@@ -35,7 +35,7 @@ function buildSystemPrompt() {
   return promptTemplate
     .replace(/\{gex_min_score\}/g, cfg.gex_min_score)
     .replace(/\{gex_strong_score\}/g, cfg.gex_strong_score)
-    .replace(/\{min_confirmations\}/g, cfg.min_confirmations)
+    .replace(/\{gex_strong_score\}/g, cfg.gex_strong_score || cfg.gex_strong_threshold || 80)
     .replace(/\{gex_exit_threshold\}/g, cfg.gex_exit_threshold)
     .replace(/\{gex_chop_zone_low\}/g, cfg.gex_chop_zone_low)
     .replace(/\{gex_chop_zone_high\}/g, cfg.gex_chop_zone_high)
@@ -62,12 +62,11 @@ const WAIT_RESPONSE = {
   action: 'WAIT',
   confidence: 'LOW',
   reason: 'Agent unavailable',
-  confirmations: 0,
-  confirmation_mode: 'BEGINNER',
+  tv_confirmations: 0,
+  bravo_confirms: false,
+  tango_confirms: false,
   target_wall: null,
   stop_level: null,
-  bullish_signals: [],
-  bearish_signals: [],
   key_risk: 'Agent not available — defaulting to WAIT',
 };
 

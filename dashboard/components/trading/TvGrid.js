@@ -6,13 +6,8 @@ import { Badge } from '../ui/Badge';
 import { cn } from '../../lib/utils';
 
 const INDICATOR_NAMES = {
-  echo: 'Echo',
   bravo: 'Bravo',
   tango: 'Tango',
-  helix: 'Helix',
-  mountain: 'Mountain',
-  arch: 'Arch',
-  lattice: 'Lattice',
 };
 
 function classColor(classification) {
@@ -55,21 +50,9 @@ export function TvGrid() {
             <span className="text-green-400 font-medium">{snapshot.confirmations?.bullish || 0} BULL</span>
             <span className="text-[var(--muted)]">/</span>
             <span className="text-red-400 font-medium">{snapshot.confirmations?.bearish || 0} BEAR</span>
+            <span className="text-[var(--muted)] text-xs">out of 2</span>
           </div>
-          <Badge label={snapshot.confirmation_mode || 'BEGINNER'} />
         </div>
-
-        {/* S/R levels */}
-        {(snapshot.support || snapshot.resistance) && (
-          <div className="flex gap-4 text-xs pt-2 border-t border-[var(--border)]">
-            {snapshot.support && (
-              <span className="text-green-400">S: ${snapshot.support.level}</span>
-            )}
-            {snapshot.resistance && (
-              <span className="text-red-400">R: ${snapshot.resistance.level}</span>
-            )}
-          </div>
-        )}
       </div>
     </Card>
   );

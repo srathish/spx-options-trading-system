@@ -62,3 +62,19 @@ export function fetchStrategyRollbacks() {
 export function fetchActiveStrategy() {
   return fetchJson('/api/strategy/active');
 }
+
+// ---- Chat ----
+
+export async function sendChatMessage(message) {
+  const res = await fetch(`${BASE}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) throw new Error(`Chat error: ${res.status}`);
+  return res.json();
+}
+
+export function fetchChatHistory() {
+  return fetchJson('/api/chat/history');
+}

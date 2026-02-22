@@ -20,6 +20,7 @@ import { getCurrentDecision } from '../agent/decision-engine.js';
 import { getSignalSnapshot, getDetailedState } from '../tv/tv-signal-store.js';
 import { getTrinityState } from '../gex/trinity.js';
 import { getActiveVersionNumber, getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
+import { callKimiChat, isAgentAvailable } from '../agent/chat-agent.js';
 
 const log = createLogger('Dashboard');
 
@@ -31,6 +32,10 @@ export const dashboardEmitter = new EventEmitter();
 
 let httpServer = null;
 let wss = null;
+
+// In-memory chat history (resets on restart)
+const chatHistory = [];
+const MAX_CHAT_HISTORY = 20;
 
 // ---- WebSocket broadcast ----
 
@@ -100,8 +105,13 @@ function createApi() {
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', 'http://localhost:3000');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
+
+  // Parse JSON bodies for POST endpoints
+  app.use(express.json());
 
   // GET /api/status — full state
   app.get('/api/status', (req, res) => {
@@ -275,6 +285,48 @@ function createApi() {
       });
     } catch (err) {
       res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // ---- Chat endpoints ----
+
+  // GET /api/chat/history — return current session chat history
+  app.get('/api/chat/history', (req, res) => {
+    res.json(chatHistory);
+  });
+
+  // POST /api/chat — send a message to the chat agent
+  app.post('/api/chat', async (req, res) => {
+    try {
+      const { message } = req.body;
+      if (!message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      if (!isAgentAvailable()) {
+        return res.status(503).json({ error: 'Chat agent not available — KIMI_API_KEY not set' });
+      }
+
+      const currentState = buildFullState();
+      const result = await callKimiChat(message.trim(), currentState, chatHistory);
+
+      // Save to in-memory history
+      chatHistory.push({ sender: 'user', text: message.trim(), timestamp: Date.now() });
+      chatHistory.push({ sender: 'agent', text: result.reply, timestamp: Date.now() });
+
+      // Trim history to max
+      while (chatHistory.length > MAX_CHAT_HISTORY * 2) {
+        chatHistory.shift();
+      }
+
+      res.json({
+        reply: result.reply,
+        tokens_used: result.tokens_used,
+        response_time_ms: result.response_time_ms,
+      });
+    } catch (err) {
+      log.error('POST /api/chat error:', err.message);
+      res.status(500).json({ error: 'Chat request failed' });
     }
   });
 

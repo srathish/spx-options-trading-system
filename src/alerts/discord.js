@@ -343,15 +343,10 @@ export async function sendCombinedSignalAlert(decision) {
     tvGrid += `${icon} ${sig.indicator.charAt(0).toUpperCase() + sig.indicator.slice(1)}: ${sig.state}${staleTag}\n`;
   }
 
-  // Build signals lists
-  const bullishSigs = (decision.bullish_signals || []).join(', ') || 'None';
-  const bearishSigs = (decision.bearish_signals || []).join(', ') || 'None';
-
   const tvState = decision.tvState || {};
   const confirmBullish = tvState.confirmations?.bullish || 0;
   const confirmBearish = tvState.confirmations?.bearish || 0;
-  const confirmTotal = tvState.confirmations?.total || 7;
-  const confirmMode = decision.confirmationMode || decision.confirmation_mode || 'BEGINNER';
+  const confirmTotal = tvState.confirmations?.total || 2;
 
   // Determine confirm display
   const maxConfirm = Math.max(confirmBullish, confirmBearish);
@@ -406,7 +401,7 @@ export async function sendCombinedSignalAlert(decision) {
 
   // TV confirmations field
   embed.fields.push({
-    name: `TV Confirmations: ${maxConfirm}/${confirmTotal} ${confirmMode}`,
+    name: `TV Confirmations: ${maxConfirm}/${confirmTotal}`,
     value: `\`\`\`\n${tvGrid}\`\`\``,
     inline: false,
   });

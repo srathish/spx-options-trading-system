@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { ChatBubbleLeftRightIcon } from '@heroicons/react/24/outline';
 import { useTradingContext } from '../../lib/tradingContext';
 import { formatCurrency } from '../../lib/utils';
 
-export function Header() {
+export function Header({ chatOpen, onChatToggle }) {
   const { connected, gex, phase } = useTradingContext();
   const [clock, setClock] = useState('');
 
@@ -47,6 +48,13 @@ export function Header() {
           <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-400'} ${connected ? 'animate-pulse' : ''}`} />
           <span className="text-xs text-[var(--muted)]">{connected ? 'Live' : 'Offline'}</span>
         </div>
+        <button
+          onClick={onChatToggle}
+          className={`p-1.5 rounded-md transition-colors ${chatOpen ? 'bg-blue-600/20 text-blue-400' : 'text-[var(--muted)] hover:text-[var(--foreground)]'}`}
+          title="Agent Chat"
+        >
+          <ChatBubbleLeftRightIcon className="w-5 h-5" />
+        </button>
       </div>
     </header>
   );

@@ -33,19 +33,12 @@ const V1_BASELINE = {
   king_node_second_tap_bias: 'BREAK',
   node_slide_weight: 1.5,
 
-  // TV weights (multipliers applied to confirmation scoring)
-  tv_weight_echo: 1.0,
+  // TV weights (Bravo + Tango only — GEX is primary decision maker)
   tv_weight_bravo: 1.0,
   tv_weight_tango: 1.5,
-  tv_weight_helix: 1.2,
-  tv_weight_mountain: 0.8,
-  tv_weight_arch: 0.8,
-  tv_weight_lattice: 0.8,
 
-  // TV requirements
-  min_confirmations: 3,
-  require_diamond: true,
-  helix_flat_override: true,
+  // GEX-primary entry thresholds
+  gex_strong_threshold: 80,   // GEX score where TV confirmation is optional
 
   // Entry/exit rules
   min_rr_ratio: 1.0,

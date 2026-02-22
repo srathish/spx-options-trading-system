@@ -13,7 +13,7 @@ const log = createLogger('TV-Webhook');
 
 let server = null;
 
-const VALID_INDICATORS = ['echo', 'bravo', 'tango', 'helix', 'mountain', 'arch', 'lattice', 'voila'];
+const VALID_INDICATORS = ['bravo', 'tango'];
 
 /**
  * Start the webhook server.

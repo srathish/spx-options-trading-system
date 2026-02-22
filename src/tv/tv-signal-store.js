@@ -1,7 +1,7 @@
 /**
  * TV Signal State Store
- * Maintains current state of all TradingView Startup indicators.
- * In-memory with SQLite backing for persistence across restarts.
+ * Maintains current state of TradingView indicators: Bravo + Tango only.
+ * GEX is the primary decision maker; these are confirmation/timing signals.
  */
 
 import { createLogger } from '../utils/logger.js';
@@ -14,37 +14,20 @@ const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 // ---- Signal Classification ----
 
 const BULLISH_SIGNALS = {
-  echo: ['BLUE'],
   bravo: ['BLUE_1', 'BLUE_2', 'WHITE'],
   tango: ['BLUE_1', 'BLUE_2'],
-  helix: ['GREEN_STEEP', 'GREEN'],
-  mountain: ['UP'],
-  arch: ['GREEN'],
-  lattice: ['BLUE_ABOVE'],
 };
 
 const BEARISH_SIGNALS = {
-  echo: ['PINK'],
   bravo: ['PINK_1', 'PINK_2'],
   tango: ['PINK_1', 'PINK_2'],
-  helix: ['PURPLE_STEEP', 'PURPLE'],
-  mountain: ['DOWN'],
-  arch: ['PURPLE'],
-  lattice: ['PINK_BELOW'],
 };
 
 // ---- In-Memory State ----
 
 const signalState = {
-  echo:     { state: 'NONE', updatedAt: null, isStale: false },
-  bravo:    { state: 'NONE', updatedAt: null, isStale: false },
-  tango:    { state: 'NONE', updatedAt: null, isStale: false },
-  helix:    { state: 'FLAT', updatedAt: null, isStale: false },
-  mountain: { state: 'ABSENT', updatedAt: null, isStale: false },
-  arch:     { state: 'PURPLE', updatedAt: null, isStale: false },
-  lattice:  { state: 'PINK_BELOW', updatedAt: null, isStale: false },
-  support:  { level: null, kind: null, updatedAt: null, isStale: false },
-  resistance: { level: null, kind: null, updatedAt: null, isStale: false },
+  bravo: { state: 'NONE', updatedAt: null, isStale: false },
+  tango: { state: 'NONE', updatedAt: null, isStale: false },
 };
 
 // Track when the last update came in (for pre-agent filter)
@@ -53,43 +36,10 @@ let lastUpdateTime = 0;
 /**
  * Update a signal from a webhook payload.
  */
-export function updateSignal(indicator, sig, level = null) {
+export function updateSignal(indicator, sig) {
   const ind = indicator.toLowerCase();
   const state = sig.toUpperCase();
   const now = Date.now();
-
-  // Handle voila (S/R levels) specially
-  if (ind === 'voila') {
-    // Parse signal: "support_5820" → type=support, level=5820
-    // Or: "gold", "green" → support; "purple", "silver" → resistance
-    const lower = state.toLowerCase();
-    let srType = null;
-    let parsedLevel = level;
-
-    if (lower.startsWith('support')) {
-      srType = 'support';
-      if (!parsedLevel) {
-        const match = lower.match(/support[_\s]?(\d+)/);
-        if (match) parsedLevel = parseFloat(match[1]);
-      }
-    } else if (lower.startsWith('resistance')) {
-      srType = 'resistance';
-      if (!parsedLevel) {
-        const match = lower.match(/resistance[_\s]?(\d+)/);
-        if (match) parsedLevel = parseFloat(match[1]);
-      }
-    } else if (lower === 'gold' || lower === 'green') {
-      srType = 'support';
-    } else {
-      srType = 'resistance';
-    }
-
-    const oldLevel = signalState[srType].level;
-    signalState[srType] = { level: parsedLevel, kind: lower, updatedAt: now, isStale: false };
-    log.info(`${srType.charAt(0).toUpperCase() + srType.slice(1)} updated: ${lower} at $${parsedLevel} (was $${oldLevel})`);
-    lastUpdateTime = now;
-    return;
-  }
 
   if (!signalState[ind]) {
     log.warn(`Unknown indicator: ${ind}`);
@@ -112,8 +62,6 @@ export function checkStaleness() {
   let staleCount = 0;
 
   for (const [ind, sig] of Object.entries(signalState)) {
-    if (ind === 'support' || ind === 'resistance') continue;
-
     if (sig.updatedAt && (now - sig.updatedAt) > STALE_THRESHOLD_MS) {
       if (!sig.isStale) {
         sig.isStale = true;
@@ -141,10 +89,10 @@ function classifySignal(indicator, state) {
 }
 
 /**
- * Count confirmations across all indicators.
+ * Count confirmations across Bravo + Tango.
  */
 export function getConfirmations() {
-  const indicators = ['echo', 'bravo', 'tango', 'helix', 'mountain', 'arch', 'lattice'];
+  const indicators = ['bravo', 'tango'];
   let bullish = 0;
   let bearish = 0;
 
@@ -154,15 +102,15 @@ export function getConfirmations() {
     if (classification === 'BEARISH') bearish++;
   }
 
-  const total = indicators.length;
+  const total = indicators.length; // 2
 
-  let mode;
-  const maxConfirm = Math.max(bullish, bearish);
-  if (maxConfirm >= 4) mode = 'MASTER';
-  else if (maxConfirm >= 3) mode = 'INTERMEDIATE';
-  else mode = 'BEGINNER';
-
-  return { bullish, bearish, total, mode };
+  return {
+    bullish,
+    bearish,
+    total,
+    bravo_confirms: classifySignal('bravo', signalState.bravo.state) !== 'NEUTRAL',
+    tango_confirms: classifySignal('tango', signalState.tango.state) !== 'NEUTRAL',
+  };
 }
 
 /**
@@ -172,38 +120,26 @@ export function getSignalSnapshot() {
   const confirmations = getConfirmations();
   const staleCount = checkStaleness();
 
-  const snapshot = {
-    echo: signalState.echo.state,
+  return {
     bravo: signalState.bravo.state,
     tango: signalState.tango.state,
-    helix: signalState.helix.state,
-    mountain: signalState.mountain.state,
-    arch: signalState.arch.state,
-    lattice: signalState.lattice.state,
-    support: signalState.support.level
-      ? { level: signalState.support.level, kind: signalState.support.kind }
-      : null,
-    resistance: signalState.resistance.level
-      ? { level: signalState.resistance.level, kind: signalState.resistance.kind }
-      : null,
     confirmations: {
       bullish: confirmations.bullish,
       bearish: confirmations.bearish,
       total: confirmations.total,
     },
-    confirmation_mode: confirmations.mode,
+    bravo_confirms: confirmations.bravo_confirms,
+    tango_confirms: confirmations.tango_confirms,
     stale_count: staleCount,
-    all_stale: staleCount >= 7,
+    all_stale: staleCount >= 2,
   };
-
-  return snapshot;
 }
 
 /**
  * Get detailed state (for Discord alert formatting).
  */
 export function getDetailedState() {
-  const indicators = ['echo', 'bravo', 'tango', 'helix', 'mountain', 'arch', 'lattice'];
+  const indicators = ['bravo', 'tango'];
   return indicators.map(ind => ({
     indicator: ind,
     state: signalState[ind].state,
@@ -227,20 +163,11 @@ export function loadFromDb(rows) {
   for (const row of rows) {
     const ind = row.indicator.toLowerCase();
     if (signalState[ind] !== undefined) {
-      if (ind === 'support' || ind === 'resistance') {
-        signalState[ind] = {
-          level: row.level,
-          kind: row.kind,
-          updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : null,
-          isStale: !!row.is_stale,
-        };
-      } else {
-        signalState[ind] = {
-          state: row.state,
-          updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : null,
-          isStale: !!row.is_stale,
-        };
-      }
+      signalState[ind] = {
+        state: row.state,
+        updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : null,
+        isStale: !!row.is_stale,
+      };
     }
   }
   log.info('Loaded signal state from database');
@@ -253,8 +180,8 @@ export function getStateForDb() {
   return Object.entries(signalState).map(([indicator, data]) => ({
     indicator,
     state: data.state || 'NONE',
-    level: data.level || null,
-    kind: data.kind || null,
+    level: null,
+    kind: null,
     updatedAt: data.updatedAt ? formatET(nowET()) : null,
     isStale: data.isStale ? 1 : 0,
   }));

@@ -11,28 +11,15 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Phantom');
 
-// TV indicators classified as "diamond" signals (highest conviction)
-const DIAMOND_INDICATORS = ['echo', 'bravo', 'tango'];
-
 // Bullish states per indicator (must match tv-signal-store.js classifications)
 const BULLISH_STATES = {
-  echo: ['BLUE'],
   bravo: ['BLUE_1', 'BLUE_2', 'WHITE'],
-  tango: ['GREEN', 'AQUA'],
-  helix: ['GREEN', 'GREEN_STEEP'],
-  mountain: ['UP'],
-  arch: ['GREEN'],
-  lattice: ['GREEN', 'LIME'],
+  tango: ['BLUE_1', 'BLUE_2'],
 };
 
 const BEARISH_STATES = {
-  echo: ['PINK'],
   bravo: ['PINK_1', 'PINK_2'],
-  tango: ['RED', 'ORANGE'],
-  helix: ['PURPLE', 'PURPLE_STEEP'],
-  mountain: ['DOWN'],
-  arch: ['PURPLE'],
-  lattice: ['RED', 'ORANGE'],
+  tango: ['PINK_1', 'PINK_2'],
 };
 
 /**
@@ -88,11 +75,11 @@ export function runPhantomComparison(closedTradeRow) {
       exitReason: closedTradeRow.exit_reason,
       currentConfig: {
         gex_min_score: currentConfig.gex_min_score,
-        min_confirmations: currentConfig.min_confirmations,
+        gex_strong_threshold: currentConfig.gex_strong_threshold,
       },
       parentConfig: {
         gex_min_score: parentConfig.gex_min_score,
-        min_confirmations: parentConfig.min_confirmations,
+        gex_strong_threshold: parentConfig.gex_strong_threshold,
       },
     },
   });
@@ -116,20 +103,22 @@ export function getRecentComparisons(limit = 20) {
 
 /**
  * Would this config have entered this trade?
+ * GEX-primary: strong GEX can enter without TV, moderate GEX needs >= 1 TV.
  */
 function evaluateEntry(gexState, tvState, direction, config) {
   // 1. GEX score check
-  if ((gexState.score || 0) < config.gex_min_score) return false;
+  const gexScore = gexState.score || 0;
+  if (gexScore < config.gex_min_score) return false;
 
-  // 2. TV confirmations check
-  const confirmations = countWeightedConfirmations(tvState, direction, config);
-  if (confirmations < config.min_confirmations) return false;
+  // 2. TV confirmations check (GEX-primary paradigm)
+  const tvConfirmations = countWeightedConfirmations(tvState, direction, config);
+  const strongThreshold = config.gex_strong_threshold || config.gex_strong_score || 80;
 
-  // 3. Diamond signal requirement
-  if (config.require_diamond && !hasDiamond(tvState, direction)) return false;
+  // Strong GEX (>= threshold) can enter without TV
+  if (gexScore >= strongThreshold) return true;
 
-  // 4. Helix flat override
-  if (config.helix_flat_override && isHelixFlat(tvState)) return false;
+  // Moderate GEX needs at least 1 TV confirmation
+  if (tvConfirmations < 1) return false;
 
   return true;
 }
@@ -141,7 +130,7 @@ function countWeightedConfirmations(tvState, direction, config) {
   if (!tvState) return 0;
 
   const isBullish = direction === 'BULLISH';
-  const indicators = ['echo', 'bravo', 'tango', 'helix', 'mountain', 'arch', 'lattice'];
+  const indicators = ['bravo', 'tango'];
   let count = 0;
 
   for (const ind of indicators) {
@@ -159,36 +148,6 @@ function countWeightedConfirmations(tvState, direction, config) {
   }
 
   return count;
-}
-
-/**
- * Check if at least one diamond signal (echo/bravo/tango) confirms.
- */
-function hasDiamond(tvState, direction) {
-  if (!tvState) return false;
-
-  const isBullish = direction === 'BULLISH';
-
-  for (const ind of DIAMOND_INDICATORS) {
-    const state = tvState[ind];
-    if (!state) continue;
-
-    const stateStr = typeof state === 'string' ? state : state.state || state.classification || '';
-    const states = isBullish ? BULLISH_STATES[ind] : BEARISH_STATES[ind];
-
-    if (states && states.includes(stateStr.toUpperCase())) return true;
-  }
-
-  return false;
-}
-
-/**
- * Check if helix is in a flat state.
- */
-function isHelixFlat(tvState) {
-  if (!tvState?.helix) return false;
-  const state = typeof tvState.helix === 'string' ? tvState.helix : tvState.helix.state || '';
-  return state.toUpperCase() === 'FLAT';
 }
 
 /**

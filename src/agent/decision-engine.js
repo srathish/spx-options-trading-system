@@ -205,13 +205,14 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
 
   // 2. Check if all signals are stale
   if (tvSnapshot.all_stale) {
-    log.warn('All TV signals are stale — forcing WAIT');
+    log.warn('Both TV signals stale — forcing WAIT');
     const decision = {
       action: 'WAIT',
       confidence: 'LOW',
-      reason: 'All TV signals stale — data integrity concern',
-      confirmations: 0,
-      confirmation_mode: 'BEGINNER',
+      reason: 'Both TV signals stale — data integrity concern',
+      tv_confirmations: 0,
+      bravo_confirms: false,
+      tango_confirms: false,
       skipped: false,
       gexScore: scored.score,
       gexDirection: scored.direction,
@@ -231,8 +232,9 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
       gexDirection: scored.direction,
       gexConfidence: scored.confidence,
       tvState: tvSnapshot,
-      confirmations: tvSnapshot.confirmations.bullish + tvSnapshot.confirmations.bearish,
-      confirmationMode: tvSnapshot.confirmation_mode,
+      tv_confirmations: tvSnapshot.confirmations.bullish + tvSnapshot.confirmations.bearish,
+      bravo_confirms: tvSnapshot.bravo_confirms,
+      tango_confirms: tvSnapshot.tango_confirms,
       action: currentAction,
       confidence: currentConfidence,
       reason: 'No change — agent skipped',
@@ -276,8 +278,9 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
     gexDirection: scored.direction,
     gexConfidence: scored.confidence,
     tvState: tvSnapshot,
-    confirmations: tvSnapshot.confirmations.bullish + tvSnapshot.confirmations.bearish,
-    confirmationMode: tvSnapshot.confirmation_mode,
+    tv_confirmations: tvSnapshot.confirmations.bullish + tvSnapshot.confirmations.bearish,
+    bravo_confirms: tvSnapshot.bravo_confirms,
+    tango_confirms: tvSnapshot.tango_confirms,
     inputTokens: agentResult.input_tokens,
     outputTokens: agentResult.output_tokens,
     responseTimeMs: agentResult.response_time_ms,

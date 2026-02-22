@@ -36,11 +36,9 @@ const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine. You an
 
 ## Adjustable Parameters (and what they control)
 - gex_min_score: Minimum GEX score to consider entry (higher = fewer but better trades)
-- gex_strong_score: Score considered "strong" signal
-- min_confirmations: Minimum TV indicator confirmations for entry (out of 7)
-- require_diamond: Whether at least one diamond signal (echo/bravo/tango) is required
-- helix_flat_override: Whether flat helix blocks ALL entries
-- tv_weight_echo, tv_weight_bravo, tv_weight_tango, tv_weight_helix, tv_weight_mountain, tv_weight_arch, tv_weight_lattice: TV indicator weight multipliers
+- gex_strong_score: Score considered "strong" signal (TV confirmation optional above this)
+- gex_strong_threshold: GEX score where TV confirmation is optional
+- tv_weight_bravo, tv_weight_tango: TV indicator weight multipliers (only 2 TV indicators: Bravo + Tango)
 - alignment_min_for_entry: Minimum tickers aligned for entry (out of 3)
 - no_entry_after: Time cutoff for new entries (HH:MM format)
 - stop_buffer_pct: Stop placement buffer percentage
@@ -358,7 +356,7 @@ function analyzeByAlignment(trades) {
 }
 
 function analyzeByTvIndicator(trades) {
-  const indicators = ['echo', 'bravo', 'tango', 'helix', 'mountain', 'arch', 'lattice'];
+  const indicators = ['bravo', 'tango'];
   const result = {};
 
   for (const ind of indicators) {
@@ -368,7 +366,7 @@ function analyzeByTvIndicator(trades) {
     for (const t of trades) {
       const tv = safeParseJson(t.tv_state_at_entry);
       const state = tv[ind];
-      const hasSignal = state && state !== 'NEUTRAL' && state !== 'FLAT' && state !== 'UNKNOWN';
+      const hasSignal = state && state !== 'NEUTRAL' && state !== 'FLAT' && state !== 'UNKNOWN' && state !== 'NONE';
       const isWin = (t.pnl_dollars || 0) > 0;
 
       if (hasSignal) {
@@ -397,14 +395,16 @@ function analyzeByTvIndicator(trades) {
 }
 
 function analyzeByConfirmations(trades) {
-  const buckets = { '1-2 (BEGINNER)': [], '3-4 (INTERMEDIATE)': [], '5+ (MASTER)': [] };
+  const buckets = { '0/2': [], '1/2': [], '2/2': [] };
 
   for (const t of trades) {
     const tv = safeParseJson(t.tv_state_at_entry);
-    const confirmations = tv.confirmations?.bullish || tv.confirmations?.total || 0;
-    if (confirmations >= 5) buckets['5+ (MASTER)'].push(t);
-    else if (confirmations >= 3) buckets['3-4 (INTERMEDIATE)'].push(t);
-    else buckets['1-2 (BEGINNER)'].push(t);
+    const bullish = tv.confirmations?.bullish || 0;
+    const bearish = tv.confirmations?.bearish || 0;
+    const confirmations = Math.min(Math.max(bullish, bearish), 2);
+    if (confirmations >= 2) buckets['2/2'].push(t);
+    else if (confirmations >= 1) buckets['1/2'].push(t);
+    else buckets['0/2'].push(t);
   }
 
   const result = {};
