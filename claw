@@ -1,0 +1,134 @@
+#!/bin/bash
+# OpenClaw CLI — Quick commands for managing the SPX bot
+# Usage: ./claw <command>
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+case "$1" in
+  status)
+    pm2 status
+    ;;
+  start)
+    pm2 start ecosystem.config.cjs
+    ;;
+  stop)
+    pm2 stop openclaw
+    ;;
+  restart)
+    pm2 restart openclaw
+    ;;
+  logs)
+    pm2 logs ${2:-openclaw} --lines 50
+    ;;
+  gex)
+    node -e "
+      import('./src/utils/config.js');
+      import('./src/store/db.js').then(db => {
+        const data = db.getLatestGex();
+        console.log(JSON.stringify(data, null, 2));
+      });
+    "
+    ;;
+  health)
+    node -e "
+      import('./src/utils/config.js');
+      import('./src/store/db.js').then(db => {
+        const data = db.getHealth();
+        console.log(JSON.stringify(data, null, 2));
+      });
+    "
+    ;;
+  test-alert)
+    node -e "
+      import('./src/utils/config.js');
+      import('./src/alerts/discord.js').then(d => d.sendTest());
+    "
+    ;;
+  run)
+    node src/index.js
+    ;;
+  strategy)
+    node -e "
+      import('./src/review/strategy-store.js').then(s => {
+        s.initStrategyStore();
+        const cfg = s.getActiveConfig();
+        const ver = s.getActiveVersionNumber();
+        const history = s.getVersionHistory();
+        console.log('Active Strategy: v' + ver);
+        console.log('Config keys:', Object.keys(cfg).length);
+        console.log('');
+        console.log('Key parameters:');
+        console.log('  gex_min_score:', cfg.gex_min_score);
+        console.log('  min_confirmations:', cfg.min_confirmations);
+        console.log('  require_diamond:', cfg.require_diamond);
+        console.log('  no_entry_after:', cfg.no_entry_after);
+        console.log('  rr_weight:', cfg.rr_weight, '/ delta_weight:', cfg.delta_weight);
+        console.log('');
+        console.log('Version history (' + history.length + ' total):');
+        history.slice(0, 5).forEach(v => {
+          const changes = JSON.parse(v.change_summary || '[]');
+          const active = v.is_active ? ' [ACTIVE]' : '';
+          console.log('  v' + v.version + ' (' + v.source + ') - ' + changes.length + ' changes' + active);
+        });
+      });
+    "
+    ;;
+  review)
+    echo "Running manual nightly review..."
+    node -e "
+      import('./src/review/strategy-store.js').then(s => {
+        s.initStrategyStore();
+        import('./src/review/nightly-review.js').then(async (r) => {
+          const result = await r.runNightlyReview();
+          console.log(JSON.stringify(result, null, 2));
+        });
+      });
+    "
+    ;;
+  briefing)
+    node -e "
+      import('./src/store/db.js').then(db => {
+        const briefing = db.getLatestBriefing();
+        if (!briefing) {
+          console.log('No briefing found. Run a nightly review first.');
+          return;
+        }
+        console.log('Date:', briefing.date);
+        console.log('Version:', briefing.version);
+        console.log('');
+        console.log(briefing.briefing);
+        const changes = JSON.parse(briefing.changes || '[]');
+        if (changes.length > 0) {
+          console.log('');
+          console.log('Changes:');
+          changes.forEach(c => console.log('  ' + c.param + ':', c.old, '->', c.new));
+        }
+        const perf = JSON.parse(briefing.performance_summary || '{}');
+        if (perf.trades) {
+          console.log('');
+          console.log('Yesterday: ' + perf.trades + ' trades, ' + perf.wins + 'W/' + perf.losses + 'L, $' + perf.totalPnlDollars);
+        }
+      });
+    "
+    ;;
+  *)
+    echo "OpenClaw SPX Trading System"
+    echo ""
+    echo "Usage: ./claw <command>"
+    echo ""
+    echo "Commands:"
+    echo "  status      Show PM2 process status"
+    echo "  start       Start the bot via PM2"
+    echo "  stop        Stop the bot"
+    echo "  restart     Restart the bot"
+    echo "  logs [n]    Show recent logs"
+    echo "  gex         Show latest GEX snapshot"
+    echo "  health      Show health status"
+    echo "  test-alert  Send a test Discord message"
+    echo "  run         Run directly (no PM2)"
+    echo "  strategy    Show active strategy version + config"
+    echo "  review      Run a manual nightly review"
+    echo "  briefing    Show latest morning briefing"
+    ;;
+esac
