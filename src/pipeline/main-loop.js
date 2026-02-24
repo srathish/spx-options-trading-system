@@ -18,10 +18,10 @@ import { scoreSpxGex } from '../gex/gex-scorer.js';
 import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
-import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById } from '../store/db.js';
+import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
 import { getGexHistory, getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
-import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert } from '../alerts/discord.js';
+import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
 import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
 import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
@@ -52,6 +52,8 @@ let lastSpot = null;
 let lastScore = null;
 let loopTimer = null;
 let reviewTimer = null;
+let eodSummaryTimer = null;
+let eodSummarySentDate = null;
 let nightlyReviewDate = null;
 let running = false;
 
@@ -105,6 +107,9 @@ export function startMainLoop() {
   // Schedule daily node tracker reset (9:25 AM ET, before warm-up)
   scheduleDailyReset();
 
+  // Schedule EOD summary (4:05 PM ET)
+  scheduleEodSummary();
+
   // Kick off the first cycle immediately
   scheduleCycle();
 }
@@ -125,6 +130,10 @@ export function stopMainLoop() {
   if (dailyResetTimer) {
     clearTimeout(dailyResetTimer);
     dailyResetTimer = null;
+  }
+  if (eodSummaryTimer) {
+    clearTimeout(eodSummaryTimer);
+    eodSummaryTimer = null;
   }
   updateLoopStatus({ running: false });
   log.info('Main loop stopped');
@@ -590,6 +599,73 @@ async function handleEodRecap() {
   } catch (err) {
     log.error('Failed to send EOD recap:', err.message);
   }
+}
+
+/**
+ * Schedule EOD summary at 4:05 PM ET (weekdays only).
+ * Sends comprehensive 4-embed summary to Discord.
+ */
+function scheduleEodSummary() {
+  const et = nowET();
+  let target = et.set({ hour: 16, minute: 5, second: 0, millisecond: 0 });
+
+  // If already past 4:05 PM today, schedule for tomorrow
+  if (et.hour > 16 || (et.hour === 16 && et.minute >= 5)) {
+    target = target.plus({ days: 1 });
+  }
+
+  // Skip weekends (Sat=6, Sun=7 in Luxon ISO weekday)
+  while (target.weekday === 6 || target.weekday === 7) {
+    target = target.plus({ days: 1 });
+  }
+
+  const msUntilSummary = target.toMillis() - et.toMillis();
+  const hoursUntil = (msUntilSummary / 3_600_000).toFixed(1);
+
+  log.info(`EOD summary scheduled in ${hoursUntil}h (4:05 PM ET)`);
+
+  eodSummaryTimer = setTimeout(async () => {
+    if (!running) return;
+
+    const todayStr = formatET(nowET()).slice(0, 10);
+    if (eodSummarySentDate === todayStr) {
+      log.info('EOD summary already sent today — skipping');
+      scheduleEodSummary();
+      return;
+    }
+
+    eodSummarySentDate = todayStr;
+
+    try {
+      const trades = getTradesByDate(todayStr);
+      const phantoms = getPhantomTradesByDate(todayStr);
+      const decisions = getDecisionsByDate(todayStr);
+      const tvSignalLog = getTvSignalLogByDate(todayStr);
+      const gexSnapshots = getGexSnapshotsByDate(todayStr);
+      const alerts = getAlertsByDate(todayStr);
+      const predictions = getTodaysPredictions();
+      const strategyLabel = getVersionLabel();
+
+      await sendEodSummary({
+        trades,
+        phantoms,
+        decisions,
+        tvSignalLog,
+        gexSnapshots,
+        alerts,
+        predictions,
+        strategy: strategyLabel,
+        cycleCount,
+      });
+
+      log.info('EOD summary sent successfully');
+    } catch (err) {
+      log.error('Failed to send EOD summary:', err.message);
+    }
+
+    // Reschedule for next trading day
+    scheduleEodSummary();
+  }, msUntilSummary);
 }
 
 /**

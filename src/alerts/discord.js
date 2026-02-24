@@ -763,6 +763,263 @@ export async function sendMapReshuffleAlert(reshuffle) {
 }
 
 /**
+ * Send comprehensive end-of-day summary at 4:05 PM ET.
+ * 4 Discord embeds: Performance, Breakdown, Trade Log, Phantoms & System.
+ */
+export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog, gexSnapshots, alerts, predictions, strategy, cycleCount }) {
+  const now = formatET(nowET());
+  const todayStr = now.slice(0, 10);
+
+  // ---- Compute stats ----
+  const closedTrades = trades.filter(t => t.closed_at);
+  const wins = closedTrades.filter(t => t.pnl_pct > 0);
+  const losses = closedTrades.filter(t => t.pnl_pct <= 0);
+  const winRate = closedTrades.length > 0 ? ((wins.length / closedTrades.length) * 100).toFixed(0) : '0';
+
+  const totalPnlPts = closedTrades.reduce((sum, t) => {
+    const pts = (t.exit_spx || 0) - (t.entry_spx || 0);
+    return sum + (t.direction === 'BEARISH' ? -pts : pts);
+  }, 0);
+  const avgPnlPts = closedTrades.length > 0 ? (totalPnlPts / closedTrades.length) : 0;
+
+  const bestTrade = closedTrades.reduce((best, t) => {
+    const pts = t.direction === 'BEARISH' ? (t.entry_spx - t.exit_spx) : (t.exit_spx - t.entry_spx);
+    return (!best || pts > best.pts) ? { ...t, pts } : best;
+  }, null);
+
+  const worstTrade = closedTrades.reduce((worst, t) => {
+    const pts = t.direction === 'BEARISH' ? (t.entry_spx - t.exit_spx) : (t.exit_spx - t.entry_spx);
+    return (!worst || pts < worst.pts) ? { ...t, pts } : worst;
+  }, null);
+
+  // Exit reason breakdown
+  const exitReasons = {};
+  for (const t of closedTrades) {
+    const reason = t.exit_reason || 'UNKNOWN';
+    exitReasons[reason] = (exitReasons[reason] || 0) + 1;
+  }
+
+  // Entry block breakdown
+  const blockedAlerts = alerts.filter(a => a.type === 'ENTRY_BLOCKED');
+  const blockReasons = {};
+  for (const a of blockedAlerts) {
+    try {
+      const parsed = JSON.parse(a.content);
+      const reason = parsed.details?.reason?.split(' — ')[0] || parsed.message?.split(' — ')[1]?.split(',')[0] || 'Unknown';
+      blockReasons[reason] = (blockReasons[reason] || 0) + 1;
+    } catch { blockReasons['Unknown'] = (blockReasons['Unknown'] || 0) + 1; }
+  }
+
+  // Agent decision stats
+  const agentCalls = decisions.filter(d => !d.skipped);
+  const skippedCalls = decisions.filter(d => d.skipped);
+  const totalTokensIn = agentCalls.reduce((s, d) => s + (d.input_tokens || 0), 0);
+  const totalTokensOut = agentCalls.reduce((s, d) => s + (d.output_tokens || 0), 0);
+  const avgResponseMs = agentCalls.length > 0
+    ? Math.round(agentCalls.reduce((s, d) => s + (d.response_time_ms || 0), 0) / agentCalls.length)
+    : 0;
+
+  // GEX stats
+  const gexScores = gexSnapshots.map(s => s.score).filter(s => s != null);
+  const avgGexScore = gexScores.length > 0 ? Math.round(gexScores.reduce((a, b) => a + b, 0) / gexScores.length) : 0;
+  const minGexScore = gexScores.length > 0 ? Math.min(...gexScores) : 0;
+  const maxGexScore = gexScores.length > 0 ? Math.max(...gexScores) : 0;
+
+  // Spot price range
+  const spots = gexSnapshots.map(s => s.spot_price).filter(s => s != null);
+  const spotHigh = spots.length > 0 ? Math.max(...spots) : 0;
+  const spotLow = spots.length > 0 ? Math.min(...spots) : 0;
+  const spotRange = spotHigh - spotLow;
+
+  // Prediction accuracy
+  const checkedPreds = predictions.filter(p => p.checked);
+  const predWins = checkedPreds.filter(p => p.result_win);
+  const predWinRate = checkedPreds.length > 0 ? ((predWins.length / checkedPreds.length) * 100).toFixed(0) : '0';
+
+  // ---- EMBED 1: Performance Summary ----
+  const perfColor = totalPnlPts >= 0 ? COLORS.BULLISH : COLORS.BEARISH;
+  const pnlSign = totalPnlPts >= 0 ? '+' : '';
+
+  const embed1 = {
+    title: '\uD83D\uDCCA END OF DAY SUMMARY',
+    description: `**${todayStr}** | Strategy: ${strategy || 'v1'}`,
+    color: perfColor,
+    fields: [
+      {
+        name: 'Performance',
+        value: [
+          `Trades: **${closedTrades.length}** (${wins.length}W / ${losses.length}L)`,
+          `Win Rate: **${winRate}%**`,
+          `Total P&L: **${pnlSign}${totalPnlPts.toFixed(1)} pts**`,
+          `Avg P&L: **${avgPnlPts >= 0 ? '+' : ''}${avgPnlPts.toFixed(1)} pts/trade**`,
+        ].join('\n'),
+        inline: true,
+      },
+      {
+        name: 'Market',
+        value: [
+          `SPX Range: $${spotLow.toFixed(0)}-$${spotHigh.toFixed(0)} ($${spotRange.toFixed(0)})`,
+          `GEX Score: ${avgGexScore} avg (${minGexScore}-${maxGexScore})`,
+          `Predictions: ${predWins.length}/${checkedPreds.length} (${predWinRate}%)`,
+        ].join('\n'),
+        inline: true,
+      },
+    ],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  if (bestTrade) {
+    embed1.fields.push({
+      name: 'Best / Worst',
+      value: `Best: **${bestTrade.contract}** ${bestTrade.pts >= 0 ? '+' : ''}${bestTrade.pts.toFixed(1)} pts\nWorst: **${worstTrade?.contract || '—'}** ${worstTrade ? `${worstTrade.pts >= 0 ? '+' : ''}${worstTrade.pts.toFixed(1)} pts` : '—'}`,
+      inline: false,
+    });
+  }
+
+  // ---- EMBED 2: Detailed Breakdown ----
+  const exitReasonsStr = Object.entries(exitReasons)
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join('\n') || 'No trades closed';
+
+  const blockReasonsStr = Object.entries(blockReasons)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join('\n') || 'None blocked';
+
+  // Hold time stats
+  const holdTimes = closedTrades.map(t => {
+    if (!t.opened_at || !t.closed_at) return null;
+    const opened = new Date(t.opened_at.replace(' ', 'T'));
+    const closed = new Date(t.closed_at.replace(' ', 'T'));
+    return (closed - opened) / 60000; // minutes
+  }).filter(h => h != null && h > 0);
+  const avgHoldMin = holdTimes.length > 0 ? (holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length).toFixed(1) : '0';
+  const maxHoldMin = holdTimes.length > 0 ? Math.max(...holdTimes).toFixed(1) : '0';
+
+  const embed2 = {
+    title: '\uD83D\uDD0D DETAILED BREAKDOWN',
+    color: COLORS.INFO,
+    fields: [
+      {
+        name: 'Exit Reasons',
+        value: `\`\`\`\n${exitReasonsStr}\n\`\`\``,
+        inline: true,
+      },
+      {
+        name: `Entries Blocked (${blockedAlerts.length})`,
+        value: `\`\`\`\n${blockReasonsStr}\n\`\`\``,
+        inline: true,
+      },
+      {
+        name: 'Timing',
+        value: `Avg Hold: ${avgHoldMin} min | Max: ${maxHoldMin} min`,
+        inline: false,
+      },
+      {
+        name: 'TV Signals',
+        value: `${tvSignalLog.length} signal changes today`,
+        inline: true,
+      },
+      {
+        name: 'GEX Snapshots',
+        value: `${gexSnapshots.length} readings`,
+        inline: true,
+      },
+    ],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // ---- EMBED 3: Trade Log ----
+  let tradeLogStr = '';
+  if (closedTrades.length > 0) {
+    tradeLogStr += 'CONTRACT              DIR   ENTRY    EXIT     PTS    EXIT REASON\n';
+    tradeLogStr += '-'.repeat(72) + '\n';
+    for (const t of closedTrades) {
+      const dir = t.direction === 'BULLISH' ? 'CALL' : 'PUT ';
+      const pts = t.direction === 'BEARISH'
+        ? (t.entry_spx - t.exit_spx)
+        : (t.exit_spx - t.entry_spx);
+      const ptsStr = `${pts >= 0 ? '+' : ''}${pts.toFixed(1)}`;
+      const contractShort = t.contract?.slice(-8) || t.contract || '?';
+      const exitReason = (t.exit_reason || '?').slice(0, 14);
+      tradeLogStr += `${contractShort.padEnd(22)}${dir.padEnd(6)}$${(t.entry_spx || 0).toFixed(0).padEnd(8)}$${(t.exit_spx || 0).toFixed(0).padEnd(8)}${ptsStr.padEnd(7)}${exitReason}\n`;
+    }
+  } else {
+    tradeLogStr = 'No trades today.';
+  }
+
+  const embed3 = {
+    title: '\uD83D\uDCDD TRADE LOG',
+    description: `\`\`\`\n${tradeLogStr}\`\`\``,
+    color: closedTrades.length > 0 ? (totalPnlPts >= 0 ? COLORS.BULLISH : COLORS.BEARISH) : COLORS.SYSTEM,
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // ---- EMBED 4: Phantoms & System ----
+  let phantomStr = '';
+  const closedPhantoms = phantoms.filter(p => p.closed_at);
+  if (closedPhantoms.length > 0) {
+    const phantomPts = closedPhantoms.reduce((sum, p) => {
+      const pts = p.direction === 'BEARISH' ? (p.entry_spx - p.exit_spx) : (p.exit_spx - p.entry_spx);
+      return sum + pts;
+    }, 0);
+    const phantomWins = closedPhantoms.filter(p => {
+      const pts = p.direction === 'BEARISH' ? (p.entry_spx - p.exit_spx) : (p.exit_spx - p.entry_spx);
+      return pts > 0;
+    });
+    phantomStr = `${closedPhantoms.length} phantom(s): ${phantomWins.length}W / ${closedPhantoms.length - phantomWins.length}L | ${phantomPts >= 0 ? '+' : ''}${phantomPts.toFixed(1)} pts`;
+  } else {
+    phantomStr = 'No phantom trades today';
+  }
+
+  const embed4 = {
+    title: '\uD83D\uDC7B PHANTOMS & SYSTEM',
+    color: COLORS.SYSTEM,
+    fields: [
+      {
+        name: 'Phantom Trades',
+        value: phantomStr,
+        inline: false,
+      },
+      {
+        name: 'Agent Stats',
+        value: [
+          `Calls: ${agentCalls.length} (${skippedCalls.length} skipped)`,
+          `Tokens: ${totalTokensIn.toLocaleString()} in / ${totalTokensOut.toLocaleString()} out`,
+          `Avg Response: ${avgResponseMs}ms`,
+        ].join('\n'),
+        inline: true,
+      },
+      {
+        name: 'System',
+        value: [
+          `Cycles: ${cycleCount || '—'}`,
+          `Strategy: ${strategy || 'v1'}`,
+          `Alerts: ${alerts.length} total`,
+        ].join('\n'),
+        inline: true,
+      },
+    ],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // Send all 4 embeds (Discord allows max 10 embeds per message)
+  const sent = await sendWebhook({ embeds: [embed1, embed2, embed3, embed4] });
+  if (sent) {
+    log.info(`EOD summary sent: ${closedTrades.length} trades, ${pnlSign}${totalPnlPts.toFixed(1)} pts`);
+  } else {
+    log.error('Failed to send EOD summary');
+  }
+  return sent;
+}
+
+/**
  * Send a test message to verify webhook works.
  */
 export async function sendTest() {

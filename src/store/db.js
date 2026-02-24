@@ -777,6 +777,32 @@ export function getTradesForVersion(versionLabel) {
   return selectTradesForVersion.all(versionLabel);
 }
 
+// ---- EOD Summary helpers ----
+
+export function getDecisionsByDate(dateStr) {
+  return db.prepare("SELECT * FROM decisions WHERE timestamp LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getTvSignalLogByDate(dateStr) {
+  return db.prepare("SELECT * FROM tv_signal_log WHERE timestamp LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getGexSnapshotsByDate(dateStr) {
+  return db.prepare("SELECT * FROM gex_snapshots WHERE timestamp LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getAlertsByDate(dateStr) {
+  return db.prepare("SELECT * FROM alerts WHERE timestamp LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getPhantomTradesByDate(dateStr) {
+  return db.prepare("SELECT * FROM trades WHERE is_phantom = 1 AND opened_at LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getTradesByDate(dateStr) {
+  return db.prepare("SELECT * FROM trades WHERE is_phantom = 0 AND opened_at LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
 export function cleanupOldData(daysToKeep = 7) {
   const cutoff = formatET(nowET().minus({ days: daysToKeep }));
   const tables = ['gex_snapshots', 'wall_trends', 'alerts', 'health', 'predictions', 'tv_signal_log', 'decisions', 'multi_ticker_analysis'];
