@@ -217,7 +217,7 @@ function computeAlignment(spxState, spyState, qqqState) {
     spxState?.scored?.direction,
     spyState?.scored?.direction,
     qqqState?.scored?.direction,
-  ].filter(d => d && d !== 'CHOP');
+  ].filter(d => d && d !== 'CHOP' && d !== 'NEUTRAL');
 
   const bullish = directions.filter(d => d === 'BULLISH').length;
   const bearish = directions.filter(d => d === 'BEARISH').length;
@@ -638,7 +638,7 @@ function detectHedgeNodes(state, ticker) {
  * Compute enhanced score bonus based on alignment + driver.
  */
 function computeEnhancedBonus(alignment, driver, spxDirection) {
-  if (spxDirection === 'CHOP') return 0;
+  if (spxDirection === 'CHOP' || spxDirection === 'NEUTRAL') return 0;
 
   // Alignment bonus (0/5/10/15)
   let bonus = MULTI_TICKER.ALIGNMENT_BONUS[alignment.count] || 0;

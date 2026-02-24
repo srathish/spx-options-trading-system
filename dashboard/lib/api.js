@@ -63,6 +63,19 @@ export function fetchActiveStrategy() {
   return fetchJson('/api/strategy/active');
 }
 
+// ---- Trade Ideas ----
+
+export function fetchTradeIdeas(date) {
+  const query = date ? `?date=${date}` : '';
+  return fetchJson(`/api/trade-ideas${query}`);
+}
+
+// ---- Alerts ----
+
+export function fetchAlerts(limit = 50) {
+  return fetchJson(`/api/alerts?limit=${limit}`);
+}
+
 // ---- Chat ----
 
 export async function sendChatMessage(message) {

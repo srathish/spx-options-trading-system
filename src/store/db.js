@@ -486,6 +486,10 @@ export function getTodaysPredictions() {
   return db.prepare("SELECT * FROM predictions WHERE timestamp LIKE ? || '%'").all(today);
 }
 
+export function getPredictionsByDate(dateStr) {
+  return db.prepare("SELECT * FROM predictions WHERE timestamp LIKE ? || '%'").all(dateStr);
+}
+
 export function getCheckedPredictionsToday() {
   const today = formatET(nowET()).slice(0, 10);
   return db.prepare(
@@ -498,6 +502,15 @@ export function getRecentAlerts(type, minutes = 15) {
   return db.prepare(
     'SELECT * FROM alerts WHERE type = ? AND timestamp > ? ORDER BY id DESC'
   ).all(type, cutoff);
+}
+
+/**
+ * Get all recent alerts (any type) for the dashboard feed.
+ */
+export function getAlertsFeed(limit = 50) {
+  return db.prepare(
+    'SELECT * FROM alerts ORDER BY id DESC LIMIT ?'
+  ).all(limit);
 }
 
 export function getHealth() {
@@ -737,9 +750,9 @@ export function saveMorningBriefing(briefing) {
   insertMorningBriefing.run(
     briefing.date,
     briefing.version,
-    JSON.stringify(briefing.briefing),
-    JSON.stringify(briefing.changes || []),
-    JSON.stringify(briefing.performanceSummary || {}),
+    typeof briefing.briefing === 'string' ? briefing.briefing : JSON.stringify(briefing.briefing),
+    typeof briefing.changes === 'string' ? briefing.changes : JSON.stringify(briefing.changes || []),
+    typeof briefing.performanceSummary === 'string' ? briefing.performanceSummary : JSON.stringify(briefing.performanceSummary || {}),
     ts,
   );
 }

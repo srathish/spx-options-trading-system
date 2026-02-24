@@ -4,16 +4,63 @@ import { useTradingContext } from '../../lib/tradingContext';
 import { Card } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { ProgressBar } from '../ui/ProgressBar';
-import { formatCurrency, formatPct, cn, pnlColor } from '../../lib/utils';
+import { formatCurrency, formatPct, formatContract, cn, pnlColor } from '../../lib/utils';
+
+function timeAgo(timestamp) {
+  if (!timestamp) return '';
+  const ms = Date.now() - timestamp;
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ${mins % 60}m ago`;
+}
 
 export function TradeCard() {
-  const { position, decision, gex } = useTradingContext();
+  const { position, decision, gex, lastTrade } = useTradingContext();
   const posState = position?.state || 'FLAT';
   const pos = position?.details;
   const action = decision?.action || decision?.lastDecision?.action || 'WAIT';
 
-  // FLAT + WAIT
+  // FLAT + WAIT — show last trade if available
   if (posState === 'FLAT' && !action?.startsWith('ENTER')) {
+    if (lastTrade) {
+      return (
+        <Card title="Last Trade">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-sm">{formatContract(lastTrade.contract)}</span>
+                <Badge label={lastTrade.direction} />
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge label={lastTrade.exitReason || lastTrade.exit_reason} />
+                <span className="text-xs text-[var(--muted)]">{timeAgo(lastTrade.closedAt)}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <span className={cn('text-2xl font-bold font-mono', pnlColor(lastTrade.spxChange))}>
+                {lastTrade.spxChange > 0 ? '+' : ''}{Number(lastTrade.spxChange).toFixed(1)} pts
+              </span>
+              <Badge label={lastTrade.isWin ? 'WIN' : 'LOSS'} />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <span className="text-[var(--muted)]">Entry SPX</span>
+                <p className="font-mono">{formatCurrency(lastTrade.entrySpx, 0)}</p>
+              </div>
+              <div>
+                <span className="text-[var(--muted)]">Exit SPX</span>
+                <p className="font-mono">{formatCurrency(lastTrade.exitSpx, 0)}</p>
+              </div>
+            </div>
+          </div>
+        </Card>
+      );
+    }
+
     return (
       <Card title="Position">
         <div className="flex items-center justify-center py-8">
@@ -23,17 +70,18 @@ export function TradeCard() {
     );
   }
 
-  // FLAT + ENTER signal (proposed trade)
+  // FLAT + ENTER signal (proposed trade — may be blocked by guardrails)
   if (posState === 'FLAT' && action?.startsWith('ENTER')) {
+    const blocked = decision?.entryBlocked;
     return (
-      <Card title="Trade Proposal">
+      <Card title={blocked ? 'Entry Blocked' : 'Trade Proposal'}>
         <div className="space-y-3">
           <div className="flex items-center gap-2">
             <Badge label={action === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH'} />
-            <span className="text-sm">Signal detected</span>
+            <span className="text-sm">{blocked ? 'Signal blocked by guardrails' : 'Signal detected'}</span>
           </div>
           <p className="text-xs text-[var(--muted)]">
-            Awaiting Polygon chain data for strike selection...
+            {blocked ? blocked.reason : 'Evaluating entry...'}
           </p>
         </div>
       </Card>
@@ -45,14 +93,16 @@ export function TradeCard() {
     const pnlPct = pos.currentPnlPct || 0;
     const spotPrice = gex?.spotPrice || 0;
 
-    // Calculate target progress
+    // Calculate target progress — guard against entry ≈ target (< 2pts apart)
     let targetProgress = 0;
     if (pos.entrySpx && pos.targetSpx && spotPrice) {
       const totalMove = Math.abs(pos.targetSpx - pos.entrySpx);
-      const currentMove = pos.direction === 'BULLISH'
-        ? spotPrice - pos.entrySpx
-        : pos.entrySpx - spotPrice;
-      targetProgress = totalMove > 0 ? (currentMove / totalMove) * 100 : 0;
+      if (totalMove >= 2) {
+        const currentMove = pos.direction === 'BULLISH'
+          ? spotPrice - pos.entrySpx
+          : pos.entrySpx - spotPrice;
+        targetProgress = Math.max(-100, Math.min(200, (currentMove / totalMove) * 100));
+      }
     }
 
     return (
@@ -60,19 +110,23 @@ export function TradeCard() {
         <div className="space-y-3">
           {/* Contract + state */}
           <div className="flex items-center justify-between">
-            <span className="font-mono text-sm">{pos.contract}</span>
+            <span className="font-medium text-sm">{formatContract(pos.contract)}</span>
             <Badge label={posState} />
           </div>
 
-          {/* P&L */}
+          {/* P&L in SPX points */}
           <div className="flex items-center gap-4">
-            <span className={cn('text-2xl font-bold font-mono', pnlColor(pnlPct))}>
-              {formatPct(pnlPct)}
-            </span>
-            {pos.entryPrice && (
-              <span className="text-xs text-[var(--muted)]">
-                Entry: {formatCurrency(pos.entryPrice)}
-              </span>
+            {pos.entrySpx && spotPrice ? (() => {
+              const spxPts = pos.direction === 'BULLISH'
+                ? spotPrice - pos.entrySpx
+                : pos.entrySpx - spotPrice;
+              return (
+                <span className={cn('text-2xl font-bold font-mono', pnlColor(spxPts))}>
+                  {spxPts > 0 ? '+' : ''}{spxPts.toFixed(1)} pts
+                </span>
+              );
+            })() : (
+              <span className="text-2xl font-bold font-mono text-gray-400">—</span>
             )}
           </div>
 

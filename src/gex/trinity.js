@@ -47,8 +47,8 @@ export async function fetchTrinityData() {
       const history = getGexHistory(ticker);
       const wallTrends = history.length >= 2 ? detectWallTrends(walls, history) : [];
 
-      // Full scoring (same scorer as SPXW)
-      const scored = scoreSpxGex(parsed, wallTrends, 0);
+      // Full scoring (same scorer as SPXW) — pass ticker for per-ticker gexAtSpot smoothing
+      const scored = scoreSpxGex(parsed, wallTrends, 0, ticker);
 
       results[ticker] = { raw, parsed, walls, scored, wallTrends };
     } catch (err) {
@@ -105,8 +105,24 @@ function buildTickerState(ticker, data) {
     strikes.push({ strike, gexValue });
   }
 
-  // Find king node (largest absolute wall)
-  const largestWall = walls.length > 0 ? walls[0] : null;
+  // Find king node — largest absolute GEX strike (unfiltered, not from walls)
+  let largestWall = null;
+  let largestAbsGex = 0;
+  for (const strike of parsed.strikes) {
+    const gex = parsed.aggregatedGex.get(strike) || 0;
+    if (Math.abs(gex) > largestAbsGex) {
+      largestAbsGex = Math.abs(gex);
+      largestWall = {
+        strike,
+        gexValue: gex,
+        absGexValue: Math.abs(gex),
+        type: gex > 0 ? 'positive' : 'negative',
+        relativeToSpot: strike > spotPrice ? 'above' : strike < spotPrice ? 'below' : 'at',
+        distanceFromSpot: Math.abs(strike - spotPrice),
+        distancePct: (Math.abs(strike - spotPrice) / spotPrice * 100),
+      };
+    }
+  }
 
   return {
     ticker,
@@ -118,6 +134,7 @@ function buildTickerState(ticker, data) {
       environment: scored.environment,
       envDetail: scored.envDetail,
       gexAtSpot: scored.gexAtSpot,
+      smoothedGexAtSpot: scored.smoothedGexAtSpot,
       breakdown: scored.breakdown,
       targetWall: scored.targetWall,
       floorWall: scored.floorWall,

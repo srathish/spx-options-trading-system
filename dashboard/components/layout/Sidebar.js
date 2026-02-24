@@ -8,10 +8,12 @@ import {
   ChartBarIcon,
   AdjustmentsHorizontalIcon,
   CpuChipIcon,
+  LightBulbIcon,
 } from '@heroicons/react/24/outline';
 
 const NAV = [
   { href: '/', label: 'Trading', icon: BoltIcon },
+  { href: '/ideas', label: 'Ideas', icon: LightBulbIcon },
   { href: '/performance', label: 'Performance', icon: ChartBarIcon },
   { href: '/strategy', label: 'Strategy', icon: AdjustmentsHorizontalIcon },
   { href: '/system', label: 'System', icon: CpuChipIcon },

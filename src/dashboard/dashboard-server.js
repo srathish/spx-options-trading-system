@@ -14,10 +14,11 @@ import { config } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
 import { getLoopStatus } from '../pipeline/loop-status.js';
 import { getSchedulePhase, nowET, formatET } from '../utils/market-hours.js';
-import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getTodaysDecisions, getCheckedPredictionsToday, getAllVersions, getRecentRollbacks, getLatestBriefing } from '../store/db.js';
+import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getTodaysDecisions, getCheckedPredictionsToday, getTodaysPredictions, getPredictionsByDate, getAllVersions, getRecentRollbacks, getLatestBriefing, getAlertsFeed } from '../store/db.js';
 import { getPositionState, getCurrentPosition } from '../trades/trade-manager.js';
 import { getCurrentDecision } from '../agent/decision-engine.js';
-import { getSignalSnapshot, getDetailedState } from '../tv/tv-signal-store.js';
+import { getSignalSnapshot, getDetailedState, updateSignal } from '../tv/tv-signal-store.js';
+import { saveTvSignalLog } from '../store/db.js';
 import { getTrinityState } from '../gex/trinity.js';
 import { getActiveVersionNumber, getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
 import { callKimiChat, isAgentAvailable } from '../agent/chat-agent.js';
@@ -50,7 +51,7 @@ function broadcast(event, data) {
 }
 
 // Wire emitter events to WS broadcast
-const EVENTS = ['gex_update', 'tv_update', 'decision_update', 'position_update', 'trade_opened', 'trade_closed', 'health_update', 'trinity_update', 'strategy_update', 'strategy_rollback'];
+const EVENTS = ['gex_update', 'tv_update', 'decision_update', 'position_update', 'trade_opened', 'trade_closed', 'health_update', 'trinity_update', 'strategy_update', 'strategy_rollback', 'alert', 'entry_blocked'];
 for (const evt of EVENTS) {
   dashboardEmitter.on(evt, (data) => {
     try {
@@ -227,6 +228,38 @@ function createApi() {
     }
   });
 
+  // GET /api/alerts — recent alert feed
+  app.get('/api/alerts', (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+      const alerts = getAlertsFeed(limit).map(a => ({
+        id: a.id,
+        timestamp: a.timestamp,
+        type: a.type,
+        content: (() => { try { return JSON.parse(a.content); } catch { return a.content; } })(),
+        discord_sent: !!a.discord_sent,
+      }));
+      res.json(alerts);
+    } catch (err) {
+      log.error('GET /api/alerts error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // GET /api/trade-ideas — trade ideas (predictions), ?date=YYYY-MM-DD for history
+  app.get('/api/trade-ideas', (req, res) => {
+    try {
+      const date = req.query.date;
+      if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        res.json(getPredictionsByDate(date));
+      } else {
+        res.json(getTodaysPredictions());
+      }
+    } catch (err) {
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
   // ---- Phase 5: Strategy endpoints ----
 
   // GET /api/strategy/active — active version + config
@@ -278,12 +311,67 @@ function createApi() {
         res.json(null);
         return;
       }
+      // Parse JSON fields — handle double-encoded values from older saves
+      let changes = briefing.changes || '[]';
+      try { changes = JSON.parse(changes); } catch { changes = []; }
+      if (typeof changes === 'string') { try { changes = JSON.parse(changes); } catch { changes = []; } }
+
+      let perfSummary = briefing.performance_summary || '{}';
+      try { perfSummary = JSON.parse(perfSummary); } catch { perfSummary = {}; }
+      if (typeof perfSummary === 'string') { try { perfSummary = JSON.parse(perfSummary); } catch { perfSummary = {}; }  }
+
+      let briefingText = briefing.briefing || '';
+      if (briefingText.startsWith('"') && briefingText.endsWith('"')) {
+        try { briefingText = JSON.parse(briefingText); } catch { /* keep as-is */ }
+      }
+
       res.json({
         ...briefing,
-        changes: JSON.parse(briefing.changes || '[]'),
-        performance_summary: JSON.parse(briefing.performance_summary || '{}'),
+        briefing: briefingText,
+        changes,
+        performance_summary: perfSummary,
       });
     } catch (err) {
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // ---- Manual TV Signal Input ----
+
+  // POST /api/signals/manual — user sends TV shape signals from the dashboard
+  app.post('/api/signals/manual', (req, res) => {
+    try {
+      const { indicator, signal, ticker } = req.body;
+
+      if (!indicator || !signal) {
+        return res.status(400).json({ error: 'indicator and signal are required' });
+      }
+
+      const ind = indicator.toLowerCase();
+      const tkr = (ticker || 'spx').toLowerCase();
+
+      if (!['bravo', 'tango'].includes(ind)) {
+        return res.status(400).json({ error: `Unknown indicator: ${ind}` });
+      }
+      if (!['spx', 'spy', 'qqq'].includes(tkr)) {
+        return res.status(400).json({ error: `Unknown ticker: ${tkr}` });
+      }
+
+      // Update the TV signal store (same as webhook)
+      updateSignal(ind, signal, tkr);
+
+      // Log to DB
+      try {
+        saveTvSignalLog(`${tkr}_${ind}`, null, signal.toUpperCase(), JSON.stringify({ source: 'manual', ...req.body }));
+      } catch (_) {}
+
+      // Broadcast TV update to all dashboard clients
+      broadcast('tv_update', { snapshot: getSignalSnapshot(), detailed: getDetailedState() });
+
+      log.info(`Manual signal: ${tkr.toUpperCase()} ${ind.toUpperCase()} → ${signal} (from dashboard)`);
+      res.json({ ok: true, ticker: tkr, indicator: ind, signal });
+    } catch (err) {
+      log.error('POST /api/signals/manual error:', err.message);
       res.status(500).json({ error: 'Internal error' });
     }
   });

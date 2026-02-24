@@ -42,6 +42,19 @@ export function pnlColor(value) {
   return value > 0 ? 'text-green-400' : 'text-red-400';
 }
 
+/**
+ * Format contract name for display.
+ * "SPX20260224C6885" → "SPX Calls 6885"
+ * "SPX20260224P6880" → "SPX Puts 6880"
+ */
+export function formatContract(contract) {
+  if (!contract) return '—';
+  const match = contract.match(/^(SPX)\d{8}([CP])(\d+)$/);
+  if (!match) return contract;
+  const [, ticker, type, strike] = match;
+  return `${ticker} ${type === 'C' ? 'Calls' : 'Puts'} ${strike}`;
+}
+
 export function directionColor(direction) {
   if (direction === 'BULLISH') return 'text-green-400';
   if (direction === 'BEARISH') return 'text-red-400';

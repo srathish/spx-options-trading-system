@@ -18,23 +18,19 @@ import { scoreSpxGex } from '../gex/gex-scorer.js';
 import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
-import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById } from '../store/db.js';
-import { getGexHistory } from '../store/state.js';
+import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById } from '../store/db.js';
+import { getGexHistory, getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
 import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
 import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
-import { updateHeatseekerSpot } from '../polygon/price-feed.js';
-import { isPolygonAvailable } from '../polygon/polygon-client.js';
-import { fetch0DteChain } from '../polygon/options-chain.js';
-import { selectStrike } from '../trades/strike-selector.js';
-import { getSignalSnapshot } from '../tv/tv-signal-store.js';
+import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
 import { getSchedulePhase, isOpeningSummaryTime, isEodRecapTime, nowET, formatET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 import { updateLoopStatus } from './loop-status.js';
 import { dashboardEmitter } from '../dashboard/dashboard-server.js';
-import { initStrategyStore, getVersionLabel, getActiveVersionNumber } from '../review/strategy-store.js';
+import { initStrategyStore, getVersionLabel, getActiveVersionNumber, getActiveConfig } from '../review/strategy-store.js';
 import { runPhantomComparison } from '../review/phantom-engine.js';
 import { checkRollbackTriggers } from '../review/rollback-engine.js';
 import { runNightlyReview } from '../review/nightly-review.js';
@@ -58,6 +54,25 @@ let loopTimer = null;
 let reviewTimer = null;
 let nightlyReviewDate = null;
 let running = false;
+
+// Re-entry cooldown tracking
+let lastExitTime = 0;
+let lastExitDirection = null;
+const REENTRY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after exit before re-entering same direction
+
+// Entry quality gate tracking
+let lastEntryTime = 0;
+let todayTradeCount = 0;
+const ENTRY_GATES = {
+  MAX_TRADES_PER_DAY: 8,
+  MIN_TIME_BETWEEN_ENTRIES_MS: 5 * 60 * 1000,   // 5 min between ANY entries
+  MIN_STABLE_DIRECTION_CYCLES: 3,                 // Direction must agree 3 consecutive cycles
+  NO_ENTRY_AFTER_FLIP_CYCLES: 4,                  // Wait 4 cycles after direction flip
+  NO_ENTRY_AFTER_ET: '15:00',                     // No new entries after 3:00 PM ET for 0DTE
+  OPENING_CAUTION_UNTIL_ET: '09:40',              // Higher thresholds during first 10 min
+  OPENING_MIN_SCORE: 85,                           // Score ≥85 required during open
+  OPENING_MIN_ALIGNMENT: 3,                        // 3/3 alignment required during open
+};
 
 /**
  * Start the main polling loop.
@@ -174,7 +189,7 @@ async function runCycle(phase) {
     // Re-score SPXW with multi-ticker bonus if applicable
     const baseScored = spxwData.scored;
     const scored = multiAnalysis.bonus > 0
-      ? scoreSpxGex(parsed, wallTrends, multiAnalysis.bonus)
+      ? scoreSpxGex(parsed, wallTrends, multiAnalysis.bonus, 'SPXW')
       : baseScored;
 
     const driverInfo = multiAnalysis.driver ? ` | Driver: ${multiAnalysis.driver.ticker}` : '';
@@ -188,6 +203,11 @@ async function runCycle(phase) {
     if (multiAnalysis.reshuffles?.some(r => r.detected)) {
       for (const r of multiAnalysis.reshuffles.filter(r => r.detected)) {
         try { await sendMapReshuffleAlert(r); } catch (_) {}
+        try {
+          const alertData = { type: 'MAP_RESHUFFLE', message: `${r.ticker}: ${r.new_count} new walls, ${r.disappeared_count} disappeared`, details: { ticker: r.ticker, newWalls: r.new_count, disappearedWalls: r.disappeared_count } };
+          dashboardEmitter.emit('alert', alertData);
+          saveAlert('MAP_RESHUFFLE', alertData);
+        } catch (_) {}
       }
     }
 
@@ -200,8 +220,28 @@ async function runCycle(phase) {
     lastScore = scored.score;
     updateLoopStatus({ cycleCount, lastSpot, lastScore, lastDirection: scored.direction });
 
-    // Dashboard: emit GEX update
-    try { dashboardEmitter.emit('gex_update', { spotPrice: parsed.spotPrice, score: scored.score, direction: scored.direction, confidence: scored.confidence, environment: scored.environment, wallsAbove: scored.wallsAbove?.slice(0, 4), wallsBelow: scored.wallsBelow?.slice(0, 4), breakdown: scored.breakdown }); } catch (_) {}
+    // Record score for chop detection
+    recordScore('SPXW', scored.score, scored.direction);
+
+    // Dashboard: emit GEX update (include full analysis data for trade idea)
+    try {
+      dashboardEmitter.emit('gex_update', {
+        spotPrice: parsed.spotPrice,
+        score: scored.score,
+        direction: scored.direction,
+        confidence: scored.confidence,
+        environment: scored.environment,
+        wallsAbove: scored.wallsAbove?.slice(0, 4),
+        wallsBelow: scored.wallsBelow?.slice(0, 4),
+        breakdown: scored.breakdown,
+        targetWall: scored.targetWall ? { strike: scored.targetWall.strike, gexValue: scored.targetWall.gexValue } : null,
+        floorWall: scored.floorWall ? { strike: scored.floorWall.strike, gexValue: scored.floorWall.gexValue } : null,
+        gexAtSpot: scored.gexAtSpot,
+        recommendation: scored.recommendation,
+        distanceToTarget: scored.distanceToTarget,
+        envDetail: scored.envDetail,
+      });
+    } catch (_) {}
 
     // Dashboard: emit Trinity update with multi-ticker analysis
     try { dashboardEmitter.emit('trinity_update', { ...trinityState, analysis: multiAnalysis }); } catch (_) {}
@@ -246,6 +286,25 @@ async function runCycle(phase) {
         scored.floorWall?.strike || null,
       );
 
+      try {
+        const targetStr = scored.targetWall ? ` | Target: ${scored.targetWall.strike}` : '';
+        const floorStr = scored.floorWall ? ` | ${scored.direction === 'BEARISH' ? 'Ceiling' : 'Floor'}: ${scored.floorWall.strike}` : '';
+        const recStr = scored.recommendation ? ` — ${scored.recommendation}` : '';
+        const alertData = {
+          type: 'FULL_ANALYSIS',
+          message: `${scored.direction} ${scored.score}/100 — ${scored.confidence}${targetStr}${floorStr}${recStr}`,
+          details: {
+            score: scored.score, direction: scored.direction, confidence: scored.confidence,
+            spotPrice: parsed.spotPrice, environment: scored.environment,
+            targetWall: scored.targetWall ? { strike: scored.targetWall.strike, gexValue: scored.targetWall.gexValue } : null,
+            floorWall: scored.floorWall ? { strike: scored.floorWall.strike, gexValue: scored.floorWall.gexValue } : null,
+            recommendation: scored.recommendation,
+            distanceToTarget: scored.distanceToTarget,
+          },
+        };
+        dashboardEmitter.emit('alert', alertData);
+        saveAlert('FULL_ANALYSIS', alertData);
+      } catch (_) {}
       log.info('Full analysis auto-sent to Discord');
     }
 
@@ -259,6 +318,7 @@ async function runCycle(phase) {
           `${scored.recommendation}`;
 
         await sendLiveAlert('DIRECTION_CHANGE', flipDetails);
+        try { dashboardEmitter.emit('alert', { type: 'DIRECTION_CHANGE', message: `${lastDirection} → ${scored.direction} | Score: ${scored.score}/100`, details: { from: lastDirection, to: scored.direction, score: scored.score, spotPrice: parsed.spotPrice } }); } catch (_) {}
         log.info(`Direction flip: ${lastDirection} \u2192 ${scored.direction}`);
 
         // On directional flip, also send full analysis + log prediction
@@ -277,19 +337,19 @@ async function runCycle(phase) {
     lastDirection = scored.direction;
 
     // ---- SPOT PRICE MOVEMENT ALERT ----
-    if (history.length >= 1) {
-      const prevSpot = history[history.length - 1].spotPrice;
-      const spotMovePct = Math.abs(parsed.spotPrice - prevSpot) / prevSpot * 100;
+    if (lastSpot > 0) {
+      const spotMovePct = Math.abs(parsed.spotPrice - lastSpot) / lastSpot * 100;
 
       if (spotMovePct > 0.3) {
-        const moveDir = parsed.spotPrice > prevSpot ? 'UP' : 'DOWN';
+        const moveDir = parsed.spotPrice > lastSpot ? 'UP' : 'DOWN';
         const moveStrike = Math.round(parsed.spotPrice / 5) * 5;
         if (shouldSendAlert('BIG_MOVE', moveStrike)) {
           await sendLiveAlert('ENVIRONMENT_CHANGE',
             `SPX moved **${moveDir} ${spotMovePct.toFixed(2)}%** in last cycle\n` +
-            `$${prevSpot.toFixed(2)} \u2192 $${parsed.spotPrice.toFixed(2)}\n` +
+            `$${lastSpot.toFixed(2)} \u2192 $${parsed.spotPrice.toFixed(2)}\n` +
             `Environment: ${scored.environment}`
           );
+          try { dashboardEmitter.emit('alert', { type: 'ENVIRONMENT_CHANGE', message: `SPX moved ${moveDir} ${spotMovePct.toFixed(2)}%`, details: { direction: moveDir, pct: spotMovePct, from: lastSpot, to: parsed.spotPrice } }); } catch (_) {}
         }
       }
     }
@@ -304,6 +364,7 @@ async function runCycle(phase) {
             `SPX at **$${parsed.spotPrice.toFixed(2)}** \u2014 within 1 strike of target wall at **${scored.targetWall.strike}** (${formatDollar(scored.targetWall.gexValue)})\n` +
             `Setup: ${scored.direction} | Score: ${scored.score}/100`
           );
+          try { dashboardEmitter.emit('alert', { type: 'PRICE_NEAR_TARGET', message: `Near target wall $${scored.targetWall.strike}`, details: { spotPrice: parsed.spotPrice, targetStrike: scored.targetWall.strike, direction: scored.direction, score: scored.score } }); } catch (_) {}
         }
       }
     }
@@ -320,12 +381,14 @@ async function runCycle(phase) {
           `${formatDollar(alert.prevValue)} \u2192 ${formatDollar(alert.wall.absGexValue)}\n` +
           `Type: ${alert.wall.type} | ${alert.wall.relativeToSpot} spot`
         );
+        try { dashboardEmitter.emit('alert', { type: 'WALL_GROWTH', message: `Wall $${alert.wall.strike} grew ${(alert.growthPct * 100).toFixed(0)}%`, details: { strike: alert.wall.strike, growthPct: alert.growthPct, wallType: alert.wall.type } }); } catch (_) {}
       } else if (alert.type === 'WALL_SHRINK') {
         await sendLiveAlert('WALL_SHRINK',
           `Wall at **${alert.wall.strike}** shrank **${(Math.abs(alert.growthPct) * 100).toFixed(0)}%**\n` +
           `${formatDollar(alert.prevValue)} \u2192 ${formatDollar(alert.wall.absGexValue)}\n` +
           `Potential breakout signal`
         );
+        try { dashboardEmitter.emit('alert', { type: 'WALL_SHRINK', message: `Wall $${alert.wall.strike} shrank ${(Math.abs(alert.growthPct) * 100).toFixed(0)}%`, details: { strike: alert.wall.strike, growthPct: alert.growthPct } }); } catch (_) {}
       }
     }
 
@@ -339,7 +402,22 @@ async function runCycle(phase) {
         const decision = decisionResult.decision;
         decision.spotPrice = parsed.spotPrice; // inject for Discord formatting
         await sendCombinedSignalAlert(decision);
+        try {
+          const alertData = { type: 'SIGNAL', message: `${decision.action.replace(/_/g, ' ')} — ${decision.confidence} confidence`, details: { action: decision.action, confidence: decision.confidence, reason: decision.reason, spotPrice: parsed.spotPrice, score: scored.score, direction: scored.direction } };
+          dashboardEmitter.emit('alert', alertData);
+          saveAlert('SIGNAL', alertData);
+        } catch (_) {}
         agentAction = decision.action;
+
+        // Save prediction for ENTER signals so trade ideas appear in dashboard Ideas tab
+        if (decision.action?.startsWith('ENTER')) {
+          savePrediction(
+            scored.direction, scored.score, parsed.spotPrice,
+            scored.targetWall?.strike || decision.target_wall?.strike || null,
+            scored.floorWall?.strike || decision.stop_level?.strike || null,
+          );
+        }
+
         log.info(`Decision: ${decision.action} (${decision.confidence}) — alert sent`);
       } else if (decisionResult && decisionResult.skipped) {
         agentAction = decisionResult.decision?.action || null;
@@ -348,30 +426,39 @@ async function runCycle(phase) {
         agentAction = decisionResult.decision?.action || null;
         log.debug(`Decision: ${decisionResult.decision?.action} (no change)`);
       }
-      // Dashboard: emit decision update
-      try { dashboardEmitter.emit('decision_update', { action: agentAction, decision: decisionResult?.decision }); } catch (_) {}
+      // Dashboard: emit decision update (include market mode for CHOP badge)
+      try { dashboardEmitter.emit('decision_update', { action: agentAction, decision: decisionResult?.decision, marketMode: detectChopMode('SPXW') }); } catch (_) {}
     } catch (decisionErr) {
       log.error('Decision engine error:', decisionErr.message);
     }
 
     // ---- PHASE 3: TRADE EXECUTION ----
     // Update Heatseeker spot cache for price feed
-    updateHeatseekerSpot(parsed.spotPrice);
+    updateLatestSpot(parsed.spotPrice);
 
     try {
       const posState = getPositionState();
 
       // A. If position OPEN → manage cycle (exit triggers, P&L updates)
       if (posState !== 'FLAT') {
-        const mgmt = managePosition(parsed.spotPrice, scored, agentAction);
+        const tvSnapshotForExit = getSignalSnapshot();
+        const mgmt = managePosition(parsed.spotPrice, scored, agentAction, { tvSnapshot: tvSnapshotForExit, multiAnalysis });
 
         if (mgmt.exitTriggered) {
-          // Estimate exit price via current P&L
-          const exitPrice = mgmt.pnl?.estimatedPrice || getCurrentPosition()?.entryPrice || 0;
-          const result = exitPosition(mgmt.exitReason, exitPrice, parsed.spotPrice);
+          const result = exitPosition(mgmt.exitReason, parsed.spotPrice);
           if (result) {
+            // Track exit for re-entry cooldown
+            lastExitTime = Date.now();
+            lastExitDirection = result.direction;
+
             await sendTradeClosed(result);
             try { dashboardEmitter.emit('trade_closed', result); } catch (_) {}
+            try {
+              const pnlStr = `${result.spxChange > 0 ? '+' : ''}${result.spxChange} pts`;
+              const alertData = { type: 'TRADE_CLOSED', message: `${result.contract} — ${result.exitReason} ${pnlStr}`, details: { contract: result.contract, exitReason: result.exitReason, spxChange: result.spxChange, pnlPct: result.pnlPct, direction: result.direction, entrySpx: result.entrySpx, exitSpx: result.exitSpx } };
+              dashboardEmitter.emit('alert', alertData);
+              saveAlert('TRADE_CLOSED', alertData);
+            } catch (_) {}
 
             // Phase 5: Phantom comparison + rollback check after trade close
             try {
@@ -396,11 +483,8 @@ async function runCycle(phase) {
               contract: pos.contract,
               direction: pos.direction,
               pnlPct: mgmt.pnl.pnlPct,
-              pnlDollars: mgmt.pnl.pnlDollars,
               currentSpx: parsed.spotPrice,
               entrySpx: pos.entrySpx,
-              estimatedPrice: mgmt.pnl.estimatedPrice,
-              entryPrice: pos.entryPrice,
             };
             await sendPositionUpdate(posUpdate);
             try { dashboardEmitter.emit('position_update', posUpdate); } catch (_) {}
@@ -408,18 +492,31 @@ async function runCycle(phase) {
         }
       }
 
-      // B. If FLAT + agent ENTER + Polygon available → open trade
-      if (getPositionState() === 'FLAT' && agentAction && isPolygonAvailable()) {
+      // B. If FLAT + agent ENTER → open trade (with guardrails)
+      if (getPositionState() === 'FLAT' && agentAction) {
         const isEnter = agentAction === 'ENTER_CALLS' || agentAction === 'ENTER_PUTS';
         if (isEnter) {
-          await handleTradeEntry(agentAction, parsed, scored, wallTrends);
+          const guardrail = validateEntryGuardrails(agentAction, scored, multiAnalysis);
+          if (guardrail.allowed) {
+            await handleTradeEntry(agentAction, parsed, scored, wallTrends);
+          } else {
+            log.warn(`Entry BLOCKED: ${agentAction} — ${guardrail.reason}`);
+            // Save blocked entry to DB for end-of-day review
+            try {
+              saveAlert('ENTRY_BLOCKED', { type: 'ENTRY_BLOCKED', message: `${agentAction} blocked — ${guardrail.reason}`, details: { action: agentAction, reason: guardrail.reason, score: scored.score, direction: scored.direction, spotPrice: parsed.spotPrice } });
+            } catch (_) {}
+            // Tell dashboard the entry was blocked so TradeCard shows the reason
+            try {
+              dashboardEmitter.emit('entry_blocked', { action: agentAction, reason: guardrail.reason, spotPrice: parsed.spotPrice });
+            } catch (_) {}
+          }
         }
       }
 
       // C. If NOT FLAT + agent ENTER again → phantom trade
       if (getPositionState() !== 'FLAT' && agentAction) {
         const isEnter = agentAction === 'ENTER_CALLS' || agentAction === 'ENTER_PUTS';
-        if (isEnter && shouldBePhantom() && isPolygonAvailable()) {
+        if (isEnter && shouldBePhantom()) {
           await handlePhantomEntry(agentAction, parsed, scored, wallTrends);
         }
       }
@@ -496,53 +593,154 @@ async function handleEodRecap() {
 }
 
 /**
+ * Validate entry against hard guardrails.
+ * These rules override the agent — even if the agent says ENTER, we block if:
+ * 1. TV regime conflicts (Pink Diamond fired → no calls until Blue Diamond)
+ * 2. Insufficient alignment (< 2/3 tickers) with no TV confirmation
+ * 3. Re-entry cooldown hasn't elapsed after recent exit in same direction
+ */
+function validateEntryGuardrails(agentAction, scored, multiAnalysis) {
+  const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
+  const tvSnapshot = getSignalSnapshot();
+  const tvRegime = getTvRegime();
+  const alignment = multiAnalysis?.alignment?.count || 0;
+
+  // Count TV confirmations for the entry direction (now includes Echo + Bravo + Tango × 2 timeframes)
+  const spxConf = tvSnapshot.spx?.confirmations || {};
+  const tvBullish = spxConf.bullish || 0;
+  const tvBearish = spxConf.bearish || 0;
+  const tvConfirms = direction === 'BULLISH' ? tvBullish : tvBearish;
+  const tvWeighted = tvSnapshot.spx?.weighted_score || {};
+  const tvWeightedScore = direction === 'BULLISH' ? (tvWeighted.bullish || 0) : (tvWeighted.bearish || 0);
+
+  // Rule 1: TV Regime gate
+  // Once Pink Diamond fires → BEARISH regime → no calls until Blue Diamond fires
+  // Once Blue Diamond fires → BULLISH regime → no puts until Pink Diamond fires
+  if (tvRegime.direction) {
+    if (direction === 'BULLISH' && tvRegime.direction === 'BEARISH') {
+      return { allowed: false, reason: `TV regime is BEARISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${Math.round((Date.now() - tvRegime.setAt) / 60000)}m ago) — need Blue Diamond before entering calls` };
+    }
+    if (direction === 'BEARISH' && tvRegime.direction === 'BULLISH') {
+      return { allowed: false, reason: `TV regime is BULLISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${Math.round((Date.now() - tvRegime.setAt) / 60000)}m ago) — need Pink Diamond before entering puts` };
+    }
+  }
+
+  // Rule 2: Alignment + TV gate
+  // With 0 TV confirmation, need alignment >= config threshold (default 2/3)
+  // EXCEPTION: Strong SPX momentum + high GEX score overrides alignment requirement
+  const alignmentMin = (getActiveConfig() || {}).alignment_min_for_entry || 2;
+  if (tvConfirms === 0 && alignment < alignmentMin) {
+    const momentum = getSpotMomentum('SPXW');
+    const momentumAligned = (direction === 'BULLISH' && momentum.direction === 'UP') ||
+                            (direction === 'BEARISH' && momentum.direction === 'DOWN');
+
+    if (momentum.strength === 'STRONG' && momentumAligned && scored.score >= 80) {
+      log.info(`Momentum override: ${momentum.strength} ${momentum.direction} ($${momentum.absPoints}) with score ${scored.score} — allowing entry despite ${alignment}/3 alignment, 0 TV`);
+    } else {
+      return { allowed: false, reason: `Only ${alignment}/3 aligned, 0 TV confirms (weighted: ${tvWeightedScore.toFixed(1)}) — need ${alignmentMin}/3 alignment or TV confirmation (momentum: ${momentum.strength} ${momentum.direction})` };
+    }
+  }
+
+  // Rule 3: Re-entry cooldown
+  // After exiting a position, wait before re-entering the same direction
+  if (lastExitTime > 0 && lastExitDirection === direction) {
+    const elapsed = Date.now() - lastExitTime;
+    if (elapsed < REENTRY_COOLDOWN_MS) {
+      const remaining = Math.round((REENTRY_COOLDOWN_MS - elapsed) / 1000);
+      return { allowed: false, reason: `Re-entry cooldown: exited ${direction} ${Math.round(elapsed / 1000)}s ago, wait ${remaining}s more` };
+    }
+  }
+
+  // Rule 4: Max trades per day
+  if (todayTradeCount >= ENTRY_GATES.MAX_TRADES_PER_DAY) {
+    return { allowed: false, reason: `Max trades reached: ${todayTradeCount}/${ENTRY_GATES.MAX_TRADES_PER_DAY} today` };
+  }
+
+  // Rule 5: Min time between ANY entries (not just same direction)
+  if (lastEntryTime > 0) {
+    const elapsed = Date.now() - lastEntryTime;
+    if (elapsed < ENTRY_GATES.MIN_TIME_BETWEEN_ENTRIES_MS) {
+      const remaining = Math.round((ENTRY_GATES.MIN_TIME_BETWEEN_ENTRIES_MS - elapsed) / 1000);
+      return { allowed: false, reason: `Entry cooldown: last entry ${Math.round(elapsed / 1000)}s ago, wait ${remaining}s more` };
+    }
+  }
+
+  // Rule 6: Direction stability — score must be stable for 3 consecutive cycles
+  if (!isDirectionStable('SPXW', ENTRY_GATES.MIN_STABLE_DIRECTION_CYCLES)) {
+    return { allowed: false, reason: `Unstable direction: score hasn't been stable for ${ENTRY_GATES.MIN_STABLE_DIRECTION_CYCLES} consecutive cycles` };
+  }
+
+  // Rule 7: Recent direction flip — wait 4 cycles after a flip
+  if (hadRecentDirectionFlip('SPXW', ENTRY_GATES.NO_ENTRY_AFTER_FLIP_CYCLES)) {
+    return { allowed: false, reason: `Direction flipped in last ${ENTRY_GATES.NO_ENTRY_AFTER_FLIP_CYCLES} cycles — wait for stabilization` };
+  }
+
+  // Rule 8: Time of day gate — no new entries after 3:00 PM ET on 0DTE
+  const etNow = nowET();
+  const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
+  if (timeET >= ENTRY_GATES.NO_ENTRY_AFTER_ET) {
+    return { allowed: false, reason: `Time gate: no new entries after ${ENTRY_GATES.NO_ENTRY_AFTER_ET} ET on 0DTE` };
+  }
+
+  // Rule 9: Opening caution (9:30-9:40) — higher thresholds
+  if (timeET < ENTRY_GATES.OPENING_CAUTION_UNTIL_ET && timeET >= '09:30') {
+    if (scored.score < ENTRY_GATES.OPENING_MIN_SCORE) {
+      return { allowed: false, reason: `Opening caution: score ${scored.score} < ${ENTRY_GATES.OPENING_MIN_SCORE} required before ${ENTRY_GATES.OPENING_CAUTION_UNTIL_ET}` };
+    }
+    if (alignment < ENTRY_GATES.OPENING_MIN_ALIGNMENT) {
+      return { allowed: false, reason: `Opening caution: alignment ${alignment}/3 < ${ENTRY_GATES.OPENING_MIN_ALIGNMENT}/3 required before ${ENTRY_GATES.OPENING_CAUTION_UNTIL_ET}` };
+    }
+  }
+
+  // Rule 10: Chop mode — require higher score during chop
+  const chopCfg = getActiveConfig() || {};
+  const chopResult = detectChopMode('SPXW', chopCfg.chop_lookback_cycles || 60);
+  if (chopResult.isChop && scored.score < (chopCfg.gex_strong_score || 80)) {
+    return { allowed: false, reason: `Chop mode (${chopResult.reason}) — need score >= ${chopCfg.gex_strong_score || 80} during chop, got ${scored.score}` };
+  }
+
+  return { allowed: true };
+}
+
+/**
  * Handle a new trade entry (ENTER_CALLS or ENTER_PUTS).
+ * Uses GEX walls for strike/target/stop — no delayed Polygon chain needed.
  */
 async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
   const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
 
   try {
-    // Fetch options chain
-    const chain = await fetch0DteChain(parsed.spotPrice);
-    if (!chain) {
-      log.warn('No chain data — skipping trade entry');
-      return;
-    }
+    const spotPrice = parsed.spotPrice;
+    const atm = Math.round(spotPrice / 5) * 5;
 
-    // Select strike
-    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? parsed.spotPrice + 20 : parsed.spotPrice - 20);
-    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? parsed.spotPrice - 10 : parsed.spotPrice + 10);
+    // Strike: ATM for calls, ATM for puts
+    const strike = atm;
 
-    const selection = selectStrike({
-      direction,
-      spotPrice: parsed.spotPrice,
-      atm: chain.atm,
-      calls: chain.calls,
-      puts: chain.puts,
-      targetSpx,
-      stopSpx,
-    });
+    // Target & stop from GEX walls
+    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? spotPrice + 20 : spotPrice - 20);
+    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? spotPrice - 10 : spotPrice + 10);
 
-    if (!selection.selected) {
-      log.warn(`No valid strike selected for ${direction} — skipping`);
-      return;
-    }
+    // Synthetic contract name (0DTE SPX format)
+    const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const optType = direction === 'BULLISH' ? 'C' : 'P';
+    const contract = `SPX${expDate}${optType}${strike}`;
 
-    const { contract, entryPrice, targets } = selection.selected;
     const tvSnapshot = getSignalSnapshot();
 
-    // Enter position
+    log.info(`Trade entry: ${contract} | spot=$${spotPrice} ATM=$${atm} | target=$${targetSpx} stop=$${stopSpx}`);
+
+    // Enter position (entryPrice=0 since we don't have live quotes)
     const pos = enterPosition({
-      contract: contract.ticker,
+      contract,
       direction,
-      strike: contract.strike,
-      entryPrice,
-      entrySpx: parsed.spotPrice,
-      targetPrice: targets.targetOptionPrice,
-      stopPrice: targets.stopOptionPrice,
+      strike,
+      entryPrice: 0,
+      entrySpx: spotPrice,
+      targetPrice: 0,
+      stopPrice: 0,
       targetSpx,
       stopSpx,
-      greeks: contract.greeks,
+      greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
       gexState: {
         score: scored.score,
         direction: scored.direction,
@@ -553,16 +751,25 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
     });
 
     if (pos) {
+      // Track entry for quality gates
+      lastEntryTime = Date.now();
+      todayTradeCount++;
+
       const tradeData = {
         ...pos,
-        targetPnlPct: targets.targetPnlPct,
-        stopPnlPct: targets.stopPnlPct,
-        rewardRiskRatio: targets.rewardRiskRatio,
-        greeks: contract.greeks,
+        targetPnlPct: 0,
+        stopPnlPct: 0,
+        rewardRiskRatio: 0,
+        greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
         agentReasoning: scored.recommendation || null,
       };
       await sendTradeCard(tradeData);
       try { dashboardEmitter.emit('trade_opened', tradeData); } catch (_) {}
+      try {
+        const alertData = { type: 'TRADE_OPENED', message: `${tradeData.contract} — ${tradeData.direction}`, details: { contract: tradeData.contract, direction: tradeData.direction, strike: tradeData.strike, entryPrice: tradeData.entryPrice, spotPrice: tradeData.spotPrice } };
+        dashboardEmitter.emit('alert', alertData);
+        saveAlert('TRADE_OPENED', alertData);
+      } catch (_) {}
     }
   } catch (err) {
     log.error(`Trade entry failed: ${err.message}`);
@@ -571,42 +778,34 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
 
 /**
  * Handle a phantom trade entry (new ENTER while already in a position).
+ * Uses GEX walls for strike/target/stop — no delayed Polygon chain needed.
  */
 async function handlePhantomEntry(agentAction, parsed, scored, wallTrends) {
   const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
 
   try {
-    const chain = await fetch0DteChain(parsed.spotPrice);
-    if (!chain) return;
+    const spotPrice = parsed.spotPrice;
+    const atm = Math.round(spotPrice / 5) * 5;
+    const strike = atm;
 
-    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? parsed.spotPrice + 20 : parsed.spotPrice - 20);
-    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? parsed.spotPrice - 10 : parsed.spotPrice + 10);
+    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? spotPrice + 20 : spotPrice - 20);
+    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? spotPrice - 10 : spotPrice + 10);
 
-    const selection = selectStrike({
-      direction,
-      spotPrice: parsed.spotPrice,
-      atm: chain.atm,
-      calls: chain.calls,
-      puts: chain.puts,
-      targetSpx,
-      stopSpx,
-    });
-
-    if (!selection.selected) return;
-
-    const { contract, entryPrice, targets } = selection.selected;
+    const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const optType = direction === 'BULLISH' ? 'C' : 'P';
+    const contract = `SPX${expDate}${optType}${strike}`;
 
     recordPhantom({
-      contract: contract.ticker,
+      contract,
       direction,
-      strike: contract.strike,
-      entryPrice,
-      entrySpx: parsed.spotPrice,
-      targetPrice: targets.targetOptionPrice,
-      stopPrice: targets.stopOptionPrice,
+      strike,
+      entryPrice: 0,
+      entrySpx: spotPrice,
+      targetPrice: 0,
+      stopPrice: 0,
       targetSpx,
       stopSpx,
-      greeks: contract.greeks,
+      greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
       gexState: { score: scored.score, direction: scored.direction },
       tvState: getSignalSnapshot(),
       agentReasoning: null,
@@ -641,7 +840,12 @@ function scheduleDailyReset() {
     if (!running) return;
 
     resetNodeTouches();
-    log.info('Node touch tracker reset for new trading day');
+    resetDailyState();
+    todayTradeCount = 0;
+    lastEntryTime = 0;
+    lastExitTime = 0;
+    lastExitDirection = null;
+    log.info('Daily reset: node tracker, smoothing, trade counters');
 
     // Reschedule for next day
     scheduleDailyReset();

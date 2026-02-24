@@ -10,15 +10,23 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ChatAgent');
 
-const CHAT_SYSTEM_PROMPT = `You are OpenClaw's conversational trading assistant. You help the operator understand the current market setup, GEX positioning, TV signal states, and the automated trading system's decisions.
+const CHAT_SYSTEM_PROMPT = `You are OpenClaw, a trading system monitoring SPX, SPY, and QQQ. You are talking to your operator.
 
-Key rules:
-- You have FULL real-time data access — it's injected below as context. Use specific numbers, levels, and states in your answers.
-- Be direct and concise. No filler. Use trading terminology naturally.
-- You are NOT making trading decisions — the automated 30-second loop handles that. You explain, analyze, and discuss.
-- Never give financial advice. Discuss data and system state objectively.
-- If asked "why" the system is doing something, reference the specific GEX score, TV confirmations, thresholds, and rules that drive the decision.
-- Format responses with short paragraphs. Use bullet points for lists of levels or signals.`;
+RULES — FOLLOW THESE EXACTLY:
+
+1. ALWAYS use specific numbers from the CURRENT STATE provided. Never say "the algorithm" or "historical data" or "internal logic." Say "SPX is at 6835, the 6800 wall is $17.4M, Bravo is PINK_1."
+
+2. When asked WHY something is happening, look at the actual data and explain WHAT you see, not theory about how algorithms work. Bad: "The GEX algorithm might not weight TV signals heavily." Good: "GEX is 100 bullish because there's -$14.8M negative gamma at 6835 pulling price up and $10.4M positive at 6800 as a floor. But Bravo is PINK_1 on all 3 tickers and price dropped from 6909 to 6835, so momentum disagrees with the wall setup."
+
+3. Keep responses SHORT. 2-4 sentences for simple questions. No numbered lists of possibilities. Give your ONE best read, not 6 maybes.
+
+4. Be direct and opinionated. Say "I think bearish here because..." not "it could be bullish or bearish depending on..." Your operator wants your read, not a hedge.
+
+5. If the data conflicts (like bullish GEX + bearish TV), say so directly: "The data is conflicting — GEX says X because of Y, but Bravo says Z. I'd weight [one] more here because [specific reason]."
+
+6. Reference walls by strike and dollar value. Reference indicators by their exact state. Reference prices to the dollar.
+
+7. You are NOT a textbook. You are a trader looking at live data. Talk like one.`;
 
 // Initialize OpenAI client for Kimi
 let client = null;
@@ -107,81 +115,97 @@ export async function callKimiChat(message, currentState, history = []) {
 }
 
 /**
- * Format system state into a readable context string for the chat agent.
+ * Format system state into a clean, readable snapshot the chat agent will actually reference.
  */
 function formatStateForChat(state) {
   if (!state) return 'No state available.';
 
   const lines = [];
 
-  // Market phase
-  lines.push(`**Phase:** ${state.phase?.phase || 'Unknown'} — ${state.phase?.description || ''}`);
-  lines.push(`**Server Time:** ${state.serverTime || 'N/A'}`);
+  lines.push(`[LIVE DATA — ${state.serverTime || 'N/A'} ET]`);
 
-  // GEX
+  // Prices from trinity
+  const spxSpot = state.gex?.spotPrice || state.trinity?.spxw?.spotPrice;
+  const spySpot = state.trinity?.spy?.spotPrice;
+  const qqqSpot = state.trinity?.qqq?.spotPrice;
+  lines.push(`\nPRICES: SPX $${spxSpot?.toFixed(2) || 'N/A'} | SPY $${spySpot?.toFixed(2) || 'N/A'} | QQQ $${qqqSpot?.toFixed(2) || 'N/A'}`);
+
+  // SPX GEX detail
   if (state.gex) {
-    lines.push(`\n**GEX:**`);
-    lines.push(`- SPX Spot: $${state.gex.spotPrice}`);
-    lines.push(`- Score: ${state.gex.score} | Direction: ${state.gex.direction} | Confidence: ${state.gex.confidence}`);
-    lines.push(`- Environment: ${state.gex.environment}`);
-    if (state.gex.wallsAbove?.length) {
-      lines.push(`- Walls Above: ${state.gex.wallsAbove.map(w => `$${w.strike} (${(w.gex / 1e6).toFixed(0)}M)`).join(', ')}`);
+    const g = state.gex;
+    lines.push(`\nSPX GEX: Score ${g.score}/100 ${g.direction} | Environment: ${g.environment}`);
+    if (g.wallsAbove?.length) {
+      lines.push(`  Walls above: ${g.wallsAbove.map(w => `${w.strike} (${formatWallVal(w.gexValue || w.gex || w.absGexValue)})`).join(', ')}`);
     }
-    if (state.gex.wallsBelow?.length) {
-      lines.push(`- Walls Below: ${state.gex.wallsBelow.map(w => `$${w.strike} (${(w.gex / 1e6).toFixed(0)}M)`).join(', ')}`);
+    if (g.wallsBelow?.length) {
+      lines.push(`  Walls below: ${g.wallsBelow.map(w => `${w.strike} (${formatWallVal(w.gexValue || w.gex || w.absGexValue)})`).join(', ')}`);
     }
-  } else {
-    lines.push('\n**GEX:** No data');
+    if (g.breakdown?.length) {
+      lines.push(`  Score breakdown: ${g.breakdown.join(' | ')}`);
+    }
   }
 
-  // TV Signals
+  // SPY + QQQ from trinity
+  const spyScored = state.trinity?.spy?.scored;
+  const qqqScored = state.trinity?.qqq?.scored;
+  if (spyScored) lines.push(`SPY GEX: Score ${spyScored.score}/100 ${spyScored.direction} | ${spyScored.environment}`);
+  if (qqqScored) lines.push(`QQQ GEX: Score ${qqqScored.score}/100 ${qqqScored.direction} | ${qqqScored.environment}`);
+
+  // Multi-ticker analysis from trinity
+  const analysis = state.trinity?.analysis;
+  if (analysis) {
+    lines.push(`\nALIGNMENT: ${analysis.alignment?.count || 0}/3 ${analysis.alignment?.direction || 'N/A'}`);
+    if (analysis.driver) {
+      lines.push(`DRIVER: ${analysis.driver.ticker} — ${analysis.driver.reason || 'N/A'}`);
+    }
+  }
+
+  // TV Signals — per ticker
   if (state.tv?.snapshot) {
-    const tvSnap = state.tv.snapshot;
-    lines.push(`\n**TV Signals:**`);
-    lines.push(`- Bullish confirmations: ${tvSnap.confirmations?.bullish || 0}/2`);
-    lines.push(`- Bearish confirmations: ${tvSnap.confirmations?.bearish || 0}/2`);
-    if (state.tv.detailed) {
-      for (const ind of state.tv.detailed) {
-        lines.push(`- ${ind.indicator}: ${ind.state} → ${ind.classification}${ind.isStale ? ' (STALE)' : ''}`);
+    const snap = state.tv.snapshot;
+    lines.push(`\nTV SIGNALS:`);
+    for (const tkr of ['spx', 'spy', 'qqq']) {
+      const t = snap[tkr];
+      if (t) {
+        const conf = t.confirmations || {};
+        lines.push(`  ${tkr.toUpperCase()}: Bravo=${t.bravo || 'NONE'} Tango=${t.tango || 'NONE'} (${conf.bullish || 0} bull / ${conf.bearish || 0} bear)`);
       }
     }
-  } else {
-    lines.push('\n**TV Signals:** No data');
+    if (state.tv.detailed?.length) {
+      const staleList = state.tv.detailed.filter(d => d.isStale);
+      if (staleList.length > 0) {
+        lines.push(`  STALE: ${staleList.map(d => d.indicator).join(', ')}`);
+      }
+    }
   }
 
   // Current decision
   if (state.decision) {
-    lines.push(`\n**Current Decision:** ${state.decision.action || 'WAIT'}`);
-    lines.push(`- Reason: ${state.decision.reason || 'N/A'}`);
-    lines.push(`- Confidence: ${state.decision.confidence || 'N/A'}`);
+    const d = state.decision.decision || state.decision;
+    lines.push(`\nCURRENT SIGNAL: ${d.action || state.decision.action || 'WAIT'} (${d.confidence || state.decision.confidence || 'N/A'})`);
+    if (d.reason) lines.push(`  Reason: ${d.reason}`);
   }
 
   // Position
   if (state.position?.details) {
     const pos = state.position.details;
-    lines.push(`\n**Position:** ${state.position.state}`);
-    lines.push(`- Direction: ${pos.direction} | Entry: $${pos.entryPrice}`);
-    if (pos.currentPnl !== undefined) {
-      lines.push(`- Current P&L: $${pos.currentPnl?.toFixed(2) || '0'} (${pos.currentPnlPct?.toFixed(1) || '0'}%)`);
-    }
+    lines.push(`\nPOSITION: ${state.position.state} — ${pos.contract || pos.direction || 'N/A'}`);
+    if (pos.entryPrice) lines.push(`  Entry: $${pos.entryPrice} | SPX at entry: $${pos.entrySpx || 'N/A'}`);
   } else {
-    lines.push(`\n**Position:** ${state.position?.state || 'FLAT'}`);
+    lines.push(`\nPOSITION: ${state.position?.state || 'FLAT'}`);
   }
 
-  // Trinity
-  if (state.trinity) {
-    lines.push(`\n**Trinity Cross-Market:**`);
-    for (const [sym, data] of Object.entries(state.trinity)) {
-      if (data) {
-        lines.push(`- ${sym.toUpperCase()}: ${data.direction || 'N/A'} (score: ${data.score || 'N/A'})`);
-      }
-    }
-  }
-
-  // Strategy
-  if (state.strategy) {
-    lines.push(`\n**Strategy:** v${state.strategy.version} (${state.strategy.label || 'default'})`);
-  }
+  // Phase
+  lines.push(`\nPHASE: ${state.phase?.phase || 'Unknown'} — ${state.phase?.description || ''}`);
 
   return lines.join('\n');
+}
+
+function formatWallVal(val) {
+  if (val == null) return '?';
+  const abs = Math.abs(val);
+  const sign = val < 0 ? '-' : '';
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}K`;
+  return `${sign}$${abs.toFixed(0)}`;
 }

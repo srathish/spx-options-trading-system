@@ -12,8 +12,10 @@ const initialState = {
   gex: null,
   decision: null,
   position: null,
+  lastTrade: null,
   tv: null,
   trinity: null,
+  alerts: [],
   serverTime: null,
   lastEvent: null,
 };
@@ -41,7 +43,10 @@ function reducer(state, action) {
       return { ...state, tv: action.data, lastEvent: 'tv_update' };
 
     case 'decision_update':
-      return { ...state, decision: { ...state.decision, ...action.data }, lastEvent: 'decision_update' };
+      return { ...state, decision: { ...state.decision, ...action.data, entryBlocked: null }, lastEvent: 'decision_update' };
+
+    case 'entry_blocked':
+      return { ...state, decision: { ...state.decision, entryBlocked: action.data }, lastEvent: 'entry_blocked' };
 
     case 'position_update':
       return {
@@ -54,6 +59,7 @@ function reducer(state, action) {
       return {
         ...state,
         position: { state: 'PENDING', details: action.data },
+        lastTrade: null,
         lastEvent: 'trade_opened',
       };
 
@@ -61,6 +67,7 @@ function reducer(state, action) {
       return {
         ...state,
         position: { state: 'FLAT', details: null },
+        lastTrade: { ...action.data, closedAt: Date.now() },
         lastEvent: 'trade_closed',
       };
 
@@ -69,6 +76,13 @@ function reducer(state, action) {
 
     case 'health_update':
       return { ...state, loop: action.data.loop, serverTime: action.data.time, lastEvent: 'health_update' };
+
+    case 'alert':
+      return {
+        ...state,
+        alerts: [{ ...action.data, ts: Date.now() }, ...state.alerts].slice(0, 50),
+        lastEvent: 'alert',
+      };
 
     case 'SET_CONNECTED':
       return { ...state, connected: action.connected };

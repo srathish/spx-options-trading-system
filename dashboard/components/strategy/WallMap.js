@@ -26,7 +26,7 @@ export function WallMap() {
   return (
     <Card title="GEX Wall Map">
       <div className="h-48">
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer width="100%" height="100%" minWidth={0}>
           <BarChart data={allWalls}>
             <XAxis dataKey="strike" tick={{ fontSize: 10, fill: '#6b7280' }} />
             <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} tickFormatter={v => `${(v / 1e6).toFixed(1)}M`} />

@@ -332,25 +332,71 @@ export async function sendCombinedSignalAlert(decision) {
   const color = actionColors[decision.action] || COLORS.SYSTEM;
   const emoji = actionEmojis[decision.action] || '\uD83D\uDD14';
 
-  // Build TV confirmation grid
+  // Build per-ticker TV confirmation grid (multi-indicator + multi-timeframe)
   const tvDetails = decision.tvDetailedState || [];
   let tvGrid = '';
+
+  // Group by ticker, then by indicator
+  const byTicker = {};
   for (const sig of tvDetails) {
-    const icon = sig.classification === 'BULLISH' ? '\u2705'
-      : sig.classification === 'BEARISH' ? '\u274C'
-      : '\u2796';
-    const staleTag = sig.isStale ? ' (STALE)' : '';
-    tvGrid += `${icon} ${sig.indicator.charAt(0).toUpperCase() + sig.indicator.slice(1)}: ${sig.state}${staleTag}\n`;
+    const tkr = sig.ticker || 'spx';
+    if (!byTicker[tkr]) byTicker[tkr] = [];
+    byTicker[tkr].push(sig);
   }
 
+  // Per-ticker lines with timeframe columns
+  for (const tkr of ['spx', 'spy', 'qqq']) {
+    const sigs = byTicker[tkr];
+    if (!sigs) continue;
+
+    // Group by indicator name
+    const byInd = {};
+    for (const sig of sigs) {
+      const ind = sig.indicatorName || sig.key?.split('_')[1] || 'unknown';
+      if (!byInd[ind]) byInd[ind] = {};
+      byInd[ind][sig.timeframe || '3'] = sig;
+    }
+
+    const lines = [];
+    for (const ind of ['echo', 'bravo', 'tango']) {
+      if (!byInd[ind]) continue;
+      const parts = [];
+      for (const tf of ['1', '3']) {
+        const sig = byInd[ind]?.[tf];
+        if (!sig || sig.state === 'NONE') {
+          parts.push(`${tf}m:—`);
+        } else {
+          const icon = sig.classification === 'BULLISH' ? '\u2705'
+            : sig.classification === 'BEARISH' ? '\u274C'
+            : '\u2796';
+          const staleTag = sig.isStale ? '*' : '';
+          parts.push(`${tf}m:${icon}${sig.state}${staleTag}`);
+        }
+      }
+      lines.push(`  ${ind.charAt(0).toUpperCase() + ind.slice(1)}: ${parts.join(' ')}`);
+    }
+    tvGrid += `${tkr.toUpperCase()}:\n${lines.join('\n')}\n`;
+  }
+
+  // TV weighted scores + confidence
   const tvState = decision.tvState || {};
+  const tvConf = decision.tv_confidence || tvState.confidence || 'NONE';
+  const spxWeighted = tvState.spx?.weighted_score || {};
+  tvGrid += `\nTV: ${tvConf} | SPX wt: ${(spxWeighted.bullish || 0).toFixed(1)}B/${(spxWeighted.bearish || 0).toFixed(1)}R`;
+
   const confirmBullish = tvState.confirmations?.bullish || 0;
   const confirmBearish = tvState.confirmations?.bearish || 0;
-  const confirmTotal = tvState.confirmations?.total || 2;
+  const confirmTotal = tvState.confirmations?.total || 6;
+
+  // Cross-market count
+  const crossMarket = tvState.cross_market || {};
+  const crossBull = crossMarket.bullish_tickers || 0;
+  const crossBear = crossMarket.bearish_tickers || 0;
+  const crossTotal = crossMarket.total || 3;
 
   // Determine confirm display
   const maxConfirm = Math.max(confirmBullish, confirmBearish);
-  const confirmDir = confirmBullish >= confirmBearish ? 'bullish' : 'bearish';
+  const tvConfidenceLabel = tvConf !== 'NONE' ? ` [${tvConf}]` : '';
 
   // Build multi-ticker summary line
   let multiLine = `SPX: **$${(decision.spotPrice || 0).toFixed(2)}** (${decision.gexScore || '--'}/100 ${decision.gexDirection || '--'})`;
@@ -399,9 +445,12 @@ export async function sendCombinedSignalAlert(decision) {
     embed.fields.push({ name: 'GEX Levels', value: gexField, inline: false });
   }
 
-  // TV confirmations field
+  // TV confirmations field (per-ticker + cross-market)
+  const crossLabel = crossBull + crossBear > 0
+    ? ` | Cross: ${crossBull}/${crossTotal} BULL`
+    : '';
   embed.fields.push({
-    name: `TV Confirmations: ${maxConfirm}/${confirmTotal}`,
+    name: `TV${tvConfidenceLabel}: SPX ${maxConfirm}/${confirmTotal}${crossLabel}`,
     value: `\`\`\`\n${tvGrid}\`\`\``,
     inline: false,
   });
@@ -463,34 +512,24 @@ export async function sendTradeCard(trade) {
     color,
     fields: [
       {
-        name: 'Contract',
-        value: `\`${trade.contract}\`\nStrike: **$${trade.strike}** | Entry: **$${trade.entryPrice.toFixed(2)}**`,
+        name: 'Trade',
+        value: `**SPX ${typeLabel} ${trade.strike}**`,
         inline: false,
       },
       {
-        name: 'Target',
-        value: `$${trade.targetPrice.toFixed(2)} (**+${trade.targetPnlPct}%**)`,
+        name: 'SPX Entry',
+        value: `$${trade.entrySpx?.toFixed(2) || '?'}`,
         inline: true,
       },
       {
-        name: 'Stop',
-        value: `$${trade.stopPrice.toFixed(2)} (**${trade.stopPnlPct}%**)`,
+        name: 'Target SPX',
+        value: `$${trade.targetSpx || '?'}`,
         inline: true,
       },
       {
-        name: 'R:R',
-        value: `**${trade.rewardRiskRatio}:1**`,
+        name: 'Stop SPX',
+        value: `$${trade.stopSpx || '?'}`,
         inline: true,
-      },
-      {
-        name: 'SPX Levels',
-        value: `Spot: $${trade.entrySpx.toFixed(2)}\nTarget: $${trade.targetSpx} | Stop: $${trade.stopSpx}`,
-        inline: false,
-      },
-      {
-        name: 'Greeks',
-        value: `\`\`\`\nDelta: ${trade.greeks.delta?.toFixed(3) || '?'}  Gamma: ${trade.greeks.gamma?.toFixed(4) || '?'}\nTheta: ${trade.greeks.theta?.toFixed(2) || '?'}  IV: ${((trade.greeks.iv || 0) * 100).toFixed(1)}%\n\`\`\``,
-        inline: false,
       },
     ],
     footer: { text: `OpenClaw v3.0 | ${now} ET` },
@@ -516,24 +555,22 @@ export async function sendPositionUpdate(update) {
   const pnlColor = update.pnlPct >= 0 ? 0x00D26A : 0xE94560;
   const pnlSign = update.pnlPct >= 0 ? '+' : '';
 
+  const spxPts = update.currentSpx - update.entrySpx;
+  const spxSign = spxPts >= 0 ? '+' : '';
+
   const embed = {
     title: '\uD83D\uDCCA Position Update',
     color: 0x6366F1, // indigo
     description: `**${update.contract}** | ${update.direction}`,
     fields: [
       {
-        name: 'P&L',
-        value: `**${pnlSign}${update.pnlPct}%** ($${pnlSign}${update.pnlDollars.toFixed(2)})`,
+        name: 'SPX Movement',
+        value: `**${spxSign}${spxPts.toFixed(1)} pts**`,
         inline: true,
       },
       {
         name: 'SPX',
         value: `$${update.currentSpx.toFixed(2)} (entry: $${update.entrySpx.toFixed(2)})`,
-        inline: true,
-      },
-      {
-        name: 'Est. Price',
-        value: `$${update.estimatedPrice.toFixed(2)} (entry: $${update.entryPrice.toFixed(2)})`,
         inline: true,
       },
     ],
@@ -550,13 +587,19 @@ export async function sendPositionUpdate(update) {
  * Bright green for win, red for loss.
  */
 export async function sendTradeClosed(result) {
-  const isWin = result.pnlDollars > 0;
+  const isWin = result.isWin;
   const color = isWin ? 0x22C55E : 0xEF4444;
-  const pnlSign = result.pnlPct >= 0 ? '+' : '';
+  const sign = result.spxChange >= 0 ? '+' : '';
 
   const exitReasonLabels = {
     TARGET_HIT: 'Target Hit',
     STOP_HIT: 'Stop Hit',
+    PROFIT_TARGET: 'Profit Target',
+    STOP_LOSS: 'Stop Loss',
+    OPPOSING_WALL: 'Opposing Wall',
+    TV_FLIP: 'TV Signal Flip',
+    MAP_RESHUFFLE: 'Map Reshuffle',
+    TRAILING_STOP: 'Trailing Stop',
     AGENT_EXIT: 'Agent Exit Signal',
     THETA_DEATH: 'Theta Death (3:30 PM)',
     GEX_FLIP: 'GEX Direction Flip',
@@ -572,8 +615,8 @@ export async function sendTradeClosed(result) {
         inline: false,
       },
       {
-        name: 'P&L',
-        value: `**${pnlSign}$${result.pnlDollars.toFixed(2)}** (${pnlSign}${result.pnlPct}%)`,
+        name: 'SPX Movement',
+        value: `**${sign}${result.spxChange} pts** (${sign}${result.pnlPct}%)`,
         inline: true,
       },
       {
@@ -582,13 +625,8 @@ export async function sendTradeClosed(result) {
         inline: true,
       },
       {
-        name: 'Prices',
-        value: `Entry: $${result.entryPrice.toFixed(2)} \u2192 Exit: $${result.exitPrice.toFixed(2)}`,
-        inline: false,
-      },
-      {
         name: 'SPX',
-        value: `$${result.entrySpx.toFixed(2)} \u2192 $${result.exitSpx.toFixed(2)} (${((result.exitSpx - result.entrySpx) / result.entrySpx * 100).toFixed(2)}%)`,
+        value: `Entry: $${result.entrySpx.toFixed(2)} → Exit: $${result.exitSpx.toFixed(2)}`,
         inline: false,
       },
     ],
@@ -597,7 +635,7 @@ export async function sendTradeClosed(result) {
   };
 
   await sendEmbed(embed);
-  log.info(`Trade closed alert: ${isWin ? 'WIN' : 'LOSS'} ${pnlSign}${result.pnlPct}%`);
+  log.info(`Trade closed: ${isWin ? 'WIN' : 'LOSS'} ${sign}${result.spxChange} pts`);
 }
 
 // ---- Phase 5: Strategy Alerts ----

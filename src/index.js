@@ -2,7 +2,7 @@
  * OpenClaw SPX Trading System — Entry Point
  * Phase 1: GEX monitor + Discord alerts
  * Phase 2: TradingView signals + Kimi K2.5 AI agent
- * Phase 3: Options intelligence + trade execution via Polygon.io
+ * Phase 3: Trade execution via SPX spot tracking
  */
 
 import { config } from './utils/config.js';
@@ -11,7 +11,6 @@ import { initTokenManager, getAuthStatus } from './gex/token-manager.js';
 import { startMainLoop, stopMainLoop } from './pipeline/main-loop.js';
 import { startWebhookServer, stopWebhookServer } from './tv/tv-webhook-server.js';
 import { isAgentAvailable } from './agent/agent.js';
-import { isPolygonAvailable, testConnection } from './polygon/polygon-client.js';
 import { startDashboardServer, stopDashboardServer } from './dashboard/dashboard-server.js';
 
 const log = createLogger('OpenClaw');
@@ -52,18 +51,7 @@ if (isAgentAvailable()) {
   log.warn('AI agent not available — set KIMI_API_KEY to enable');
 }
 
-// Log Polygon status (Phase 3)
-if (isPolygonAvailable()) {
-  log.info('Polygon.io: API key configured (15-min delayed quotes)');
-  testConnection().then(ok => {
-    if (ok) log.info('Polygon.io: connection verified');
-    else log.warn('Polygon.io: connection test failed — will retry on first trade');
-  });
-} else {
-  log.warn('Polygon.io not available — set POLYGON_API_KEY to enable trade cards');
-}
-
-// Start dashboard server (Phase 4)
+// Start dashboard server
 startDashboardServer();
 log.info(`Dashboard server: port ${config.dashboardPort}`);
 

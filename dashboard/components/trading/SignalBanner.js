@@ -48,6 +48,9 @@ export function SignalBanner() {
         {decision?.confidence && (
           <span className="text-xs opacity-60">Confidence: {decision.confidence}</span>
         )}
+        {decision?.marketMode?.isChop && (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-300 font-medium">CHOP</span>
+        )}
       </div>
 
       <div className="flex items-center gap-4 text-sm">

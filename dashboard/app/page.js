@@ -6,6 +6,7 @@ import { GexPanel } from '../components/trading/GexPanel';
 import { TvGrid } from '../components/trading/TvGrid';
 import { AgentReasoning } from '../components/trading/AgentReasoning';
 import { TrinityPanel } from '../components/trading/TrinityPanel';
+import { AlertFeed } from '../components/trading/AlertFeed';
 
 export default function TradingPage() {
   return (
@@ -27,6 +28,9 @@ export default function TradingPage() {
         <TvGrid />
         <AgentReasoning />
       </div>
+
+      {/* Full-width Alert Feed */}
+      <AlertFeed />
     </div>
   );
 }

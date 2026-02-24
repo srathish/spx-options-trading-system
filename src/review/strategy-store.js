@@ -50,6 +50,19 @@ const V1_BASELINE = {
   gex_wait_zone_low: 40,
   gex_wait_zone_high: 60,
 
+  // Exit tuning
+  profit_target_pct: 0.15,           // +0.15% SPX move → lock profits
+  stop_loss_pct: 0.20,               // -0.20% adverse → cut losses
+  tv_against_exit_count: 2,          // 2+ opposing 3m TV signals → exit
+  trailing_stop_activate_pts: 8,     // Activate trailing after +8 SPX pts
+  trailing_stop_distance_pts: 5,     // Trail 5 pts behind best
+  opposing_wall_exit_value: 5_000_000, // Exit if opposing wall > $5M appears
+
+  // Chop detection
+  chop_lookback_cycles: 60,          // 60 cycles = 30 min of history
+  chop_flip_threshold: 6,            // 6+ direction flips = chop
+  chop_stddev_threshold: 20,         // score stddev > 20 = chop
+
   // Strike selection weights
   rr_weight: 0.40,
   delta_weight: 0.25,

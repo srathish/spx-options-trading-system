@@ -4,7 +4,6 @@
  * Manages position lifecycle, P&L tracking, and exit triggers.
  */
 
-import { estimateCurrentPnl } from './target-calculator.js';
 import {
   openTrade, closeTrade, updateTradePnlDb, confirmTrade,
   getOpenTrade, getTradeById,
@@ -15,8 +14,9 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('TradeManager');
 
-const AUTO_CONFIRM_MS = 60_000;       // Auto-confirm PENDING after 60s
-const POSITION_UPDATE_MS = 5 * 60_000; // Discord update every 5 min
+const AUTO_CONFIRM_MS = 60_000;              // Auto-confirm PENDING after 60s
+const POSITION_UPDATE_MS = 5 * 60_000;      // Discord update every 5 min
+const MIN_HOLD_BEFORE_SOFT_EXIT_MS = 3 * 60_000; // 3 min before GEX_FLIP/AGENT_EXIT can trigger
 
 // In-memory position state
 let currentPosition = null;
@@ -93,6 +93,7 @@ export function enterPosition({
     greeks, state: 'PENDING',
     openedAt: new Date().toISOString(),
     currentPnlPct: 0,
+    bestSpxChange: 0,
   };
 
   lastUpdateSentAt = Date.now();
@@ -107,7 +108,7 @@ export function enterPosition({
  *
  * @returns {{ exitTriggered, exitReason, pnl, shouldSendUpdate }}
  */
-export function manageCycle(currentSpot, scored, agentAction) {
+export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   if (!currentPosition) return { exitTriggered: false, shouldSendUpdate: false };
 
   const now = Date.now();
@@ -124,25 +125,27 @@ export function manageCycle(currentSpot, scored, agentAction) {
     }
   }
 
-  // 2. Update P&L estimate
-  if (currentPosition.greeks?.delta) {
-    const pnl = estimateCurrentPnl({
-      entryPrice: currentPosition.entryPrice,
-      entrySpx: currentPosition.entrySpx,
-      greeks: currentPosition.greeks,
-      openedAt: currentPosition.openedAt,
-    }, currentSpot);
+  // 2. Update P&L estimate — SPX spot movement
+  if (currentPosition.entrySpx && currentSpot) {
+    const isBullish = currentPosition.direction === 'BULLISH';
+    const spxChange = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
+    const pnlPct = (spxChange / currentPosition.entrySpx) * 100;
 
-    currentPosition.currentPnlPct = pnl.pnlPct;
-    updateTradePnlDb(currentPosition.id, pnl.pnlPct);
-    result.pnl = pnl;
+    currentPosition.currentPnlPct = Math.round(pnlPct * 10) / 10;
+    updateTradePnlDb(currentPosition.id, currentPosition.currentPnlPct);
+    result.pnl = {
+      spxChange: Math.round(spxChange * 100) / 100,
+      pnlPct: currentPosition.currentPnlPct,
+      currentSpx: currentSpot,
+    };
   }
 
   // 3. Check exit triggers (priority order)
+  const cfg = getActiveConfig() || {};
+  const isBullish = currentPosition.direction === 'BULLISH';
 
   // 3a. Target hit — SPX reached target wall
   if (currentPosition.targetSpx) {
-    const isBullish = currentPosition.direction === 'BULLISH';
     const targetHit = isBullish
       ? currentSpot >= currentPosition.targetSpx
       : currentSpot <= currentPosition.targetSpx;
@@ -156,7 +159,6 @@ export function manageCycle(currentSpot, scored, agentAction) {
 
   // 3b. Stop hit — SPX broke through stop level
   if (currentPosition.stopSpx) {
-    const isBullish = currentPosition.direction === 'BULLISH';
     const stopHit = isBullish
       ? currentSpot <= currentPosition.stopSpx
       : currentSpot >= currentPosition.stopSpx;
@@ -168,21 +170,105 @@ export function manageCycle(currentSpot, scored, agentAction) {
     }
   }
 
-  // 3c. Agent EXIT signal
+  // 3c. Profit target — lock in gains (immediate, no hold gate)
+  if (currentPosition.entrySpx && currentSpot) {
+    const spxChange = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
+    const movePct = (spxChange / currentPosition.entrySpx) * 100;
+
+    const profitTargetPct = cfg.profit_target_pct || 0.15;
+    if (movePct >= profitTargetPct) {
+      result.exitTriggered = true;
+      result.exitReason = 'PROFIT_TARGET';
+      return result;
+    }
+
+    // 3d. Stop loss — cut losses (immediate, no hold gate)
+    const stopLossPct = cfg.stop_loss_pct || 0.20;
+    if (movePct <= -stopLossPct) {
+      result.exitTriggered = true;
+      result.exitReason = 'STOP_LOSS';
+      return result;
+    }
+  }
+
+  // Calculate hold time for minimum-hold gates
+  const holdTimeMs = now - new Date(currentPosition.openedAt).getTime();
+  const holdTooShort = holdTimeMs < MIN_HOLD_BEFORE_SOFT_EXIT_MS;
+
+  // 3e. Opposing wall — large positive wall materialized against our position
+  const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
+  if (!holdTooShort && scored) {
+    const opposingWalls = isBullish ? scored.wallsBelow : scored.wallsAbove;
+    const bigOpposing = opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingWallValue && w.type === 'POSITIVE');
+    if (bigOpposing) {
+      result.exitTriggered = true;
+      result.exitReason = 'OPPOSING_WALL';
+      return result;
+    }
+  }
+
+  // 3f. TV flip — multiple 3m indicators turned against position
+  const tvAgainstCount = cfg.tv_against_exit_count || 2;
+  if (!holdTooShort && context.tvSnapshot) {
+    const signals = context.tvSnapshot.spx?.signals || {};
+    let opposingCount = 0;
+    for (const [key, sig] of Object.entries(signals)) {
+      if (!key.endsWith('3m')) continue;
+      const opposing = isBullish ? sig.classification === 'BEARISH' : sig.classification === 'BULLISH';
+      if (opposing && !sig.isStale) opposingCount++;
+    }
+    if (opposingCount >= tvAgainstCount) {
+      result.exitTriggered = true;
+      result.exitReason = 'TV_FLIP';
+      return result;
+    }
+  }
+
+  // 3g. Map reshuffle — GEX map changed dramatically
+  if (!holdTooShort && context.multiAnalysis?.reshuffles?.some(r => r.detected)) {
+    result.exitTriggered = true;
+    result.exitReason = 'MAP_RESHUFFLE';
+    return result;
+  }
+
+  // 3h. Trailing stop — activated after threshold, trails behind best price
+  const trailActivate = cfg.trailing_stop_activate_pts || 8;
+  const trailDistance = cfg.trailing_stop_distance_pts || 5;
+  if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
+    const spxChangeForTrail = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
+
+    if (!currentPosition.bestSpxChange || spxChangeForTrail > currentPosition.bestSpxChange) {
+      currentPosition.bestSpxChange = spxChangeForTrail;
+    }
+
+    if (currentPosition.bestSpxChange >= trailActivate) {
+      const drawdown = currentPosition.bestSpxChange - spxChangeForTrail;
+      if (drawdown >= trailDistance) {
+        result.exitTriggered = true;
+        result.exitReason = 'TRAILING_STOP';
+        return result;
+      }
+    }
+  }
+
+  // 3i. Agent EXIT signal — requires minimum hold time
   if (agentAction) {
     const action = agentAction.toUpperCase();
     if (
       (currentPosition.state === 'IN_CALLS' && (action === 'EXIT_CALLS' || action === 'EXIT')) ||
       (currentPosition.state === 'IN_PUTS' && (action === 'EXIT_PUTS' || action === 'EXIT'))
     ) {
-      result.exitTriggered = true;
-      result.exitReason = 'AGENT_EXIT';
-      return result;
+      if (holdTooShort) {
+        log.debug(`Agent says exit but holding — ${Math.round((MIN_HOLD_BEFORE_SOFT_EXIT_MS - holdTimeMs) / 1000)}s until min hold`);
+      } else {
+        result.exitTriggered = true;
+        result.exitReason = 'AGENT_EXIT';
+        return result;
+      }
     }
   }
 
-  // 3d. Theta death — configurable time cutoff
-  const cfg = getActiveConfig() || {};
+  // 3j. Theta death — configurable time cutoff (always immediate)
   const [thetaH, thetaM] = (cfg.no_entry_after || '15:30').split(':').map(Number);
   const etNow = nowET();
   if (etNow.hour > thetaH ||
@@ -192,15 +278,19 @@ export function manageCycle(currentSpot, scored, agentAction) {
     return result;
   }
 
-  // 3e. GEX flip — direction flipped against position
+  // 3k. GEX flip — direction flipped against position — requires minimum hold time
   const gexFlipThreshold = cfg.gex_exit_threshold || 60;
   if (scored && scored.score >= gexFlipThreshold) {
     const gexBullish = scored.direction === 'BULLISH';
     const positionBullish = currentPosition.direction === 'BULLISH';
     if (gexBullish !== positionBullish) {
-      result.exitTriggered = true;
-      result.exitReason = 'GEX_FLIP';
-      return result;
+      if (holdTooShort) {
+        log.debug(`GEX flipped but holding — ${Math.round((MIN_HOLD_BEFORE_SOFT_EXIT_MS - holdTimeMs) / 1000)}s until min hold (noise filter)`);
+      } else {
+        result.exitTriggered = true;
+        result.exitReason = 'GEX_FLIP';
+        return result;
+      }
     }
   }
 
@@ -215,20 +305,22 @@ export function manageCycle(currentSpot, scored, agentAction) {
 
 /**
  * Exit the current position.
+ * P&L is based on SPX spot movement (no option pricing needed).
  */
-export function exitPosition(exitReason, exitPrice, exitSpx) {
+export function exitPosition(exitReason, exitSpx) {
   if (!currentPosition) {
     log.warn('No position to exit');
     return null;
   }
 
-  const pnlDollars = exitPrice - currentPosition.entryPrice;
-  const pnlPct = (pnlDollars / currentPosition.entryPrice) * 100;
+  const isBullish = currentPosition.direction === 'BULLISH';
+  const spxChange = isBullish ? exitSpx - currentPosition.entrySpx : currentPosition.entrySpx - exitSpx;
+  const pnlPct = currentPosition.entrySpx ? (spxChange / currentPosition.entrySpx) * 100 : 0;
 
   closeTrade(currentPosition.id, {
-    exitPrice,
+    exitPrice: 0,
     exitSpx,
-    pnlDollars: Math.round(pnlDollars * 100) / 100,
+    pnlDollars: Math.round(spxChange * 100) / 100,
     pnlPct: Math.round(pnlPct * 10) / 10,
     exitReason,
   });
@@ -237,19 +329,17 @@ export function exitPosition(exitReason, exitPrice, exitSpx) {
     id: currentPosition.id,
     contract: currentPosition.contract,
     direction: currentPosition.direction,
-    entryPrice: currentPosition.entryPrice,
-    exitPrice,
     entrySpx: currentPosition.entrySpx,
     exitSpx,
-    pnlDollars: Math.round(pnlDollars * 100) / 100,
+    spxChange: Math.round(spxChange * 100) / 100,
     pnlPct: Math.round(pnlPct * 10) / 10,
     exitReason,
-    isWin: pnlDollars > 0,
+    isWin: spxChange > 0,
   };
 
   log.info(
     `Closed: ${currentPosition.contract} | ${exitReason} | ` +
-    `P&L: $${result.pnlDollars} (${result.pnlPct}%) | ${result.isWin ? 'WIN' : 'LOSS'}`
+    `SPX ${currentPosition.entrySpx} → ${exitSpx} (${spxChange > 0 ? '+' : ''}${result.spxChange} pts) | ${result.isWin ? 'WIN' : 'LOSS'}`
   );
 
   currentPosition = null;

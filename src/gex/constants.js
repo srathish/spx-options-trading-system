@@ -26,6 +26,23 @@ export const CONFIDENCE = {
   MEDIUM: 60,
 };
 
+// Minimum score to label a direction (below this → NEUTRAL)
+export const NEUTRAL_THRESHOLD = 35;
+
+// Momentum scoring — price trend over recent reads
+export const MOMENTUM = {
+  LOOKBACK: 10,              // number of spot reads to track (~5 min at 30s cycles)
+  STRONG_MOVE_PTS: 15,       // $15+ move in lookback window = strong momentum
+  MODERATE_MOVE_PTS: 8,      // $8+ move = moderate momentum
+  STRONG_BONUS: 25,          // +25 to aligned direction for strong momentum
+  MODERATE_BONUS: 15,        // +15 for moderate momentum
+  CONTRARY_PENALTY: -20,     // -20 from the direction fighting momentum
+  // Drift detection — catches slow grinds that evade the 5-min window
+  DRIFT_LOOKBACK: 30,        // 30 reads ≈ 15 min at 30s cycles
+  DRIFT_MODERATE_PTS: 6,     // $6+ cumulative drift = MODERATE momentum
+  DRIFT_STRONG_PTS: 12,      // $12+ cumulative drift = STRONG momentum
+};
+
 // Live monitoring
 export const WALL_GROWTH_ALERT_PCT = 0.20;    // 20% growth triggers alert
 export const WALL_SHRINK_ALERT_PCT = 0.30;    // 30% shrinkage triggers alert

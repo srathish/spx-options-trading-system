@@ -68,6 +68,40 @@ export function GexPanel() {
           </div>
         )}
 
+        {/* Trade Idea / Levels */}
+        {(gex.targetWall || gex.floorWall) && (
+          <div className="border border-[var(--border)] rounded-lg p-3 bg-[var(--surface)]">
+            <p className="text-xs text-[var(--muted)] mb-2 uppercase">Trade Idea</p>
+            {gex.recommendation && (
+              <p className="text-sm font-medium mb-2">{gex.recommendation}</p>
+            )}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              {gex.targetWall && (
+                <div>
+                  <span className="text-[var(--muted)]">Target</span>
+                  <p className="font-mono font-medium">{gex.targetWall.strike}</p>
+                  <p className="text-[var(--muted)]">{formatCurrency(gex.targetWall.gexValue, 0)}</p>
+                </div>
+              )}
+              {gex.floorWall && (
+                <div>
+                  <span className="text-[var(--muted)]">{gex.direction === 'BEARISH' ? 'Ceiling' : 'Floor'}</span>
+                  <p className="font-mono font-medium">{gex.floorWall.strike}</p>
+                  <p className="text-[var(--muted)]">{formatCurrency(gex.floorWall.gexValue, 0)}</p>
+                </div>
+              )}
+            </div>
+            {gex.distanceToTarget != null && (
+              <p className="text-xs text-[var(--muted)] mt-1">
+                Distance: {gex.distanceToTarget}%
+              </p>
+            )}
+            {gex.envDetail && (
+              <p className="text-[10px] text-[var(--muted)] mt-1">{gex.envDetail}</p>
+            )}
+          </div>
+        )}
+
         {/* Breakdown */}
         {gex.breakdown?.length > 0 && (
           <div>

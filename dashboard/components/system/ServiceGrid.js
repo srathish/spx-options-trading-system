@@ -24,7 +24,6 @@ export function ServiceGrid() {
     { name: 'GEX Data', status: gex ? 'OK' : 'WARN', detail: gex ? `Score: ${gex.score}` : 'No data' },
     { name: 'AI Agent', status: decision?.lastDecision ? 'OK' : 'WARN', detail: decision?.action || 'Idle' },
     { name: 'TV Webhook', status: 'OK', detail: 'Port 3001' },
-    { name: 'Polygon', status: 'OK', detail: '15-min delayed' },
   ];
 
   return (

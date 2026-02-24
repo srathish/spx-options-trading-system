@@ -2,9 +2,9 @@
  * Phantom Tracker
  * Tracks skipped signals — when a new ENTER fires while already in a position.
  * Records what would have happened for performance analysis.
+ * P&L is based on SPX spot movement (same as trade-manager.js).
  */
 
-import { estimateCurrentPnl } from './target-calculator.js';
 import { openTrade, closeTrade, getOpenPhantoms } from '../store/db.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
@@ -109,35 +109,34 @@ export function updatePhantoms(currentSpot) {
     }
 
     if (exitReason) {
-      // Estimate exit price
-      const pnl = estimateCurrentPnl({
-        entryPrice: phantom.entryPrice,
-        entrySpx: phantom.entrySpx,
-        greeks: phantom.greeks,
-        openedAt: phantom.openedAt,
-      }, currentSpot);
+      // SPX-based P&L — same as trade-manager.js
+      const isBull = phantom.direction === 'BULLISH';
+      const spxChange = isBull ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+      const pnlPct = phantom.entrySpx ? Math.round((spxChange / phantom.entrySpx) * 1000) / 10 : 0;
+      const pnlDollars = Math.round(spxChange * 100) / 100;
 
       closeTrade(phantom.id, {
-        exitPrice: pnl.estimatedPrice,
+        exitPrice: 0,
         exitSpx: currentSpot,
-        pnlDollars: pnl.pnlDollars,
-        pnlPct: pnl.pnlPct,
+        pnlDollars,
+        pnlPct,
         exitReason,
       });
 
       closed.push({
         contract: phantom.contract,
         direction: phantom.direction,
-        entryPrice: phantom.entryPrice,
-        exitPrice: pnl.estimatedPrice,
-        pnlPct: pnl.pnlPct,
+        entrySpx: phantom.entrySpx,
+        exitSpx: currentSpot,
+        spxChange: pnlDollars,
+        pnlPct,
         exitReason,
-        isWin: pnl.pnlDollars > 0,
+        isWin: spxChange > 0,
       });
 
       log.info(
         `Phantom closed: ${phantom.contract} | ${exitReason} | ` +
-        `P&L: ${pnl.pnlPct}% | ${pnl.pnlDollars > 0 ? 'WIN' : 'LOSS'}`
+        `SPX ${phantom.entrySpx} → ${currentSpot} (${spxChange > 0 ? '+' : ''}${pnlDollars} pts) | ${spxChange > 0 ? 'WIN' : 'LOSS'}`
       );
     } else {
       remaining.push(phantom);

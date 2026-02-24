@@ -48,6 +48,69 @@ case "$1" in
   run)
     node src/index.js
     ;;
+  launch)
+    echo "=== OpenClaw Launch ==="
+    echo ""
+
+    # 1. Build dashboard
+    echo "[1/4] Building dashboard..."
+    cd dashboard && npm run build > /dev/null 2>&1 && cd ..
+    echo "  Dashboard built."
+
+    # 2. Start backend + dashboard via PM2
+    echo "[2/4] Starting services via PM2..."
+    pm2 start ecosystem.config.cjs --silent
+    sleep 2
+    echo "  Backend:   http://localhost:3002"
+    echo "  Dashboard: http://localhost:3000"
+
+    # 3. Start ngrok tunnel for TV webhooks
+    echo "[3/4] Starting ngrok tunnel (port 3001)..."
+    ngrok http 3001 --log=stdout --log-level=warn > /tmp/openclaw-ngrok.log 2>&1 &
+    NGROK_PID=$!
+    echo $NGROK_PID > /tmp/openclaw-ngrok.pid
+    sleep 3
+
+    # Get tunnel URL from ngrok API
+    TUNNEL_URL=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | node -e "
+      let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
+        try { const t=JSON.parse(d).tunnels.find(t=>t.proto==='https');
+          console.log(t?t.public_url:'FAILED');
+        } catch { console.log('FAILED'); }
+      });
+    " 2>/dev/null)
+
+    if [ "$TUNNEL_URL" = "FAILED" ] || [ -z "$TUNNEL_URL" ]; then
+      echo "  ngrok failed to start. Check: ngrok config check"
+      echo "  TV webhooks won't work without a tunnel."
+    else
+      echo "  Tunnel:    $TUNNEL_URL"
+      echo ""
+      echo "  TradingView webhook URL:"
+      echo "  $TUNNEL_URL/webhook/tv?token=YOUR_SECRET"
+    fi
+
+    # 4. Open dashboard
+    echo ""
+    echo "[4/4] Opening dashboard..."
+    open http://localhost:3000 2>/dev/null || true
+
+    echo ""
+    echo "=== OpenClaw is live ==="
+    echo "  ./claw logs       — view logs"
+    echo "  ./claw status     — PM2 status"
+    echo "  ./claw shutdown   — stop everything"
+    ;;
+  shutdown)
+    echo "Shutting down OpenClaw..."
+    pm2 stop ecosystem.config.cjs --silent 2>/dev/null
+    pm2 delete ecosystem.config.cjs --silent 2>/dev/null
+    if [ -f /tmp/openclaw-ngrok.pid ]; then
+      kill "$(cat /tmp/openclaw-ngrok.pid)" 2>/dev/null
+      rm -f /tmp/openclaw-ngrok.pid
+    fi
+    echo "All services stopped."
+    ;;
   strategy)
     node -e "
       import('./src/review/strategy-store.js').then(s => {
@@ -60,10 +123,9 @@ case "$1" in
         console.log('');
         console.log('Key parameters:');
         console.log('  gex_min_score:', cfg.gex_min_score);
-        console.log('  min_confirmations:', cfg.min_confirmations);
-        console.log('  require_diamond:', cfg.require_diamond);
+        console.log('  gex_strong_threshold:', cfg.gex_strong_threshold || cfg.gex_strong_score);
         console.log('  no_entry_after:', cfg.no_entry_after);
-        console.log('  rr_weight:', cfg.rr_weight, '/ delta_weight:', cfg.delta_weight);
+        console.log('  tv_weight_bravo:', cfg.tv_weight_bravo, '/ tv_weight_tango:', cfg.tv_weight_tango);
         console.log('');
         console.log('Version history (' + history.length + ' total):');
         history.slice(0, 5).forEach(v => {
@@ -118,6 +180,8 @@ case "$1" in
     echo "Usage: ./claw <command>"
     echo ""
     echo "Commands:"
+    echo "  launch      Start everything (backend + dashboard + ngrok)"
+    echo "  shutdown    Stop everything"
     echo "  status      Show PM2 process status"
     echo "  start       Start the bot via PM2"
     echo "  stop        Stop the bot"

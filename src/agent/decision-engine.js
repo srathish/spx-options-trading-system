@@ -4,7 +4,7 @@
  */
 
 import { callAgent, isAgentAvailable } from './agent.js';
-import { getSignalSnapshot, getLastUpdateTime, getDetailedState } from '../tv/tv-signal-store.js';
+import { getSignalSnapshot, getLastUpdateTime, getDetailedState, getTvAlignment, calculateTvConfidence } from '../tv/tv-signal-store.js';
 import { getPositionState, getCurrentPosition } from '../trades/trade-manager.js';
 import { saveDecision } from '../store/db.js';
 import { createLogger } from '../utils/logger.js';
@@ -12,6 +12,7 @@ import { detectMidpointDanger, characterizeAirPocket } from '../gex/gex-scorer.j
 import { detectVexConfluence } from '../gex/gex-parser.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
 import { isPowerHour, isOpexWeek, isOpexDay } from '../utils/market-hours.js';
+import { detectChopMode } from '../store/state.js';
 
 const log = createLogger('Decision');
 
@@ -150,6 +151,7 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
       is_power_hour: isPowerHour(),
       is_opex_week: isOpexWeek(),
       is_opex_day: isOpexDay(),
+      market_mode: detectChopMode('SPXW'),
     },
   };
 
@@ -203,25 +205,10 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
   // 1. Read TV signal state
   const tvSnapshot = getSignalSnapshot();
 
-  // 2. Check if all signals are stale
+  // 2. If TV signals are stale, log it but let GEX drive the decision.
+  //    Stale TV = no confirmation, not a hard block.
   if (tvSnapshot.all_stale) {
-    log.warn('Both TV signals stale — forcing WAIT');
-    const decision = {
-      action: 'WAIT',
-      confidence: 'LOW',
-      reason: 'Both TV signals stale — data integrity concern',
-      tv_confirmations: 0,
-      bravo_confirms: false,
-      tango_confirms: false,
-      skipped: false,
-      gexScore: scored.score,
-      gexDirection: scored.direction,
-      gexConfidence: scored.confidence,
-      tvState: tvSnapshot,
-    };
-
-    saveDecision(decision);
-    return { changed: currentAction !== 'WAIT', decision, skipped: false };
+    log.debug('TV signals stale — GEX will drive (no TV confirmation)');
   }
 
   // 3. Pre-filter: should we call the agent?
@@ -281,6 +268,8 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
     tv_confirmations: tvSnapshot.confirmations.bullish + tvSnapshot.confirmations.bearish,
     bravo_confirms: tvSnapshot.bravo_confirms,
     tango_confirms: tvSnapshot.tango_confirms,
+    tv_alignment: getTvAlignment(),
+    tv_confidence: calculateTvConfidence(),
     inputTokens: agentResult.input_tokens,
     outputTokens: agentResult.output_tokens,
     responseTimeMs: agentResult.response_time_ms,

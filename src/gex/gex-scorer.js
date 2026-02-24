@@ -25,17 +25,22 @@
  *   No significant walls
  */
 
-import { SCORE, CONFIDENCE, MIDPOINT, AIR_POCKET } from './constants.js';
+import { SCORE, CONFIDENCE, MIDPOINT, AIR_POCKET, NEUTRAL_THRESHOLD, MOMENTUM } from './constants.js';
 import { getGexAtSpot, formatDollar } from './gex-parser.js';
+import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection } from '../store/state.js';
 
 /**
  * Score the SPX GEX environment.
  * Returns: { score, direction, confidence, breakdown, walls, environment }
  */
-export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0) {
+export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, ticker = 'SPXW') {
   const { spotPrice, aggregatedGex, strikes, walls } = parsedData;
 
   const gexAtSpot = getGexAtSpot(aggregatedGex, strikes, spotPrice);
+
+  // Smooth gexAtSpot with rolling median to prevent oscillation at gamma boundaries
+  pushGexAtSpot(ticker, gexAtSpot);
+  const smoothedGexAtSpot = getSmoothedGexAtSpot(ticker);
 
   // Find the largest wall — used to filter out insignificant walls
   const largestWallAbs = walls.length > 0 ? walls[0].absGexValue : 0;
@@ -44,9 +49,44 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0) {
   const wallsAbove = walls.filter(w => w.relativeToSpot === 'above');
   const wallsBelow = walls.filter(w => w.relativeToSpot === 'below');
 
-  // Score both directions
-  const bullish = scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs);
-  const bearish = scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs);
+  // Check momentum BEFORE scoring — used to gate negative GEX at spot
+  const momentum = getSpotMomentum(ticker);
+
+  // Score both directions — use smoothed gexAtSpot for sign determination
+  const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot);
+  const bearish = scoreBearish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs, momentum, gexAtSpot);
+
+  // Apply momentum — direction-conflict penalty with CHOP override
+  if (momentum.strength !== 'WEAK') {
+    const bonus = momentum.strength === 'STRONG' ? MOMENTUM.STRONG_BONUS : MOMENTUM.MODERATE_BONUS;
+    const penalty = MOMENTUM.CONTRARY_PENALTY;
+
+    if (momentum.direction === 'DOWN') {
+      bearish.score = Math.min(100, Math.max(0, bearish.score + bonus));
+      bearish.breakdown.push(`+${bonus}: ${momentum.strength} bearish momentum (${momentum.points}pts over ${momentum.readings} reads)`);
+      bullish.score = Math.max(0, bullish.score + penalty);
+      bullish.breakdown.push(`${penalty}: Fighting bearish momentum (${momentum.points}pts)`);
+    } else if (momentum.direction === 'UP') {
+      bullish.score = Math.min(100, Math.max(0, bullish.score + bonus));
+      bullish.breakdown.push(`+${bonus}: ${momentum.strength} bullish momentum (+${momentum.points}pts over ${momentum.readings} reads)`);
+      bearish.score = Math.max(0, bearish.score + penalty);
+      bearish.breakdown.push(`${penalty}: Fighting bullish momentum (+${momentum.points}pts)`);
+    }
+  }
+
+  // Momentum conflict override — if score direction fights strong price trend, degrade to CHOP
+  // This catches the scenario where walls say BULLISH but price is falling through them
+  if (momentum.strength === 'STRONG') {
+    if (bullish.score > bearish.score && momentum.direction === 'DOWN') {
+      const conflictPenalty = Math.min(30, Math.round(Math.abs(momentum.points) * 2));
+      bullish.score = Math.max(25, bullish.score - conflictPenalty);
+      bullish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BULLISH but price falling ${momentum.points}pts`);
+    } else if (bearish.score > bullish.score && momentum.direction === 'UP') {
+      const conflictPenalty = Math.min(30, Math.round(momentum.points * 2));
+      bearish.score = Math.max(25, bearish.score - conflictPenalty);
+      bearish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BEARISH but price rising +${momentum.points}pts`);
+    }
+  }
 
   // Check for chop
   const chop = checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes);
@@ -68,27 +108,45 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0) {
     result = bearish;
   }
 
-  // Apply Trinity cross-market confirmation bonus
-  if (trinityBonus > 0 && result.direction !== 'CHOP') {
+  // Low scores → NEUTRAL (not enough evidence for a directional call)
+  if (result.direction !== 'CHOP' && result.score < NEUTRAL_THRESHOLD) {
+    result.breakdown.push(`Score ${result.score} < ${NEUTRAL_THRESHOLD} threshold → NEUTRAL`);
+    result.direction = 'NEUTRAL';
+  }
+
+  // Apply Trinity cross-market confirmation bonus (only for directional setups)
+  if (trinityBonus > 0 && result.direction !== 'CHOP' && result.direction !== 'NEUTRAL') {
     result.score = Math.min(100, result.score + trinityBonus);
     result.breakdown.push(`+${trinityBonus}: Trinity confirmation (cross-market alignment)`);
   }
 
-  // Confidence tier
+  // EMA score smoothing — prevents whipsaw on small spot moves
+  const rawScore = result.score;
+  result.score = smoothGexScore(ticker, result.score);
+  if (result.score !== rawScore) {
+    result.breakdown.push(`EMA smoothed: ${rawScore} → ${result.score} (α=${0.3})`);
+  }
+
+  // Track direction for stability detection
+  recordDirection(ticker, result.direction);
+
+  // Confidence tier (based on smoothed score)
   let confidence;
   if (result.score >= CONFIDENCE.HIGH) confidence = 'HIGH';
   else if (result.score >= CONFIDENCE.MEDIUM) confidence = 'MEDIUM';
   else confidence = 'LOW';
 
-  // Overall environment label
-  const environment = gexAtSpot < 0 ? 'NEGATIVE GAMMA' : 'POSITIVE GAMMA';
-  const envDetail = gexAtSpot < 0
+  // Overall environment label — use smoothed value to prevent oscillation
+  const environment = smoothedGexAtSpot < 0 ? 'NEGATIVE GAMMA' : 'POSITIVE GAMMA';
+  const envDetail = smoothedGexAtSpot < 0
     ? 'Volatile — dealers short gamma, moves amplified'
     : 'Pinned — dealers long gamma, moves dampened';
 
   return {
     spotPrice,
     gexAtSpot,
+    smoothedGexAtSpot,
+    rawScore,
     score: result.score,
     direction: result.direction,
     confidence,
@@ -100,19 +158,31 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0) {
     wallsBelow: wallsBelow.slice(0, 5),
     environment,
     envDetail,
+    momentum: {
+      direction: momentum.direction,
+      points: momentum.points,
+      strength: momentum.strength,
+      readings: momentum.readings,
+    },
     recommendation: getRecommendation(result.direction, confidence, environment),
   };
 }
 
-function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs) {
+function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs, momentum, rawGexAtSpot) {
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
 
   // +30: Negative GEX at spot — volatile, dealers amplify moves
+  // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
+  // Only award if momentum is NOT bearish (neg gamma helps the trend, not both sides)
   if (gexAtSpot < 0) {
-    score += SCORE.NEGATIVE_GEX_AT_SPOT;
-    breakdown.push(`+30: Negative GEX at spot (${formatDollar(gexAtSpot)})`);
+    if (momentum.direction !== 'DOWN' || momentum.strength === 'WEAK') {
+      score += SCORE.NEGATIVE_GEX_AT_SPOT;
+      breakdown.push(`+30: Negative GEX at spot (${formatDollar(rawGexAtSpot)}, smoothed: ${formatDollar(gexAtSpot)})`);
+    } else {
+      breakdown.push(`+0: Negative GEX at spot but momentum is bearish (${momentum.points}pts) — amplifies downside, not upside`);
+    }
   }
 
   // +25: Target / Expansion signal
@@ -188,15 +258,21 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
   };
 }
 
-function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTrends, largestWallAbs) {
+function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTrends, largestWallAbs, momentum, rawGexAtSpot) {
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
 
-  // +30: Negative GEX at spot
+  // +30: Negative GEX at spot — volatile, dealers amplify moves
+  // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
+  // Only award if momentum is NOT bullish
   if (gexAtSpot < 0) {
-    score += SCORE.NEGATIVE_GEX_AT_SPOT;
-    breakdown.push(`+30: Negative GEX at spot (${formatDollar(gexAtSpot)})`);
+    if (momentum.direction !== 'UP' || momentum.strength === 'WEAK') {
+      score += SCORE.NEGATIVE_GEX_AT_SPOT;
+      breakdown.push(`+30: Negative GEX at spot (${formatDollar(rawGexAtSpot)}, smoothed: ${formatDollar(gexAtSpot)})`);
+    } else {
+      breakdown.push(`+0: Negative GEX at spot but momentum is bullish (+${momentum.points}pts) — amplifies upside, not downside`);
+    }
   }
 
   // +25: Target / Expansion signal
@@ -398,6 +474,7 @@ function checkOpenAir(spotPrice, targetStrike, direction, aggregatedGex, strikes
 
 function getRecommendation(direction, confidence, environment) {
   if (direction === 'CHOP') return 'WAIT — choppy environment, no clear setup';
+  if (direction === 'NEUTRAL') return 'WAIT — insufficient directional evidence';
   if (confidence === 'LOW') return 'WAIT — low confidence, avoid forcing trades';
 
   if (direction === 'BULLISH') {
