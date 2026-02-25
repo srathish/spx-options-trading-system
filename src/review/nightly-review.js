@@ -1,16 +1,18 @@
 /**
  * Nightly Review Agent — 2 AM ET daily self-improvement cycle.
- * Calls Kimi K2.5 with 10-dimension analysis of recent trades,
+ * Calls Claude Sonnet with 10-dimension analysis + enriched data,
  * generates strategy adjustments, creates new version if warranted.
  */
 
-import OpenAI from 'openai';
 import { config } from '../utils/config.js';
+import { callSonnet } from '../agent/sonnet-client.js';
 import { createLogger } from '../utils/logger.js';
 import { nowET, formatET } from '../utils/market-hours.js';
 import {
   getTradesByDateRange, getTradesForVersion,
   getRecentPhantomComparisons, getRecentClosedTrades,
+  getDecisionsByDate, getGexSnapshotsByDate, getTvSignalLogByDate,
+  getAllVersions,
 } from '../store/db.js';
 import {
   getActiveConfig, getActiveVersionNumber, getVersionLabel,
@@ -21,7 +23,13 @@ const log = createLogger('Review');
 
 // ---- Review System Prompt ----
 
-const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine. You analyze trading performance data and recommend specific, data-backed strategy adjustments.
+const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine — an autonomous 0DTE SPX options trading system. You analyze daily trading performance data and recommend specific, data-backed strategy adjustments.
+
+## Your Role
+You receive a comprehensive data package each night containing:
+- 10-dimension trade analysis (GEX scores, alignment, TV signals, time-of-day, direction, exits, strikes, phantoms)
+- Enrichment data (blocked entries, GEX score distribution, TV signal transitions, previous review findings)
+- Current strategy config with 38+ tunable parameters
 
 ## Rules
 1. NEVER recommend more than 3 adjustments at once. Small changes, measured results.
@@ -33,6 +41,9 @@ const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine. You an
 7. Think about second-order effects — raising gex_min_score means fewer trades.
 8. Changes should be conservative: no more than ~20% shift on any numeric parameter.
 9. Only adjust parameters listed in the current_config.
+10. Look at blocked entries — if many good setups were blocked, entry criteria may be too strict.
+11. Analyze exit effectiveness — if most profits come from one exit type, others may need tuning.
+12. Build on previous review findings when available — create a narrative over time.
 
 ## Adjustable Parameters (and what they control)
 - gex_min_score: Minimum GEX score to consider entry (higher = fewer but better trades)
@@ -42,12 +53,19 @@ const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine. You an
 - alignment_min_for_entry: Minimum tickers aligned for entry (out of 3)
 - no_entry_after: Time cutoff for new entries (HH:MM format)
 - stop_buffer_pct: Stop placement buffer percentage
+- profit_target_pct: SPX move % to lock profits
+- stop_loss_pct: Adverse SPX move % to cut losses
+- trailing_stop_activate_pts: SPX points profit to activate trailing stop
+- trailing_stop_distance_pts: Trailing stop distance in SPX points
+- tv_against_exit_count: Opposing TV signals needed to trigger exit
+- opposing_wall_exit_value: GEX wall value threshold for opposing wall exit
 - rr_weight, delta_weight, liquidity_weight, theta_weight: Strike selection weights (must sum to 1.0)
 - delta_sweet_spot_low, delta_sweet_spot_high: Target delta range for strike selection
 - min_rr_ratio: Minimum risk:reward ratio for entry
+- chop_lookback_cycles, chop_flip_threshold, chop_stddev_threshold: Chop detection tuning
 
 ## Output Format
-Respond with ONLY valid JSON in this format:
+Respond with ONLY valid JSON in this exact format:
 {
   "should_adjust": true,
   "analysis_summary": "Brief 2-3 sentence overview of findings",
@@ -61,31 +79,23 @@ Respond with ONLY valid JSON in this format:
     }
   ],
   "market_notes": "Any notable patterns about market conditions",
-  "morning_briefing_text": "2-3 sentence summary for the dashboard"
-}
-
-If no adjustments are warranted:
-{
-  "should_adjust": false,
-  "analysis_summary": "Current strategy performing well. 68% win rate over 15 trades.",
-  "adjustments": [],
-  "market_notes": "...",
-  "morning_briefing_text": "No changes overnight. Strategy continues performing well."
-}`;
-
-// ---- Kimi client (reuses same config as decision agent) ----
-
-let client = null;
-
-function getClient() {
-  if (!client && config.kimiApiKey) {
-    client = new OpenAI({
-      baseURL: 'https://api.moonshot.ai/v1',
-      apiKey: config.kimiApiKey,
-    });
+  "morning_briefing_text": "2-3 sentence summary for the dashboard",
+  "pattern_analysis": {
+    "winning_setups": "Description of what winning trades had in common",
+    "losing_setups": "Description of what losing trades had in common",
+    "blocked_entry_review": "Were blocked entries justified? Any good setups filtered out?",
+    "exit_effectiveness": "Which exit triggers worked well, which need tuning?",
+    "tv_signal_value": "How much value did TV signals add to entry/exit decisions?",
+    "time_patterns": "Any time-of-day patterns worth noting?"
+  },
+  "narrative": {
+    "today_story": "Natural language summary of the trading day — what happened, key moments, overall character of the day",
+    "comparison_to_previous": "How does today compare to the last review? Are we improving?",
+    "cumulative_learnings": "What is the system learning over time? What patterns are emerging across multiple days?"
   }
-  return client;
 }
+
+If no adjustments are warranted, set should_adjust: false and adjustments: [], but still provide pattern_analysis and narrative.`;
 
 // ---- Public API ----
 
@@ -94,7 +104,7 @@ function getClient() {
  * Returns: { skipped, reason?, changes?, newVersion?, analysis? }
  */
 export async function runNightlyReview() {
-  log.info('=== Starting Nightly Review ===');
+  log.info('=== Starting Nightly Review (Sonnet) ===');
 
   const activeConfig = getActiveConfig();
   const currentVersion = getActiveVersionNumber();
@@ -116,56 +126,26 @@ export async function runNightlyReview() {
     return { skipped: true, reason: 'insufficient_trades', tradeCount: totalTrades };
   }
 
-  // Guard: no Kimi API key
-  const kimiClient = getClient();
-  if (!kimiClient) {
-    log.warn('Kimi API key not configured — skipping review');
+  // Guard: no Anthropic API key
+  if (!config.anthropicApiKey) {
+    log.warn('Anthropic API key not configured — skipping review');
     return { skipped: true, reason: 'no_api_key' };
   }
 
-  // Call Kimi K2.5
-  log.info(`Sending review data to Kimi (${totalTrades} trades, v${currentVersion})...`);
-  const startTime = Date.now();
+  // Call Claude Sonnet
+  log.info(`Sending review data to Sonnet (${totalTrades} trades, v${currentVersion})...`);
 
   try {
-    const response = await kimiClient.chat.completions.create({
-      model: config.agentModel || 'kimi-k2.5',
-      temperature: 0.2,
-      max_tokens: 2000,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: REVIEW_SYSTEM_PROMPT },
-        { role: 'user', content: JSON.stringify(input) },
-      ],
-    });
-
-    const responseTimeMs = Date.now() - startTime;
-    const content = response.choices?.[0]?.message?.content;
-
-    if (!content) {
-      log.error('Review agent returned empty response');
-      return { skipped: true, reason: 'empty_response' };
-    }
-
-    let result;
-    try {
-      result = JSON.parse(content);
-    } catch {
-      log.error('Review agent returned invalid JSON:', content.slice(0, 300));
-      return { skipped: true, reason: 'invalid_json' };
-    }
-
-    const tokenUsage = {
-      inputTokens: response.usage?.prompt_tokens || 0,
-      outputTokens: response.usage?.completion_tokens || 0,
-      responseTimeMs,
-    };
+    const { parsed: result, tokenUsage } = await callSonnet(REVIEW_SYSTEM_PROMPT, input);
 
     log.info(
-      `Review completed in ${responseTimeMs}ms | ` +
+      `Review completed in ${tokenUsage.responseTimeMs}ms | ` +
       `${tokenUsage.inputTokens}+${tokenUsage.outputTokens} tokens | ` +
       `should_adjust: ${result.should_adjust}`
     );
+
+    // Attach input data for Discord report
+    result._inputData = input;
 
     // Apply changes if any
     if (result.should_adjust && result.adjustments?.length > 0) {
@@ -227,15 +207,14 @@ export async function runNightlyReview() {
     };
 
   } catch (err) {
-    const responseTimeMs = Date.now() - startTime;
-    log.error(`Review agent error (${responseTimeMs}ms):`, err.message);
+    log.error(`Review agent error:`, err.message);
     return { skipped: true, reason: `api_error: ${err.message}` };
   }
 }
 
 /**
  * Build the structured input for the review agent.
- * Includes 10-dimension analysis from DB queries.
+ * Includes 10-dimension analysis + enrichment data from DB.
  */
 export function buildReviewInput() {
   const activeConfig = getActiveConfig();
@@ -259,6 +238,32 @@ export function buildReviewInput() {
   // Get failed adjustments
   const failedAdj = getFailedAdjustments();
 
+  // ---- Enrichment data ----
+
+  // Blocked entries from today's decisions
+  const todayStr = formatET(nowET()).slice(0, 10);
+  const recentDecisions = getDecisionsByDate(todayStr);
+  const blockedEntries = recentDecisions
+    .filter(d => {
+      try { const p = JSON.parse(d.decision_json || '{}'); return p.entryBlocked; } catch { return false; }
+    })
+    .map(d => {
+      try { return JSON.parse(d.decision_json || '{}'); } catch { return {}; }
+    });
+
+  // GEX score distribution today
+  const gexSnapshots = getGexSnapshotsByDate(todayStr);
+  const gexScores = gexSnapshots.map(s => {
+    try { return JSON.parse(s.snapshot_json || '{}').score || 0; } catch { return 0; }
+  }).filter(s => s > 0);
+
+  // TV signal transitions today
+  const tvSignalLog = getTvSignalLogByDate(todayStr);
+
+  // Previous review findings (narrative continuity)
+  const allVersions = getAllVersions();
+  const previousReview = allVersions.length > 1 ? allVersions[allVersions.length - 1] : null;
+
   return {
     current_version: currentVersion,
     version_label: versionLabel,
@@ -277,6 +282,24 @@ export function buildReviewInput() {
       strike_performance: analyzeStrikeEffectiveness(closedTrades),
       phantom_comparison_summary: summarizeComparisons(comparisons),
       version_performance: buildVersionMetrics(versionTrades),
+    },
+    enrichment: {
+      blocked_entries_summary: {
+        total_blocked: blockedEntries.length,
+        top_block_reasons: summarizeBlockReasons(blockedEntries),
+      },
+      gex_score_distribution: {
+        count: gexScores.length,
+        avg: gexScores.length > 0 ? +(gexScores.reduce((a, b) => a + b, 0) / gexScores.length).toFixed(1) : 0,
+        min: gexScores.length > 0 ? Math.min(...gexScores) : 0,
+        max: gexScores.length > 0 ? Math.max(...gexScores) : 0,
+      },
+      tv_signal_transitions: tvSignalLog.length,
+      previous_review: previousReview ? {
+        version: previousReview.version,
+        changes: safeParseJson(previousReview.changes_json),
+        analysis: safeParseJson(previousReview.analysis_json)?.analysis_summary,
+      } : null,
     },
   };
 }
@@ -523,6 +546,20 @@ function buildVersionMetrics(versionTrades) {
     win_rate: ((wins / versionTrades.length) * 100).toFixed(1),
     total_pnl: versionTrades.reduce((s, t) => s + (t.pnl_dollars || 0), 0).toFixed(0),
   };
+}
+
+// ---- Enrichment helpers ----
+
+function summarizeBlockReasons(blocked) {
+  const reasons = {};
+  for (const b of blocked) {
+    const r = b.blockReason || b.reason || 'unknown';
+    reasons[r] = (reasons[r] || 0) + 1;
+  }
+  return Object.entries(reasons)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([reason, count]) => ({ reason, count }));
 }
 
 // ---- Validation ----

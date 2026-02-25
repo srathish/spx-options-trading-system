@@ -24,6 +24,11 @@ export const config = {
   agentTemperature: parseFloat(process.env.AGENT_TEMPERATURE || '0'),
   agentMaxTokens: parseInt(process.env.AGENT_MAX_TOKENS || '500', 10),
 
+  // Claude Sonnet (review agent)
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  sonnetModel: process.env.SONNET_MODEL || 'claude-sonnet-4-20250514',
+  sonnetMaxTokens: parseInt(process.env.SONNET_MAX_TOKENS || '4096', 10),
+
   // Polygon.io (free tier = 15-min delayed quotes)
   polygonApiKey: process.env.POLYGON_API_KEY || '',
 

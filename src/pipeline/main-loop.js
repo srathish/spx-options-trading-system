@@ -21,7 +21,7 @@ import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } f
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
 import { getGexHistory, getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
-import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert } from '../alerts/discord.js';
+import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
 import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
 import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
@@ -976,19 +976,25 @@ function scheduleNightlyReview() {
       const briefing = generateMorningBriefing(reviewResult);
       log.info(`Morning briefing generated: ${briefing.changes.length} change(s)`);
 
-      // Send Discord alerts + emit dashboard events
+      // Send Discord review report + emit dashboard events
       try {
+        if (!reviewResult.skipped) {
+          await sendReviewReport(reviewResult);
+        }
         if (reviewResult.newVersion) {
-          await sendStrategyChange(reviewResult);
           dashboardEmitter.emit('strategy_update', {
             version: reviewResult.newVersion,
             changes: reviewResult.changes,
             analysis: reviewResult.analysis?.analysis_summary,
           });
-        } else if (!reviewResult.skipped) {
-          await sendNoChange(reviewResult);
         }
-      } catch (_) {}
+      } catch (discordErr) {
+        log.error('Review report failed, falling back:', discordErr.message);
+        try {
+          if (reviewResult.newVersion) await sendStrategyChange(reviewResult);
+          else if (!reviewResult.skipped) await sendNoChange(reviewResult);
+        } catch (_) {}
+      }
 
     } catch (err) {
       log.error('Nightly review failed:', err.message);

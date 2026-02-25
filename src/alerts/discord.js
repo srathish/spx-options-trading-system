@@ -1020,6 +1020,187 @@ export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog,
 }
 
 /**
+ * Send comprehensive review report to Discord (after nightly/weekly review).
+ * 4 embeds: Performance Summary, Pattern Analysis, Proposed Changes, Narrative.
+ */
+export async function sendReviewReport(reviewResult) {
+  const now = formatET(nowET());
+  const analysis = reviewResult.analysis || {};
+  const inputData = analysis._inputData || {};
+  const metrics = inputData.analysis?.overall_metrics || {};
+  const enrichment = inputData.enrichment || {};
+  const isWeekly = inputData.review_type === 'WEEKLY';
+  const reviewType = isWeekly ? 'Weekly' : 'Nightly';
+
+  // Determine performance color
+  const winRate = parseFloat(metrics.win_rate || '0');
+  const perfColor = winRate >= 60 ? COLORS.BULLISH : winRate < 40 ? COLORS.BEARISH : COLORS.WARNING;
+
+  // ---- EMBED 1: Performance Summary ----
+  const versionInfo = reviewResult.newVersion
+    ? `v${reviewResult.previousVersion} \u2192 v${reviewResult.newVersion}`
+    : `v${inputData.current_version || '?'} (no changes)`;
+
+  const embed1 = {
+    title: `\uD83E\uDDE0 ${reviewType} Review Report`,
+    description: analysis.analysis_summary || 'Review completed.',
+    color: perfColor,
+    fields: [
+      {
+        name: 'Performance',
+        value: [
+          `Trades: **${metrics.total_trades || 0}** (${metrics.wins || 0}W / ${metrics.losses || 0}L)`,
+          `Win Rate: **${metrics.win_rate || '0'}%**`,
+          `Total P&L: **$${metrics.total_pnl_dollars || 0}**`,
+          `Avg P&L: **${metrics.avg_pnl_pct || 0}%**`,
+        ].join('\n'),
+        inline: true,
+      },
+      {
+        name: 'Strategy',
+        value: [
+          `Version: **${versionInfo}**`,
+          `Days Analyzed: **${inputData.days_analyzed || '?'}**`,
+          `Blocked Entries: **${enrichment.blocked_entries_summary?.total_blocked || 0}**`,
+        ].join('\n'),
+        inline: true,
+      },
+    ],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // Add best/worst if available
+  if (metrics.best_trade_pnl_pct || metrics.worst_trade_pnl_pct) {
+    embed1.fields.push({
+      name: 'Range',
+      value: `Best: **${metrics.best_trade_pnl_pct > 0 ? '+' : ''}${metrics.best_trade_pnl_pct || 0}%** | Worst: **${metrics.worst_trade_pnl_pct || 0}%**`,
+      inline: false,
+    });
+  }
+
+  // ---- EMBED 2: Pattern Analysis ----
+  const patterns = analysis.pattern_analysis || {};
+  const patternFields = [];
+
+  if (patterns.winning_setups) {
+    patternFields.push({ name: '\u2705 Winning Setups', value: truncate(patterns.winning_setups, 1024), inline: false });
+  }
+  if (patterns.losing_setups) {
+    patternFields.push({ name: '\u274C Losing Setups', value: truncate(patterns.losing_setups, 1024), inline: false });
+  }
+  if (patterns.blocked_entry_review) {
+    patternFields.push({ name: '\uD83D\uDEAB Blocked Entries', value: truncate(patterns.blocked_entry_review, 1024), inline: false });
+  }
+  if (patterns.exit_effectiveness) {
+    patternFields.push({ name: '\uD83D\uDEAA Exit Analysis', value: truncate(patterns.exit_effectiveness, 1024), inline: false });
+  }
+  if (patterns.tv_signal_value) {
+    patternFields.push({ name: '\uD83D\uDCFA TV Signal Value', value: truncate(patterns.tv_signal_value, 512), inline: true });
+  }
+  if (patterns.time_patterns) {
+    patternFields.push({ name: '\u23F0 Time Patterns', value: truncate(patterns.time_patterns, 512), inline: true });
+  }
+
+  // Weekly-specific patterns
+  if (patterns.version_evolution) {
+    patternFields.push({ name: '\uD83D\uDCC8 Version Evolution', value: truncate(patterns.version_evolution, 1024), inline: false });
+  }
+
+  const embed2 = {
+    title: '\uD83D\uDD0D Pattern Analysis',
+    color: COLORS.INFO,
+    fields: patternFields.length > 0 ? patternFields : [{ name: 'Analysis', value: 'No patterns detected yet — need more data.', inline: false }],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // ---- EMBED 3: Proposed Changes ----
+  const changes = reviewResult.changes || [];
+  const hasChanges = changes.length > 0;
+
+  let changesDescription;
+  if (hasChanges) {
+    changesDescription = changes.map(c =>
+      `**${c.parameter}**: \`${c.old_value}\` \u2192 \`${c.new_value}\`\n> ${c.reason}${c.expected_impact ? `\n> _Impact: ${c.expected_impact}_` : ''}`
+    ).join('\n\n');
+  } else {
+    changesDescription = analysis.should_adjust === false
+      ? 'No changes recommended — strategy performing within expectations.'
+      : reviewResult.reason || 'No adjustments warranted.';
+  }
+
+  const embed3 = {
+    title: hasChanges
+      ? `\uD83D\uDD27 ${changes.length} Change${changes.length === 1 ? '' : 's'} Applied`
+      : '\u2705 No Changes',
+    description: truncate(changesDescription, 2048),
+    color: hasChanges ? 0x7C3AED : COLORS.SYSTEM, // purple if changes, gray if not
+    fields: [],
+    footer: { text: `OpenClaw | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // Add token cost
+  if (reviewResult.tokenUsage) {
+    embed3.fields.push({
+      name: 'Review Cost',
+      value: `${reviewResult.tokenUsage.inputTokens?.toLocaleString() || 0} + ${reviewResult.tokenUsage.outputTokens?.toLocaleString() || 0} tokens | ${reviewResult.tokenUsage.responseTimeMs || 0}ms`,
+      inline: true,
+    });
+  }
+
+  // ---- EMBED 4: Narrative & Memory ----
+  const narrative = analysis.narrative || {};
+  const narrativeFields = [];
+
+  const storyKey = isWeekly ? 'week_story' : 'today_story';
+  const compKey = isWeekly ? 'evolution' : 'comparison_to_previous';
+
+  if (narrative[storyKey]) {
+    narrativeFields.push({ name: isWeekly ? '\uD83D\uDCD6 Week Story' : '\uD83D\uDCD6 Today\'s Story', value: truncate(narrative[storyKey], 1024), inline: false });
+  }
+  if (narrative[compKey]) {
+    narrativeFields.push({ name: isWeekly ? '\uD83D\uDCC8 Evolution' : '\uD83D\uDD04 Comparison', value: truncate(narrative[compKey], 1024), inline: false });
+  }
+  if (narrative.cumulative_learnings) {
+    narrativeFields.push({ name: '\uD83E\uDDE0 Cumulative Learnings', value: truncate(narrative.cumulative_learnings, 1024), inline: false });
+  }
+  if (analysis.market_notes) {
+    narrativeFields.push({ name: '\uD83C\uDF0E Market Notes', value: truncate(analysis.market_notes, 512), inline: false });
+  }
+
+  // Weekly patterns
+  if (analysis.weekly_patterns) {
+    narrativeFields.push({ name: '\uD83D\uDCC5 Weekly Patterns', value: truncate(analysis.weekly_patterns, 512), inline: false });
+  }
+
+  const embed4 = {
+    title: '\uD83D\uDCDD Narrative & Memory',
+    color: 0x1E3A5F, // dark blue
+    fields: narrativeFields.length > 0 ? narrativeFields : [{ name: 'Narrative', value: 'Building narrative — more data needed.', inline: false }],
+    footer: { text: `OpenClaw | ${reviewType} Review | ${now} ET` },
+    timestamp: new Date().toISOString(),
+  };
+
+  // Send all 4 embeds
+  const sent = await sendWebhook({ embeds: [embed1, embed2, embed3, embed4] });
+  if (sent) {
+    log.info(`${reviewType} review report sent to Discord: ${changes.length} change(s)`);
+  } else {
+    log.error(`Failed to send ${reviewType} review report`);
+  }
+  return sent;
+}
+
+/** Truncate text to Discord field limit */
+function truncate(text, maxLen = 1024) {
+  if (!text) return 'N/A';
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - 3) + '...';
+}
+
+/**
  * Send a test message to verify webhook works.
  */
 export async function sendTest() {

@@ -1,15 +1,16 @@
 /**
  * Weekly Review Agent — Runs Sunday 2 AM ET.
  * Deeper analysis than nightly: 14-day lookback, cross-version analysis,
- * day-of-week patterns. Reuses nightly review infrastructure.
+ * day-of-week patterns. Uses Claude Sonnet for analysis.
  */
 
-import OpenAI from 'openai';
 import { config } from '../utils/config.js';
+import { callSonnet } from '../agent/sonnet-client.js';
 import { createLogger } from '../utils/logger.js';
 import { nowET, formatET } from '../utils/market-hours.js';
 import {
   getTradesByDateRange, getRecentPhantomComparisons, getAllVersions,
+  getDecisionsByDate, getGexSnapshotsByDate, getTvSignalLogByDate,
 } from '../store/db.js';
 import {
   getActiveConfig, getActiveVersionNumber, getVersionLabel,
@@ -22,7 +23,7 @@ const WEEKLY_LOOKBACK_DAYS = 14;
 
 // ---- Weekly Review System Prompt ----
 
-const WEEKLY_SYSTEM_PROMPT = `You are OpenClaw's weekly deep-analysis engine. You analyze 14 days of trading data with special focus on weekly patterns, cross-version performance, and day-of-week trends.
+const WEEKLY_SYSTEM_PROMPT = `You are OpenClaw's weekly deep-analysis engine — an autonomous 0DTE SPX options trading system. You analyze 14 days of trading data with special focus on weekly patterns, cross-version performance, and day-of-week trends.
 
 ## Rules
 1. NEVER recommend more than 3 adjustments at once. Small changes, measured results.
@@ -39,6 +40,9 @@ const WEEKLY_SYSTEM_PROMPT = `You are OpenClaw's weekly deep-analysis engine. Yo
     - Early-week vs late-week trends
     - If a version was rolled back this week, understand WHY and avoid similar changes
     - Cross-version performance: was version N better than N-1 overall?
+11. Look at blocked entries — if many good setups were blocked, entry criteria may be too strict.
+12. Analyze exit effectiveness — which exits preserved profits, which let winners turn to losers?
+13. Build narrative across weeks — what's the system learning over time?
 
 ## Adjustable Parameters (and what they control)
 - gex_min_score: Minimum GEX score to consider entry (higher = fewer but better trades)
@@ -48,9 +52,16 @@ const WEEKLY_SYSTEM_PROMPT = `You are OpenClaw's weekly deep-analysis engine. Yo
 - alignment_min_for_entry: Minimum tickers aligned for entry (out of 3)
 - no_entry_after: Time cutoff for new entries (HH:MM format)
 - stop_buffer_pct: Stop placement buffer percentage
+- profit_target_pct: SPX move % to lock profits
+- stop_loss_pct: Adverse SPX move % to cut losses
+- trailing_stop_activate_pts: SPX points profit to activate trailing stop
+- trailing_stop_distance_pts: Trailing stop distance in SPX points
+- tv_against_exit_count: Opposing TV signals needed to trigger exit
+- opposing_wall_exit_value: GEX wall value threshold for opposing wall exit
 - rr_weight, delta_weight, liquidity_weight, theta_weight: Strike selection weights (must sum to 1.0)
 - delta_sweet_spot_low, delta_sweet_spot_high: Target delta range for strike selection
 - min_rr_ratio: Minimum risk:reward ratio for entry
+- chop_lookback_cycles, chop_flip_threshold, chop_stddev_threshold: Chop detection tuning
 
 ## Output Format
 Respond with ONLY valid JSON in this format:
@@ -68,22 +79,24 @@ Respond with ONLY valid JSON in this format:
   ],
   "weekly_patterns": "Notable day-of-week or cross-version patterns observed",
   "market_notes": "Any notable patterns about market conditions this week",
-  "morning_briefing_text": "2-3 sentence summary for the dashboard"
-}`;
-
-// ---- Kimi client ----
-
-let client = null;
-
-function getClient() {
-  if (!client && config.kimiApiKey) {
-    client = new OpenAI({
-      baseURL: 'https://api.moonshot.ai/v1',
-      apiKey: config.kimiApiKey,
-    });
+  "morning_briefing_text": "2-3 sentence summary for the dashboard",
+  "pattern_analysis": {
+    "winning_setups": "What winning trades over 2 weeks had in common",
+    "losing_setups": "What losing trades over 2 weeks had in common",
+    "blocked_entry_review": "Were blocked entries justified? Patterns in what was filtered out?",
+    "exit_effectiveness": "Which exit triggers worked well over 2 weeks, which need tuning?",
+    "tv_signal_value": "How much value did TV signals add over 2 weeks?",
+    "time_patterns": "Day-of-week and time-of-day patterns worth noting",
+    "version_evolution": "How did version changes affect performance? What worked, what didn't?"
+  },
+  "narrative": {
+    "week_story": "Natural language summary of the past 2 weeks — what happened, trends, turning points",
+    "evolution": "How is the system evolving? What's improving vs stuck?",
+    "cumulative_learnings": "Key learnings from 2 weeks of data. What patterns are solidifying?"
   }
-  return client;
 }
+
+If no adjustments are warranted, set should_adjust: false and adjustments: [], but still provide pattern_analysis and narrative.`;
 
 // ---- Public API ----
 
@@ -92,7 +105,7 @@ function getClient() {
  * Returns: { skipped, reason?, changes?, newVersion?, analysis? }
  */
 export async function runWeeklyReview() {
-  log.info('=== Starting Weekly Review (14-day deep analysis) ===');
+  log.info('=== Starting Weekly Review (Sonnet, 14-day deep analysis) ===');
 
   const activeConfig = getActiveConfig();
   const currentVersion = getActiveVersionNumber();
@@ -108,54 +121,24 @@ export async function runWeeklyReview() {
   }
 
   // Guard: no API key
-  const kimiClient = getClient();
-  if (!kimiClient) {
-    log.warn('Kimi API key not configured — skipping weekly review');
+  if (!config.anthropicApiKey) {
+    log.warn('Anthropic API key not configured — skipping weekly review');
     return { skipped: true, reason: 'no_api_key' };
   }
 
-  log.info(`Sending weekly data to Kimi (${totalTrades} trades over 14d, v${currentVersion})...`);
-  const startTime = Date.now();
+  log.info(`Sending weekly data to Sonnet (${totalTrades} trades over 14d, v${currentVersion})...`);
 
   try {
-    const response = await kimiClient.chat.completions.create({
-      model: config.agentModel || 'kimi-k2.5',
-      temperature: 0.2,
-      max_tokens: 2000,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: WEEKLY_SYSTEM_PROMPT },
-        { role: 'user', content: JSON.stringify(input) },
-      ],
-    });
-
-    const responseTimeMs = Date.now() - startTime;
-    const content = response.choices?.[0]?.message?.content;
-
-    if (!content) {
-      log.error('Weekly review agent returned empty response');
-      return { skipped: true, reason: 'empty_response' };
-    }
-
-    let result;
-    try {
-      result = JSON.parse(content);
-    } catch {
-      log.error('Weekly review agent returned invalid JSON:', content.slice(0, 300));
-      return { skipped: true, reason: 'invalid_json' };
-    }
-
-    const tokenUsage = {
-      inputTokens: response.usage?.prompt_tokens || 0,
-      outputTokens: response.usage?.completion_tokens || 0,
-      responseTimeMs,
-    };
+    const { parsed: result, tokenUsage } = await callSonnet(WEEKLY_SYSTEM_PROMPT, input);
 
     log.info(
-      `Weekly review completed in ${responseTimeMs}ms | ` +
+      `Weekly review completed in ${tokenUsage.responseTimeMs}ms | ` +
       `${tokenUsage.inputTokens}+${tokenUsage.outputTokens} tokens | ` +
       `should_adjust: ${result.should_adjust}`
     );
+
+    // Attach input data for Discord report
+    result._inputData = input;
 
     // Apply changes if any
     if (result.should_adjust && result.adjustments?.length > 0) {
@@ -214,8 +197,7 @@ export async function runWeeklyReview() {
     };
 
   } catch (err) {
-    const responseTimeMs = Date.now() - startTime;
-    log.error(`Weekly review error (${responseTimeMs}ms):`, err.message);
+    log.error(`Weekly review error:`, err.message);
     return { skipped: true, reason: `api_error: ${err.message}` };
   }
 }
@@ -236,6 +218,33 @@ function buildWeeklyInput() {
   const failedAdj = getFailedAdjustments();
   const allVersions = getAllVersions();
 
+  // ---- Enrichment data ----
+  const todayStr = formatET(nowET()).slice(0, 10);
+
+  // Aggregate blocked entries across lookback period (sample last few days)
+  let totalBlocked = 0;
+  const blockReasons = {};
+  for (let i = 0; i < Math.min(WEEKLY_LOOKBACK_DAYS, 5); i++) {
+    const dayStr = formatET(nowET().minus({ days: i })).slice(0, 10);
+    const decisions = getDecisionsByDate(dayStr);
+    for (const d of decisions) {
+      try {
+        const p = JSON.parse(d.decision_json || '{}');
+        if (p.entryBlocked) {
+          totalBlocked++;
+          const r = p.blockReason || p.reason || 'unknown';
+          blockReasons[r] = (blockReasons[r] || 0) + 1;
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  // GEX score distribution (today only for freshness)
+  const gexSnapshots = getGexSnapshotsByDate(todayStr);
+  const gexScores = gexSnapshots.map(s => {
+    try { return JSON.parse(s.snapshot_json || '{}').score || 0; } catch { return 0; }
+  }).filter(s => s > 0);
+
   return {
     review_type: 'WEEKLY',
     current_version: currentVersion,
@@ -254,6 +263,21 @@ function buildWeeklyInput() {
       exit_reason_distribution: analyzeByExitReason(closedTrades),
       phantom_comparison_summary: summarizeComparisons(comparisons),
       version_history_summary: summarizeVersionHistory(allVersions),
+    },
+    enrichment: {
+      blocked_entries_summary: {
+        total_blocked: totalBlocked,
+        top_block_reasons: Object.entries(blockReasons)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([reason, count]) => ({ reason, count })),
+      },
+      gex_score_distribution: {
+        count: gexScores.length,
+        avg: gexScores.length > 0 ? +(gexScores.reduce((a, b) => a + b, 0) / gexScores.length).toFixed(1) : 0,
+        min: gexScores.length > 0 ? Math.min(...gexScores) : 0,
+        max: gexScores.length > 0 ? Math.max(...gexScores) : 0,
+      },
     },
   };
 }
