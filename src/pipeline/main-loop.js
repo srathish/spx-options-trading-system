@@ -931,22 +931,22 @@ function scheduleDailyReset() {
 // ---- Phase 5: Nightly/Weekly Review Scheduling ----
 
 /**
- * Schedule the next nightly review at 2 AM ET.
+ * Schedule the next nightly review at 10:30 PM ET.
  * On Sundays, runs weekly review instead.
  */
 function scheduleNightlyReview() {
   const et = nowET();
-  let target = et.set({ hour: 2, minute: 0, second: 0, millisecond: 0 });
+  let target = et.set({ hour: 22, minute: 30, second: 0, millisecond: 0 });
 
-  // If already past 2 AM today, schedule for tomorrow
-  if (et.hour >= 2) {
+  // If already past 10:30 PM today, schedule for tomorrow
+  if (et.hour > 22 || (et.hour === 22 && et.minute >= 30)) {
     target = target.plus({ days: 1 });
   }
 
   const msUntilReview = target.toMillis() - et.toMillis();
   const hoursUntil = (msUntilReview / 3_600_000).toFixed(1);
 
-  log.info(`Nightly review scheduled in ${hoursUntil}h (${formatET(target).split(' ')[0]} 02:00 ET)`);
+  log.info(`Nightly review scheduled in ${hoursUntil}h (${formatET(target).split(' ')[0]} 22:30 ET)`);
 
   reviewTimer = setTimeout(async () => {
     if (!running) return;
