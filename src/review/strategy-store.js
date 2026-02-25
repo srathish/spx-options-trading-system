@@ -72,7 +72,7 @@ const V1_BASELINE = {
   delta_sweet_spot_high: 0.55,
 
   // Self-improvement settings
-  learning_period_days: 7,
+  learning_period_days: 5,
   min_trades_for_adjustment: 5,
   max_adjustments_per_review: 3,
 };

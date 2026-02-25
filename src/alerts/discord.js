@@ -1130,9 +1130,11 @@ export async function sendReviewReport(reviewResult) {
       : reviewResult.reason || 'No adjustments warranted.';
   }
 
+  const isProposed = reviewResult.proposed === true;
+
   const embed3 = {
     title: hasChanges
-      ? `\uD83D\uDD27 ${changes.length} Change${changes.length === 1 ? '' : 's'} Applied`
+      ? `\uD83D\uDD27 ${changes.length} Proposed Change${changes.length === 1 ? '' : 's'} — Awaiting Approval`
       : '\u2705 No Changes',
     description: truncate(changesDescription, 2048),
     color: hasChanges ? 0x7C3AED : COLORS.SYSTEM, // purple if changes, gray if not

@@ -140,48 +140,19 @@ export async function runWeeklyReview() {
     // Attach input data for Discord report
     result._inputData = input;
 
-    // Apply changes if any
+    // Propose changes (DO NOT auto-apply — user reviews in Discord and decides)
     if (result.should_adjust && result.adjustments?.length > 0) {
       const maxChanges = activeConfig.max_adjustments_per_review || 3;
       const adjustments = result.adjustments.slice(0, maxChanges);
 
       const validated = validateChanges(adjustments, activeConfig);
-      if (validated.length === 0) {
-        log.info('All proposed weekly changes failed validation');
-        return {
-          skipped: false,
-          changes: [],
-          reason: 'validation_failed',
-          analysis: result,
-          tokenUsage,
-        };
-      }
 
-      const newConfig = { ...activeConfig };
-      for (const change of validated) {
-        newConfig[change.parameter] = change.new_value;
-      }
-
-      const newVersionNum = createVersion(
-        newConfig,
-        validated.map(c => ({
-          param: c.parameter,
-          old: c.old_value,
-          new: c.new_value,
-          reason: c.reason,
-        })),
-        'WEEKLY_REVIEW',
-        result,
-        tokenUsage,
-      );
-
-      log.info(`Weekly review created v${newVersionNum} with ${validated.length} change(s)`);
+      log.info(`Weekly review proposes ${validated.length} change(s) — awaiting user approval via Discord`);
 
       return {
         skipped: false,
         changes: validated,
-        newVersion: newVersionNum,
-        previousVersion: currentVersion,
+        proposed: true,
         analysis: result,
         tokenUsage,
       };
@@ -191,7 +162,6 @@ export async function runWeeklyReview() {
     return {
       skipped: false,
       changes: [],
-      reason: result.analysis_summary || 'no_changes_needed',
       analysis: result,
       tokenUsage,
     };

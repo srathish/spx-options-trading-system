@@ -147,51 +147,20 @@ export async function runNightlyReview() {
     // Attach input data for Discord report
     result._inputData = input;
 
-    // Apply changes if any
+    // Propose changes (DO NOT auto-apply — user reviews in Discord and decides)
     if (result.should_adjust && result.adjustments?.length > 0) {
       const maxChanges = activeConfig.max_adjustments_per_review || 3;
       const adjustments = result.adjustments.slice(0, maxChanges);
 
-      // Validate and clamp changes
+      // Validate and clamp changes (for the proposal)
       const validated = validateChanges(adjustments, activeConfig);
-      if (validated.length === 0) {
-        log.info('All proposed changes failed validation — no changes applied');
-        return {
-          skipped: false,
-          changes: [],
-          reason: 'validation_failed',
-          analysis: result,
-          tokenUsage,
-        };
-      }
 
-      // Build new config
-      const newConfig = { ...activeConfig };
-      for (const change of validated) {
-        newConfig[change.parameter] = change.new_value;
-      }
-
-      // Create new version
-      const newVersionNum = createVersion(
-        newConfig,
-        validated.map(c => ({
-          param: c.parameter,
-          old: c.old_value,
-          new: c.new_value,
-          reason: c.reason,
-        })),
-        'NIGHTLY_REVIEW',
-        result,
-        tokenUsage,
-      );
-
-      log.info(`Review created v${newVersionNum} with ${validated.length} change(s)`);
+      log.info(`Review proposes ${validated.length} change(s) — awaiting user approval via Discord`);
 
       return {
         skipped: false,
         changes: validated,
-        newVersion: newVersionNum,
-        previousVersion: currentVersion,
+        proposed: true, // Flag: changes are proposed, not applied
         analysis: result,
         tokenUsage,
       };
@@ -201,7 +170,6 @@ export async function runNightlyReview() {
     return {
       skipped: false,
       changes: [],
-      reason: result.analysis_summary || 'no_changes_needed',
       analysis: result,
       tokenUsage,
     };
