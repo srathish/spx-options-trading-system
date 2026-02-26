@@ -1,18 +1,18 @@
 /**
  * Phantom Tracker
- * Tracks skipped signals — when a new ENTER fires while already in a position.
- * Records what would have happened for performance analysis.
+ * Tracks phantom trades (Lane A skipped signals + Lane B GEX+TV phantoms).
+ * Full exit trigger parity with trade-manager.js (13 of 14 triggers — no AGENT_EXIT).
  * P&L is based on SPX spot movement (same as trade-manager.js).
  */
 
 import { openTrade, closeTrade, getOpenPhantoms } from '../store/db.js';
 import { nowET } from '../utils/market-hours.js';
+import { getActiveConfig } from '../review/strategy-store.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Phantom');
 
-const THETA_DEATH_HOUR = 15;
-const THETA_DEATH_MINUTE = 30;
+const MIN_HOLD_BEFORE_SOFT_EXIT_MS = 3 * 60_000; // 3 min hold gate (same as trade-manager)
 
 // In-memory phantom positions
 let phantoms = [];
@@ -22,19 +22,28 @@ let phantoms = [];
  */
 export function initPhantomTracker() {
   const rows = getOpenPhantoms();
-  phantoms = rows.map(row => ({
-    id: row.id,
-    contract: row.contract,
-    direction: row.direction,
-    strike: row.strike,
-    entryPrice: row.entry_price,
-    entrySpx: row.entry_spx,
-    targetSpx: row.target_spx,
-    stopSpx: row.stop_spx,
-    greeks: JSON.parse(row.greeks_at_entry || '{}'),
-    openedAt: row.opened_at,
-    state: row.state,
-  }));
+  phantoms = rows.map(row => {
+    let entryCtx = null;
+    try { entryCtx = row.entry_context ? JSON.parse(row.entry_context) : null; } catch { /* ignore */ }
+
+    return {
+      id: row.id,
+      contract: row.contract,
+      direction: row.direction,
+      strike: row.strike,
+      entryPrice: row.entry_price,
+      entrySpx: row.entry_spx,
+      targetSpx: row.target_spx,
+      stopSpx: row.stop_spx,
+      greeks: JSON.parse(row.greeks_at_entry || '{}'),
+      openedAt: row.opened_at,
+      state: row.state,
+      strategyLane: row.strategy_lane || null,
+      entryTrigger: row.entry_trigger || null,
+      entryContext: entryCtx,
+      bestSpxChange: 0,
+    };
+  });
 
   if (phantoms.length > 0) {
     log.info(`Loaded ${phantoms.length} open phantom(s) from DB`);
@@ -42,12 +51,13 @@ export function initPhantomTracker() {
 }
 
 /**
- * Record a phantom trade (skipped signal).
+ * Record a phantom trade.
  */
 export function recordPhantom({
   contract, direction, strike, entryPrice, entrySpx,
   targetPrice, stopPrice, targetSpx, stopSpx,
   greeks, gexState, tvState, agentReasoning,
+  strategyLane, entryTrigger, entryContext,
 }) {
   const state = direction === 'BULLISH' ? 'IN_CALLS' : 'IN_PUTS';
 
@@ -57,61 +67,48 @@ export function recordPhantom({
     greeks, gexState, tvState, agentReasoning,
     isPhantom: true,
     state,
+    strategyLane: strategyLane || null,
+    entryTrigger: entryTrigger || null,
+    entryContext: entryContext || null,
   });
 
   const phantom = {
     id, contract, direction, strike, entryPrice, entrySpx,
     targetSpx, stopSpx, greeks,
     openedAt: new Date().toISOString(), state,
+    strategyLane: strategyLane || null,
+    entryTrigger: entryTrigger || null,
+    entryContext: entryContext || null,
+    bestSpxChange: 0,
   };
 
   phantoms.push(phantom);
-  log.info(`Phantom recorded: ${contract} ${direction} @ $${entryPrice}`);
+  log.info(`Phantom recorded: ${contract} ${direction} @ SPX ${entrySpx} [Lane ${strategyLane || '?'}]`);
 
   return phantom;
 }
 
 /**
  * Update all open phantoms each cycle.
- * Returns array of closed phantom summaries.
+ * Full exit trigger parity with trade-manager (13 triggers, no AGENT_EXIT).
+ *
+ * @param {number} currentSpot - Current SPX price
+ * @param {object} scored - Scored GEX state (for GEX_FLIP, OPPOSING_WALL)
+ * @param {object} context - { tvSnapshot, multiAnalysis }
+ * @returns {Array} Closed phantom summaries
  */
-export function updatePhantoms(currentSpot) {
+export function updatePhantoms(currentSpot, scored = null, context = {}) {
   const closed = [];
+  const cfg = getActiveConfig() || {};
   const etNow = nowET();
-  const isThetaDeath = etNow.hour > THETA_DEATH_HOUR ||
-    (etNow.hour === THETA_DEATH_HOUR && etNow.minute >= THETA_DEATH_MINUTE);
-
   const remaining = [];
 
   for (const phantom of phantoms) {
-    const isBullish = phantom.direction === 'BULLISH';
-
-    // Check target hit
-    let exitReason = null;
-    if (phantom.targetSpx) {
-      const targetHit = isBullish
-        ? currentSpot >= phantom.targetSpx
-        : currentSpot <= phantom.targetSpx;
-      if (targetHit) exitReason = 'TARGET_HIT';
-    }
-
-    // Check stop hit
-    if (!exitReason && phantom.stopSpx) {
-      const stopHit = isBullish
-        ? currentSpot <= phantom.stopSpx
-        : currentSpot >= phantom.stopSpx;
-      if (stopHit) exitReason = 'STOP_HIT';
-    }
-
-    // Check theta death
-    if (!exitReason && isThetaDeath) {
-      exitReason = 'THETA_DEATH';
-    }
+    const exitReason = checkPhantomExit(phantom, currentSpot, scored, context, cfg, etNow);
 
     if (exitReason) {
-      // SPX-based P&L — same as trade-manager.js
-      const isBull = phantom.direction === 'BULLISH';
-      const spxChange = isBull ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+      const isBullish = phantom.direction === 'BULLISH';
+      const spxChange = isBullish ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
       const pnlPct = phantom.entrySpx ? Math.round((spxChange / phantom.entrySpx) * 1000) / 10 : 0;
       const pnlDollars = Math.round(spxChange * 100) / 100;
 
@@ -132,19 +129,164 @@ export function updatePhantoms(currentSpot) {
         pnlPct,
         exitReason,
         isWin: spxChange > 0,
+        strategyLane: phantom.strategyLane,
+        entryTrigger: phantom.entryTrigger,
       });
 
       log.info(
-        `Phantom closed: ${phantom.contract} | ${exitReason} | ` +
+        `Phantom closed: ${phantom.contract} [Lane ${phantom.strategyLane || '?'}] | ${exitReason} | ` +
         `SPX ${phantom.entrySpx} → ${currentSpot} (${spxChange > 0 ? '+' : ''}${pnlDollars} pts) | ${spxChange > 0 ? 'WIN' : 'LOSS'}`
       );
     } else {
+      // Update bestSpxChange for trailing stop tracking
+      if (phantom.entrySpx && currentSpot) {
+        const isBullish = phantom.direction === 'BULLISH';
+        const spxChange = isBullish ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+        if (spxChange > (phantom.bestSpxChange || 0)) {
+          phantom.bestSpxChange = spxChange;
+        }
+      }
       remaining.push(phantom);
     }
   }
 
   phantoms = remaining;
   return closed;
+}
+
+/**
+ * Check all 13 exit triggers for a phantom (same priority as trade-manager, minus AGENT_EXIT).
+ */
+function checkPhantomExit(phantom, currentSpot, scored, context, cfg, etNow) {
+  const isBullish = phantom.direction === 'BULLISH';
+  const now = Date.now();
+  const holdTimeMs = now - new Date(phantom.openedAt).getTime();
+  const holdTooShort = holdTimeMs < MIN_HOLD_BEFORE_SOFT_EXIT_MS;
+
+  // 1. TARGET_HIT
+  if (phantom.targetSpx) {
+    const hit = isBullish ? currentSpot >= phantom.targetSpx : currentSpot <= phantom.targetSpx;
+    if (hit) return 'TARGET_HIT';
+  }
+
+  // 2. NODE_SUPPORT_BREAK
+  if (phantom.entryContext) {
+    const ctx = phantom.entryContext;
+    const buffer = cfg.node_break_buffer_pts ?? 2;
+
+    if (isBullish && ctx.support_node?.strike) {
+      if (currentSpot < ctx.support_node.strike - buffer) return 'NODE_SUPPORT_BREAK';
+    }
+    if (!isBullish && ctx.ceiling_node?.strike) {
+      if (currentSpot > ctx.ceiling_node.strike + buffer) return 'NODE_SUPPORT_BREAK';
+    }
+  }
+
+  // 3. STOP_HIT
+  if (phantom.stopSpx) {
+    const hit = isBullish ? currentSpot <= phantom.stopSpx : currentSpot >= phantom.stopSpx;
+    if (hit) return 'STOP_HIT';
+  }
+
+  // 4. PROFIT_TARGET
+  if (phantom.entrySpx && currentSpot) {
+    const spxChange = isBullish ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+    const movePct = (spxChange / phantom.entrySpx) * 100;
+    if (movePct >= (cfg.profit_target_pct || 0.15)) return 'PROFIT_TARGET';
+    // 5. STOP_LOSS
+    if (movePct <= -(cfg.stop_loss_pct || 0.20)) return 'STOP_LOSS';
+  }
+
+  // 6. TV_COUNTER_FLIP
+  if (cfg.tv_counter_flip_enabled !== false && !holdTooShort && context.tvSnapshot) {
+    const signals = context.tvSnapshot.spx?.signals || {};
+    const bravo3 = signals['bravo_3m'];
+    const tango3 = signals['tango_3m'];
+
+    const bravoAgainst = bravo3 && !bravo3.isStale && (
+      (isBullish && bravo3.classification === 'BEARISH') || (!isBullish && bravo3.classification === 'BULLISH')
+    );
+    const tangoAgainst = tango3 && !tango3.isStale && (
+      (isBullish && tango3.classification === 'BEARISH') || (!isBullish && tango3.classification === 'BULLISH')
+    );
+
+    if ((bravoAgainst ? 1 : 0) + (tangoAgainst ? 1 : 0) >= (cfg.tv_counter_flip_min_indicators ?? 2)) {
+      return 'TV_COUNTER_FLIP';
+    }
+  }
+
+  // 7. OPPOSING_WALL
+  if (!holdTooShort && scored) {
+    const opposingWalls = isBullish ? scored.wallsBelow : scored.wallsAbove;
+    const opposingValue = cfg.opposing_wall_exit_value || 5_000_000;
+    if (opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingValue && w.type === 'POSITIVE')) {
+      return 'OPPOSING_WALL';
+    }
+  }
+
+  // 8. MOMENTUM_TIMEOUT
+  if (!holdTooShort && phantom.entrySpx && currentSpot) {
+    const holdMinutes = holdTimeMs / 60_000;
+    const spxProgress = isBullish ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+
+    const p1Min = cfg.momentum_phase1_minutes ?? 5;
+    const p1Pts = cfg.momentum_phase1_min_pts ?? 2;
+    if (holdMinutes >= p1Min && spxProgress < p1Pts) return 'MOMENTUM_TIMEOUT';
+
+    const p2Min = cfg.momentum_phase2_minutes ?? 10;
+    const p2Pct = cfg.momentum_phase2_target_pct ?? 0.40;
+    if (holdMinutes >= p2Min && phantom.targetSpx) {
+      const totalTarget = Math.abs(phantom.targetSpx - phantom.entrySpx);
+      if (totalTarget > 0 && spxProgress < totalTarget * p2Pct) return 'MOMENTUM_TIMEOUT';
+    }
+
+    const p3Min = cfg.momentum_phase3_minutes ?? 15;
+    if (holdMinutes >= p3Min && spxProgress <= 0) return 'MOMENTUM_TIMEOUT';
+  }
+
+  // 9. TV_FLIP (multiple 3m indicators against)
+  if (!holdTooShort && context.tvSnapshot) {
+    const signals = context.tvSnapshot.spx?.signals || {};
+    let opposingCount = 0;
+    for (const [key, sig] of Object.entries(signals)) {
+      if (!key.endsWith('3m')) continue;
+      const opposing = isBullish ? sig.classification === 'BEARISH' : sig.classification === 'BULLISH';
+      if (opposing && !sig.isStale) opposingCount++;
+    }
+    if (opposingCount >= (cfg.tv_against_exit_count || 2)) return 'TV_FLIP';
+  }
+
+  // 10. MAP_RESHUFFLE
+  if (!holdTooShort && context.multiAnalysis?.reshuffles?.some(r => r.detected)) {
+    return 'MAP_RESHUFFLE';
+  }
+
+  // 11. TRAILING_STOP
+  const trailActivate = cfg.trailing_stop_activate_pts || 8;
+  const trailDistance = cfg.trailing_stop_distance_pts || 5;
+  if (!holdTooShort && phantom.entrySpx && currentSpot) {
+    const spxChange = isBullish ? currentSpot - phantom.entrySpx : phantom.entrySpx - currentSpot;
+    if (spxChange > (phantom.bestSpxChange || 0)) phantom.bestSpxChange = spxChange;
+    if ((phantom.bestSpxChange || 0) >= trailActivate) {
+      const drawdown = phantom.bestSpxChange - spxChange;
+      if (drawdown >= trailDistance) return 'TRAILING_STOP';
+    }
+  }
+
+  // 12. THETA_DEATH
+  const [thetaH, thetaM] = (cfg.no_entry_after || '15:30').split(':').map(Number);
+  if (etNow.hour > thetaH || (etNow.hour === thetaH && etNow.minute >= thetaM)) {
+    return 'THETA_DEATH';
+  }
+
+  // 13. GEX_FLIP
+  const gexFlipThreshold = cfg.gex_exit_threshold || 60;
+  if (!holdTooShort && scored && scored.score >= gexFlipThreshold) {
+    const gexBullish = scored.direction === 'BULLISH';
+    if (gexBullish !== isBullish) return 'GEX_FLIP';
+  }
+
+  return null; // No exit
 }
 
 /**

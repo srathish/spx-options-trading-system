@@ -1,5 +1,5 @@
 /**
- * OpenClaw SPX Trading System — Entry Point
+ * GexClaw SPX Trading System — Entry Point
  * Phase 1: GEX monitor + Discord alerts
  * Phase 2: TradingView signals + Kimi K2.5 AI agent
  * Phase 3: Trade execution via SPX spot tracking
@@ -13,9 +13,9 @@ import { startWebhookServer, stopWebhookServer } from './tv/tv-webhook-server.js
 import { isAgentAvailable } from './agent/agent.js';
 import { startDashboardServer, stopDashboardServer } from './dashboard/dashboard-server.js';
 
-const log = createLogger('OpenClaw');
+const log = createLogger('GexClaw');
 
-log.info('OpenClaw SPX Trading System starting...');
+log.info('GexClaw SPX Trading System starting...');
 log.info(`Environment: ${config.nodeEnv}`);
 log.info(`Data directory: ${config.dataDir}`);
 log.info(`Discord webhook: ${config.discordWebhookUrl ? 'configured' : 'NOT SET'}`);

@@ -19,13 +19,18 @@ import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
-import { getGexHistory, getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
+import { resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
 import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
 import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
-import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
+import { checkGexOnlyEntry, checkLaneBEntry } from '../trades/entry-engine.js';
+import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
+import { buildEntryContext } from '../trades/entry-context.js';
+import { detectAllPatterns } from '../gex/gex-patterns.js';
+import { getNodeTouches } from '../gex/node-tracker.js';
+import { getSignalSnapshot } from '../tv/tv-signal-store.js';
 import { getSchedulePhase, isOpeningSummaryTime, isEodRecapTime, nowET, formatET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 import { updateLoopStatus } from './loop-status.js';
@@ -57,24 +62,9 @@ let eodSummarySentDate = null;
 let nightlyReviewDate = null;
 let running = false;
 
-// Re-entry cooldown tracking
-let lastExitTime = 0;
-let lastExitDirection = null;
-const REENTRY_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after exit before re-entering same direction
-
-// Entry quality gate tracking
-let lastEntryTime = 0;
-let todayTradeCount = 0;
-const ENTRY_GATES = {
-  MAX_TRADES_PER_DAY: 8,
-  MIN_TIME_BETWEEN_ENTRIES_MS: 5 * 60 * 1000,   // 5 min between ANY entries
-  MIN_STABLE_DIRECTION_CYCLES: 3,                 // Direction must agree 3 consecutive cycles
-  NO_ENTRY_AFTER_FLIP_CYCLES: 4,                  // Wait 4 cycles after direction flip
-  NO_ENTRY_AFTER_ET: '15:00',                     // No new entries after 3:00 PM ET for 0DTE
-  OPENING_CAUTION_UNTIL_ET: '09:40',              // Higher thresholds during first 10 min
-  OPENING_MIN_SCORE: 85,                           // Score ≥85 required during open
-  OPENING_MIN_ALIGNMENT: 3,                        // 3/3 alignment required during open
-};
+// Lane B phantom cooldown
+let lastLaneBPhantomTime = 0;
+const LANE_B_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between Lane B phantoms
 
 /**
  * Start the main polling loop.
@@ -86,7 +76,7 @@ export function startMainLoop() {
   }
 
   running = true;
-  log.info('OpenClaw main loop starting...');
+  log.info('GexClaw main loop starting...');
 
   updateLoopStatus({ running: true, startedAt: Date.now() });
 
@@ -101,7 +91,7 @@ export function startMainLoop() {
   // Run cleanup on startup
   cleanupOldData(7);
 
-  // Schedule nightly review (2 AM ET, independent of main loop)
+  // Schedule nightly review (4:10 PM ET, right after market close)
   scheduleNightlyReview();
 
   // Schedule daily node tracker reset (9:25 AM ET, before warm-up)
@@ -403,8 +393,17 @@ async function runCycle(phase) {
 
     // ---- PHASE 2: DECISION ENGINE (GEX + TV → Agent) ----
     let agentAction = null;
+    let detectedPatterns = [];
+    let agentEntryTrigger = null;
     try {
       const decisionResult = await runDecisionCycle(scored, parsed, wallTrends, multiAnalysis, trinityState);
+      detectedPatterns = decisionResult?.patterns || [];
+
+      // Emit patterns to dashboard
+      if (detectedPatterns.length > 0) {
+        log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
+        try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}
+      }
 
       if (decisionResult && decisionResult.changed && !decisionResult.skipped) {
         // Action or confidence changed — send combined signal alert
@@ -417,6 +416,7 @@ async function runCycle(phase) {
           saveAlert('SIGNAL', alertData);
         } catch (_) {}
         agentAction = decision.action;
+        agentEntryTrigger = decision.entry_trigger || null;
 
         // Save prediction for ENTER signals so trade ideas appear in dashboard Ideas tab
         if (decision.action?.startsWith('ENTER')) {
@@ -427,7 +427,8 @@ async function runCycle(phase) {
           );
         }
 
-        log.info(`Decision: ${decision.action} (${decision.confidence}) — alert sent`);
+        const isAdvisory = decision.action?.startsWith('ENTER');
+        log.info(`Decision: ${decision.action} (${decision.confidence})${isAdvisory ? ' [advisory — entries are algorithmic]' : ''} — alert sent`);
       } else if (decisionResult && decisionResult.skipped) {
         agentAction = decisionResult.decision?.action || null;
         log.debug('Decision: agent skipped (no change)');
@@ -439,6 +440,10 @@ async function runCycle(phase) {
       try { dashboardEmitter.emit('decision_update', { action: agentAction, decision: decisionResult?.decision, marketMode: detectChopMode('SPXW') }); } catch (_) {}
     } catch (decisionErr) {
       log.error('Decision engine error:', decisionErr.message);
+      // Fallback: detect patterns independently so algorithmic entries still work
+      try {
+        detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches());
+      } catch (_) {}
     }
 
     // ---- PHASE 3: TRADE EXECUTION ----
@@ -456,9 +461,8 @@ async function runCycle(phase) {
         if (mgmt.exitTriggered) {
           const result = exitPosition(mgmt.exitReason, parsed.spotPrice);
           if (result) {
-            // Track exit for re-entry cooldown
-            lastExitTime = Date.now();
-            lastExitDirection = result.direction;
+            // Track exit for entry gates (loss streaks, re-entry cooldown)
+            recordExitForGates(result.direction, result.spxChange <= 0);
 
             await sendTradeClosed(result);
             try { dashboardEmitter.emit('trade_closed', result); } catch (_) {}
@@ -501,37 +505,120 @@ async function runCycle(phase) {
         }
       }
 
-      // B. If FLAT + agent ENTER → open trade (with guardrails)
-      if (getPositionState() === 'FLAT' && agentAction) {
-        const isEnter = agentAction === 'ENTER_CALLS' || agentAction === 'ENTER_PUTS';
-        if (isEnter) {
-          const guardrail = validateEntryGuardrails(agentAction, scored, multiAnalysis);
+      // B. If FLAT → algorithmic Lane A entry (GEX-only, no agent call needed)
+      if (getPositionState() === 'FLAT' && detectedPatterns.length > 0) {
+        const nodeTouches = getNodeTouches();
+        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+        const laneAResult = checkGexOnlyEntry(entryState);
+
+        if (laneAResult?.shouldEnter) {
+          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis);
           if (guardrail.allowed) {
-            await handleTradeEntry(agentAction, parsed, scored, wallTrends);
+            const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
+            await handleTradeEntry(laneAResult.action, parsed, scored, wallTrends, {
+              strategyLane: 'A',
+              entryTrigger: laneAResult.trigger.pattern,
+              entryContext,
+            });
+            recordEntryForGates();
           } else {
-            log.warn(`Entry BLOCKED: ${agentAction} — ${guardrail.reason}`);
-            // Save blocked entry to DB for end-of-day review
+            log.warn(`Lane A entry BLOCKED: ${laneAResult.action} — ${guardrail.reason}`);
             try {
-              saveAlert('ENTRY_BLOCKED', { type: 'ENTRY_BLOCKED', message: `${agentAction} blocked — ${guardrail.reason}`, details: { action: agentAction, reason: guardrail.reason, score: scored.score, direction: scored.direction, spotPrice: parsed.spotPrice } });
+              saveAlert('ENTRY_BLOCKED', { type: 'ENTRY_BLOCKED', message: `Lane A ${laneAResult.action} blocked — ${guardrail.reason}`, details: { action: laneAResult.action, reason: guardrail.reason, score: scored.score, direction: scored.direction, spotPrice: parsed.spotPrice, trigger: laneAResult.trigger.pattern } });
             } catch (_) {}
-            // Tell dashboard the entry was blocked so TradeCard shows the reason
             try {
-              dashboardEmitter.emit('entry_blocked', { action: agentAction, reason: guardrail.reason, spotPrice: parsed.spotPrice });
+              dashboardEmitter.emit('entry_blocked', { action: laneAResult.action, reason: guardrail.reason, spotPrice: parsed.spotPrice });
             } catch (_) {}
           }
         }
       }
 
-      // C. If NOT FLAT + agent ENTER again → phantom trade
-      if (getPositionState() !== 'FLAT' && agentAction) {
-        const isEnter = agentAction === 'ENTER_CALLS' || agentAction === 'ENTER_PUTS';
-        if (isEnter && shouldBePhantom()) {
-          await handlePhantomEntry(agentAction, parsed, scored, wallTrends);
+      // C. If NOT FLAT + Lane A pattern fires → phantom trade (Lane A skipped signal)
+      if (getPositionState() !== 'FLAT' && detectedPatterns.length > 0 && shouldBePhantom()) {
+        const nodeTouches = getNodeTouches();
+        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+        const laneAResult = checkGexOnlyEntry(entryState);
+
+        if (laneAResult?.shouldEnter) {
+          const direction = laneAResult.trigger.direction;
+          const spotPrice = parsed.spotPrice;
+          const atm = Math.round(spotPrice / 5) * 5;
+          const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+          const optType = direction === 'BULLISH' ? 'C' : 'P';
+          const contract = `SPX${expDate}${optType}${atm}`;
+          const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
+
+          recordPhantom({
+            contract,
+            direction,
+            strike: atm,
+            entryPrice: 0,
+            entrySpx: spotPrice,
+            targetPrice: 0,
+            stopPrice: 0,
+            targetSpx: laneAResult.trigger.target_strike,
+            stopSpx: laneAResult.trigger.stop_strike,
+            greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
+            gexState: { score: scored.score, direction: scored.direction },
+            tvState: getSignalSnapshot(),
+            agentReasoning: `Lane A phantom: ${laneAResult.trigger.pattern} — ${laneAResult.trigger.reasoning}`,
+            strategyLane: 'A',
+            entryTrigger: laneAResult.trigger.pattern,
+            entryContext,
+          });
         }
       }
 
-      // D. Update phantom trades
-      const closedPhantoms = updatePhantoms(parsed.spotPrice);
+      // D. Lane B: GEX+TV phantom trades (independent of Lane A)
+      const laneBReady = (Date.now() - lastLaneBPhantomTime) >= LANE_B_COOLDOWN_MS;
+      if (detectedPatterns.length > 0 && laneBReady) {
+        try {
+          const nodeTouches = getNodeTouches();
+          const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+          const laneBResult = checkLaneBEntry(entryState);
+
+          if (laneBResult?.shouldEnter) {
+            const guardrail = checkEntryGates(laneBResult.action, scored, multiAnalysis);
+            if (guardrail.allowed) {
+              const direction = laneBResult.trigger.direction;
+              const spotPrice = parsed.spotPrice;
+              const atm = Math.round(spotPrice / 5) * 5;
+              const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+              const optType = direction === 'BULLISH' ? 'C' : 'P';
+              const contract = `SPX${expDate}${optType}${atm}`;
+              const entryContext = buildEntryContext(laneBResult.trigger, scored, multiAnalysis);
+
+              recordPhantom({
+                contract,
+                direction,
+                strike: atm,
+                entryPrice: 0,
+                entrySpx: spotPrice,
+                targetPrice: 0,
+                stopPrice: 0,
+                targetSpx: laneBResult.trigger.target_strike,
+                stopSpx: laneBResult.trigger.stop_strike,
+                greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
+                gexState: { score: scored.score, direction: scored.direction },
+                tvState: getSignalSnapshot(),
+                agentReasoning: `Lane B: ${laneBResult.trigger.pattern} + TV confirm (${laneBResult.tvConfirmCount} indicators)`,
+                strategyLane: 'B',
+                entryTrigger: laneBResult.trigger.pattern,
+                entryContext,
+              });
+
+              lastLaneBPhantomTime = Date.now();
+              log.info(`Lane B phantom: ${contract} ${direction} via ${laneBResult.trigger.pattern} + TV (${laneBResult.tvConfirmCount} confirms)`);
+            }
+          }
+        } catch (laneBErr) {
+          log.error('Lane B phantom error:', laneBErr.message);
+        }
+      }
+
+      // E. Update phantom trades (pass full context for 13 exit triggers)
+      const tvSnapshotForPhantoms = getSignalSnapshot();
+      const closedPhantoms = updatePhantoms(parsed.spotPrice, scored, { tvSnapshot: tvSnapshotForPhantoms, multiAnalysis });
       if (closedPhantoms.length > 0) {
         log.info(`${closedPhantoms.length} phantom(s) closed this cycle`);
       }
@@ -668,121 +755,13 @@ function scheduleEodSummary() {
   }, msUntilSummary);
 }
 
-/**
- * Validate entry against hard guardrails.
- * These rules override the agent — even if the agent says ENTER, we block if:
- * 1. TV regime conflicts (Pink Diamond fired → no calls until Blue Diamond)
- * 2. Insufficient alignment (< 2/3 tickers) with no TV confirmation
- * 3. Re-entry cooldown hasn't elapsed after recent exit in same direction
- */
-function validateEntryGuardrails(agentAction, scored, multiAnalysis) {
-  const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
-  const tvSnapshot = getSignalSnapshot();
-  const tvRegime = getTvRegime();
-  const alignment = multiAnalysis?.alignment?.count || 0;
-
-  // Count TV confirmations for the entry direction (now includes Echo + Bravo + Tango × 2 timeframes)
-  const spxConf = tvSnapshot.spx?.confirmations || {};
-  const tvBullish = spxConf.bullish || 0;
-  const tvBearish = spxConf.bearish || 0;
-  const tvConfirms = direction === 'BULLISH' ? tvBullish : tvBearish;
-  const tvWeighted = tvSnapshot.spx?.weighted_score || {};
-  const tvWeightedScore = direction === 'BULLISH' ? (tvWeighted.bullish || 0) : (tvWeighted.bearish || 0);
-
-  // Rule 1: TV Regime gate
-  // Once Pink Diamond fires → BEARISH regime → no calls until Blue Diamond fires
-  // Once Blue Diamond fires → BULLISH regime → no puts until Pink Diamond fires
-  if (tvRegime.direction) {
-    if (direction === 'BULLISH' && tvRegime.direction === 'BEARISH') {
-      return { allowed: false, reason: `TV regime is BEARISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${Math.round((Date.now() - tvRegime.setAt) / 60000)}m ago) — need Blue Diamond before entering calls` };
-    }
-    if (direction === 'BEARISH' && tvRegime.direction === 'BULLISH') {
-      return { allowed: false, reason: `TV regime is BULLISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${Math.round((Date.now() - tvRegime.setAt) / 60000)}m ago) — need Pink Diamond before entering puts` };
-    }
-  }
-
-  // Rule 2: Alignment + TV gate
-  // With 0 TV confirmation, need alignment >= config threshold (default 2/3)
-  // EXCEPTION: Strong SPX momentum + high GEX score overrides alignment requirement
-  const alignmentMin = (getActiveConfig() || {}).alignment_min_for_entry || 2;
-  if (tvConfirms === 0 && alignment < alignmentMin) {
-    const momentum = getSpotMomentum('SPXW');
-    const momentumAligned = (direction === 'BULLISH' && momentum.direction === 'UP') ||
-                            (direction === 'BEARISH' && momentum.direction === 'DOWN');
-
-    if (momentum.strength === 'STRONG' && momentumAligned && scored.score >= 80) {
-      log.info(`Momentum override: ${momentum.strength} ${momentum.direction} ($${momentum.absPoints}) with score ${scored.score} — allowing entry despite ${alignment}/3 alignment, 0 TV`);
-    } else {
-      return { allowed: false, reason: `Only ${alignment}/3 aligned, 0 TV confirms (weighted: ${tvWeightedScore.toFixed(1)}) — need ${alignmentMin}/3 alignment or TV confirmation (momentum: ${momentum.strength} ${momentum.direction})` };
-    }
-  }
-
-  // Rule 3: Re-entry cooldown
-  // After exiting a position, wait before re-entering the same direction
-  if (lastExitTime > 0 && lastExitDirection === direction) {
-    const elapsed = Date.now() - lastExitTime;
-    if (elapsed < REENTRY_COOLDOWN_MS) {
-      const remaining = Math.round((REENTRY_COOLDOWN_MS - elapsed) / 1000);
-      return { allowed: false, reason: `Re-entry cooldown: exited ${direction} ${Math.round(elapsed / 1000)}s ago, wait ${remaining}s more` };
-    }
-  }
-
-  // Rule 4: Max trades per day
-  if (todayTradeCount >= ENTRY_GATES.MAX_TRADES_PER_DAY) {
-    return { allowed: false, reason: `Max trades reached: ${todayTradeCount}/${ENTRY_GATES.MAX_TRADES_PER_DAY} today` };
-  }
-
-  // Rule 5: Min time between ANY entries (not just same direction)
-  if (lastEntryTime > 0) {
-    const elapsed = Date.now() - lastEntryTime;
-    if (elapsed < ENTRY_GATES.MIN_TIME_BETWEEN_ENTRIES_MS) {
-      const remaining = Math.round((ENTRY_GATES.MIN_TIME_BETWEEN_ENTRIES_MS - elapsed) / 1000);
-      return { allowed: false, reason: `Entry cooldown: last entry ${Math.round(elapsed / 1000)}s ago, wait ${remaining}s more` };
-    }
-  }
-
-  // Rule 6: Direction stability — score must be stable for 3 consecutive cycles
-  if (!isDirectionStable('SPXW', ENTRY_GATES.MIN_STABLE_DIRECTION_CYCLES)) {
-    return { allowed: false, reason: `Unstable direction: score hasn't been stable for ${ENTRY_GATES.MIN_STABLE_DIRECTION_CYCLES} consecutive cycles` };
-  }
-
-  // Rule 7: Recent direction flip — wait 4 cycles after a flip
-  if (hadRecentDirectionFlip('SPXW', ENTRY_GATES.NO_ENTRY_AFTER_FLIP_CYCLES)) {
-    return { allowed: false, reason: `Direction flipped in last ${ENTRY_GATES.NO_ENTRY_AFTER_FLIP_CYCLES} cycles — wait for stabilization` };
-  }
-
-  // Rule 8: Time of day gate — no new entries after 3:00 PM ET on 0DTE
-  const etNow = nowET();
-  const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
-  if (timeET >= ENTRY_GATES.NO_ENTRY_AFTER_ET) {
-    return { allowed: false, reason: `Time gate: no new entries after ${ENTRY_GATES.NO_ENTRY_AFTER_ET} ET on 0DTE` };
-  }
-
-  // Rule 9: Opening caution (9:30-9:40) — higher thresholds
-  if (timeET < ENTRY_GATES.OPENING_CAUTION_UNTIL_ET && timeET >= '09:30') {
-    if (scored.score < ENTRY_GATES.OPENING_MIN_SCORE) {
-      return { allowed: false, reason: `Opening caution: score ${scored.score} < ${ENTRY_GATES.OPENING_MIN_SCORE} required before ${ENTRY_GATES.OPENING_CAUTION_UNTIL_ET}` };
-    }
-    if (alignment < ENTRY_GATES.OPENING_MIN_ALIGNMENT) {
-      return { allowed: false, reason: `Opening caution: alignment ${alignment}/3 < ${ENTRY_GATES.OPENING_MIN_ALIGNMENT}/3 required before ${ENTRY_GATES.OPENING_CAUTION_UNTIL_ET}` };
-    }
-  }
-
-  // Rule 10: Chop mode — require higher score during chop
-  const chopCfg = getActiveConfig() || {};
-  const chopResult = detectChopMode('SPXW', chopCfg.chop_lookback_cycles || 60);
-  if (chopResult.isChop && scored.score < (chopCfg.gex_strong_score || 80)) {
-    return { allowed: false, reason: `Chop mode (${chopResult.reason}) — need score >= ${chopCfg.gex_strong_score || 80} during chop, got ${scored.score}` };
-  }
-
-  return { allowed: true };
-}
+// validateEntryGuardrails() removed — replaced by checkEntryGates() in entry-gates.js
 
 /**
  * Handle a new trade entry (ENTER_CALLS or ENTER_PUTS).
  * Uses GEX walls for strike/target/stop — no delayed Polygon chain needed.
  */
-async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
+async function handleTradeEntry(agentAction, parsed, scored, wallTrends, laneOpts = {}) {
   const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
 
   try {
@@ -792,9 +771,13 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
     // Strike: ATM for calls, ATM for puts
     const strike = atm;
 
-    // Target & stop from GEX walls
-    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? spotPrice + 20 : spotPrice - 20);
-    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? spotPrice - 10 : spotPrice + 10);
+    // Target & stop from GEX walls — must be on correct side of spot
+    const targetSpx = direction === 'BULLISH'
+      ? (scored.wallsAbove?.[0]?.strike || spotPrice + 20)
+      : (scored.wallsBelow?.[0]?.strike || spotPrice - 20);
+    const stopSpx = direction === 'BULLISH'
+      ? (scored.wallsBelow?.[0]?.strike || spotPrice - 10)
+      : (scored.wallsAbove?.[0]?.strike || spotPrice + 10);
 
     // Synthetic contract name (0DTE SPX format)
     const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -802,8 +785,8 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
     const contract = `SPX${expDate}${optType}${strike}`;
 
     const tvSnapshot = getSignalSnapshot();
-
-    log.info(`Trade entry: ${contract} | spot=$${spotPrice} ATM=$${atm} | target=$${targetSpx} stop=$${stopSpx}`);
+    const triggerStr = laneOpts.entryTrigger ? ` | trigger=${laneOpts.entryTrigger}` : '';
+    log.info(`Trade entry: ${contract} | lane=${laneOpts.strategyLane || '-'} | spot=$${spotPrice} ATM=$${atm} | target=$${targetSpx} stop=$${stopSpx}${triggerStr}`);
 
     // Enter position (entryPrice=0 since we don't have live quotes)
     const pos = enterPosition({
@@ -824,13 +807,12 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
       },
       tvState: tvSnapshot,
       agentReasoning: scored.recommendation || null,
+      strategyLane: laneOpts.strategyLane || null,
+      entryTrigger: laneOpts.entryTrigger || null,
+      entryContext: laneOpts.entryContext || null,
     });
 
     if (pos) {
-      // Track entry for quality gates
-      lastEntryTime = Date.now();
-      todayTradeCount++;
-
       const tradeData = {
         ...pos,
         targetPnlPct: 0,
@@ -852,46 +834,7 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends) {
   }
 }
 
-/**
- * Handle a phantom trade entry (new ENTER while already in a position).
- * Uses GEX walls for strike/target/stop — no delayed Polygon chain needed.
- */
-async function handlePhantomEntry(agentAction, parsed, scored, wallTrends) {
-  const direction = agentAction === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
-
-  try {
-    const spotPrice = parsed.spotPrice;
-    const atm = Math.round(spotPrice / 5) * 5;
-    const strike = atm;
-
-    const targetSpx = scored.targetWall?.strike || (direction === 'BULLISH' ? spotPrice + 20 : spotPrice - 20);
-    const stopSpx = scored.floorWall?.strike || (direction === 'BULLISH' ? spotPrice - 10 : spotPrice + 10);
-
-    const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const optType = direction === 'BULLISH' ? 'C' : 'P';
-    const contract = `SPX${expDate}${optType}${strike}`;
-
-    recordPhantom({
-      contract,
-      direction,
-      strike,
-      entryPrice: 0,
-      entrySpx: spotPrice,
-      targetPrice: 0,
-      stopPrice: 0,
-      targetSpx,
-      stopSpx,
-      greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
-      gexState: { score: scored.score, direction: scored.direction },
-      tvState: getSignalSnapshot(),
-      agentReasoning: null,
-    });
-  } catch (err) {
-    log.error(`Phantom entry failed: ${err.message}`);
-  }
-}
-
-// ---- Daily Reset Scheduling (Node Tracker) ----
+// ---- Daily Reset Scheduling (Node Tracker + Entry Gates) ----
 
 let dailyResetTimer = null;
 
@@ -917,11 +860,8 @@ function scheduleDailyReset() {
 
     resetNodeTouches();
     resetDailyState();
-    todayTradeCount = 0;
-    lastEntryTime = 0;
-    lastExitTime = 0;
-    lastExitDirection = null;
-    log.info('Daily reset: node tracker, smoothing, trade counters');
+    resetDailyGates();
+    log.info('Daily reset: node tracker, smoothing, entry gates');
 
     // Reschedule for next day
     scheduleDailyReset();
@@ -931,22 +871,27 @@ function scheduleDailyReset() {
 // ---- Phase 5: Nightly/Weekly Review Scheduling ----
 
 /**
- * Schedule the next nightly review at 10:30 PM ET.
+ * Schedule the next nightly review at 4:10 PM ET.
  * On Sundays, runs weekly review instead.
  */
 function scheduleNightlyReview() {
   const et = nowET();
-  let target = et.set({ hour: 22, minute: 30, second: 0, millisecond: 0 });
+  let target = et.set({ hour: 16, minute: 10, second: 0, millisecond: 0 });
 
-  // If already past 10:30 PM today, schedule for tomorrow
-  if (et.hour > 22 || (et.hour === 22 && et.minute >= 30)) {
+  // If already past 4:10 PM today, schedule for tomorrow
+  if (et.hour > 16 || (et.hour === 16 && et.minute >= 10)) {
+    target = target.plus({ days: 1 });
+  }
+
+  // Skip weekends (Sat=6, Sun=7 in Luxon ISO weekday)
+  while (target.weekday === 6 || target.weekday === 7) {
     target = target.plus({ days: 1 });
   }
 
   const msUntilReview = target.toMillis() - et.toMillis();
   const hoursUntil = (msUntilReview / 3_600_000).toFixed(1);
 
-  log.info(`Nightly review scheduled in ${hoursUntil}h (${formatET(target).split(' ')[0]} 22:30 ET)`);
+  log.info(`Nightly review scheduled in ${hoursUntil}h (${formatET(target).split(' ')[0]} 16:10 ET)`);
 
   reviewTimer = setTimeout(async () => {
     if (!running) return;

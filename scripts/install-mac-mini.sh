@@ -1,16 +1,16 @@
 #!/bin/bash
-# Install OpenClaw as a macOS LaunchAgent — auto-starts on boot.
+# Install GexClaw as a macOS LaunchAgent — auto-starts on boot.
 # Run once: ./scripts/install-mac-mini.sh
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PLIST_NAME="com.openclaw.trading"
+PLIST_NAME="com.gexclaw.trading"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
 LOG_DIR="$SCRIPT_DIR/logs"
 NODE_PATH="$(which node)"
 PM2_PATH="$(which pm2)"
 
-echo "=== OpenClaw Mac Mini Installer ==="
+echo "=== GexClaw Mac Mini Installer ==="
 echo ""
 echo "Project:  $SCRIPT_DIR"
 echo "Node:     $NODE_PATH"
@@ -54,7 +54,7 @@ NGROK_LAUNCHER="$SCRIPT_DIR/scripts/start-ngrok.sh"
 cat > "$NGROK_LAUNCHER" << 'NGROK_EOF'
 #!/bin/bash
 # Start ngrok tunnel for TV webhooks
-ngrok http 3001 --log=stdout --log-level=warn > /tmp/openclaw-ngrok.log 2>&1
+ngrok http 3001 --log=stdout --log-level=warn > /tmp/gexclaw-ngrok.log 2>&1
 NGROK_EOF
 chmod +x "$NGROK_LAUNCHER"
 

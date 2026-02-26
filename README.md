@@ -1,4 +1,4 @@
-# OpenClaw
+# GexClaw
 
 Autonomous SPX 0DTE options trading system. Analyzes gamma exposure (GEX) data from Heatseeker, combines it with TradingView technical indicator signals (Echo + Bravo + Tango), and uses a Kimi K2.5 AI decision engine to generate structured trading decisions in real time.
 
@@ -147,7 +147,7 @@ cp .env.example .env
 ```bash
 # Production (via PM2)
 pm2 start ecosystem.config.cjs
-pm2 logs openclaw
+pm2 logs gexclaw
 
 # CLI shortcuts
 ./claw status        # System status

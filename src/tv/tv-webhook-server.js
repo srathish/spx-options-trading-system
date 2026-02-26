@@ -69,7 +69,7 @@ export function startWebhookServer() {
 
   // Health check
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', service: 'openclaw-tv-webhook' });
+    res.json({ status: 'ok', service: 'gexclaw-tv-webhook' });
   });
 
   // Signal state endpoint

@@ -10,7 +10,7 @@ import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ChatAgent');
 
-const CHAT_SYSTEM_PROMPT = `You are OpenClaw, a trading system monitoring SPX, SPY, and QQQ. You are talking to your operator.
+const CHAT_SYSTEM_PROMPT = `You are GexClaw, a trading system monitoring SPX, SPY, and QQQ. You are talking to your operator.
 
 RULES — FOLLOW THESE EXACTLY:
 

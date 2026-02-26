@@ -23,7 +23,7 @@ const WEEKLY_LOOKBACK_DAYS = 14;
 
 // ---- Weekly Review System Prompt ----
 
-const WEEKLY_SYSTEM_PROMPT = `You are OpenClaw's weekly deep-analysis engine — an autonomous 0DTE SPX options trading system. You analyze 14 days of trading data with special focus on weekly patterns, cross-version performance, and day-of-week trends.
+const WEEKLY_SYSTEM_PROMPT = `You are GexClaw's weekly deep-analysis engine — an autonomous 0DTE SPX options trading system. You analyze 14 days of trading data with special focus on weekly patterns, cross-version performance, and day-of-week trends.
 
 ## Rules
 1. NEVER recommend more than 3 adjustments at once. Small changes, measured results.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# OpenClaw CLI — Quick commands for managing the SPX bot
+# GexClaw CLI — Quick commands for managing the SPX bot
 # Usage: ./claw <command>
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -13,13 +13,13 @@ case "$1" in
     pm2 start ecosystem.config.cjs
     ;;
   stop)
-    pm2 stop openclaw
+    pm2 stop gexclaw
     ;;
   restart)
-    pm2 restart openclaw
+    pm2 restart gexclaw
     ;;
   logs)
-    pm2 logs ${2:-openclaw} --lines 50
+    pm2 logs ${2:-gexclaw} --lines 50
     ;;
   gex)
     node -e "
@@ -49,7 +49,7 @@ case "$1" in
     node src/index.js
     ;;
   launch)
-    echo "=== OpenClaw Launch ==="
+    echo "=== GexClaw Launch ==="
     echo ""
 
     # 1. Build dashboard
@@ -66,9 +66,9 @@ case "$1" in
 
     # 3. Start ngrok tunnel for TV webhooks
     echo "[3/4] Starting ngrok tunnel (port 3001)..."
-    ngrok http 3001 --log=stdout --log-level=warn > /tmp/openclaw-ngrok.log 2>&1 &
+    ngrok http 3001 --log=stdout --log-level=warn > /tmp/gexclaw-ngrok.log 2>&1 &
     NGROK_PID=$!
-    echo $NGROK_PID > /tmp/openclaw-ngrok.pid
+    echo $NGROK_PID > /tmp/gexclaw-ngrok.pid
     sleep 3
 
     # Get tunnel URL from ngrok API
@@ -96,18 +96,18 @@ case "$1" in
     open http://localhost:3000 2>/dev/null || true
 
     echo ""
-    echo "=== OpenClaw is live ==="
+    echo "=== GexClaw is live ==="
     echo "  ./claw logs       — view logs"
     echo "  ./claw status     — PM2 status"
     echo "  ./claw shutdown   — stop everything"
     ;;
   shutdown)
-    echo "Shutting down OpenClaw..."
+    echo "Shutting down GexClaw..."
     pm2 stop ecosystem.config.cjs --silent 2>/dev/null
     pm2 delete ecosystem.config.cjs --silent 2>/dev/null
-    if [ -f /tmp/openclaw-ngrok.pid ]; then
-      kill "$(cat /tmp/openclaw-ngrok.pid)" 2>/dev/null
-      rm -f /tmp/openclaw-ngrok.pid
+    if [ -f /tmp/gexclaw-ngrok.pid ]; then
+      kill "$(cat /tmp/gexclaw-ngrok.pid)" 2>/dev/null
+      rm -f /tmp/gexclaw-ngrok.pid
     fi
     echo "All services stopped."
     ;;
@@ -175,7 +175,7 @@ case "$1" in
     "
     ;;
   *)
-    echo "OpenClaw SPX Trading System"
+    echo "GexClaw SPX Trading System"
     echo ""
     echo "Usage: ./claw <command>"
     echo ""

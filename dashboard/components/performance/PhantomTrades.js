@@ -1,36 +1,63 @@
 'use client';
 
-import { formatCurrency, formatPct, formatET, pnlColor } from '../../lib/utils';
+import { formatCurrency, formatET, formatContract, pnlColor, cn } from '../../lib/utils';
 import { Card } from '../ui/Card';
 
 export function PhantomTrades({ phantoms }) {
   if (!phantoms?.length) return null;
 
   return (
-    <Card title="Phantom Trades" className="opacity-70">
+    <Card title={`Phantom Trades (${phantoms.length})`}>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-xs text-[var(--muted)] border-b border-[var(--border)]">
               <th className="text-left py-2 pr-3">Time</th>
               <th className="text-left py-2 pr-3">Contract</th>
-              <th className="text-right py-2 pr-3">Entry</th>
+              <th className="text-left py-2 pr-3">Lane</th>
+              <th className="text-left py-2 pr-3">Trigger</th>
+              <th className="text-right py-2 pr-3">Entry SPX</th>
+              <th className="text-right py-2 pr-3">Exit SPX</th>
               <th className="text-right py-2 pr-3">P&L</th>
               <th className="text-left py-2">Status</th>
             </tr>
           </thead>
           <tbody>
-            {phantoms.map((p) => (
-              <tr key={p.id} className="border-b border-[var(--border)]/30">
-                <td className="py-2 pr-3 font-mono text-xs">{formatET(p.opened_at)}</td>
-                <td className="py-2 pr-3 font-mono text-xs">{p.contract}</td>
-                <td className="py-2 pr-3 text-right font-mono">{formatCurrency(p.entry_price)}</td>
-                <td className={`py-2 pr-3 text-right font-mono ${pnlColor(p.current_pnl_pct)}`}>
-                  {p.current_pnl_pct != null ? formatPct(p.current_pnl_pct) : '—'}
-                </td>
-                <td className="py-2 text-xs text-[var(--muted)]">{p.state}</td>
-              </tr>
-            ))}
+            {phantoms.map((p) => {
+              const spxChange = p.exit_spx && p.entry_spx
+                ? (p.direction === 'BULLISH' ? p.exit_spx - p.entry_spx : p.entry_spx - p.exit_spx)
+                : null;
+              const isOpen = !p.exit_reason;
+              const laneColor = p.strategy_lane === 'A' ? 'text-blue-400' : p.strategy_lane === 'B' ? 'text-purple-400' : 'text-[var(--muted)]';
+              const triggerLabel = p.entry_trigger ? p.entry_trigger.replace(/_/g, ' ') : '—';
+
+              return (
+                <tr key={p.id} className={cn(
+                  'border-b border-[var(--border)]/30',
+                  isOpen ? 'bg-yellow-500/5' : 'hover:bg-[var(--border)]/20'
+                )}>
+                  <td className="py-2 pr-3 font-mono text-xs">{formatET(p.opened_at)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{formatContract(p.contract)}</td>
+                  <td className={cn('py-2 pr-3 text-xs font-medium', laneColor)}>{p.strategy_lane || '—'}</td>
+                  <td className="py-2 pr-3 text-xs text-[var(--muted)]">{triggerLabel}</td>
+                  <td className="py-2 pr-3 text-right font-mono">{formatCurrency(p.entry_spx, 0)}</td>
+                  <td className="py-2 pr-3 text-right font-mono">{p.exit_spx ? formatCurrency(p.exit_spx, 0) : '—'}</td>
+                  <td className={cn('py-2 pr-3 text-right font-mono font-medium', pnlColor(spxChange))}>
+                    {spxChange != null ? `${spxChange > 0 ? '+' : ''}${spxChange.toFixed(1)} pts` : '—'}
+                  </td>
+                  <td className="py-2 text-xs">
+                    {isOpen ? (
+                      <span className="inline-flex items-center gap-1 text-yellow-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+                        {p.state || 'Open'}
+                      </span>
+                    ) : (
+                      <span className="text-[var(--muted)]">{p.exit_reason}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

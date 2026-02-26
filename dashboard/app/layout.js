@@ -14,7 +14,7 @@ const geistMono = localFont({
 });
 
 export const metadata = {
-  title: "OpenClaw Dashboard",
+  title: "GexClaw Dashboard",
   description: "SPX Options Trading Command Center",
 };
 

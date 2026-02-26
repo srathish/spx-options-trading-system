@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'openclaw',
+      name: 'gexclaw',
       script: 'src/index.js',
       cwd: __dirname,
       watch: false,
@@ -13,7 +13,7 @@ module.exports = {
       },
     },
     {
-      name: 'openclaw-dashboard',
+      name: 'gexclaw-dashboard',
       script: 'node_modules/.bin/next',
       args: 'start',
       cwd: __dirname + '/dashboard',

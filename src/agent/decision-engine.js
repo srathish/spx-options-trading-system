@@ -11,6 +11,7 @@ import { createLogger } from '../utils/logger.js';
 import { detectMidpointDanger, characterizeAirPocket } from '../gex/gex-scorer.js';
 import { detectVexConfluence } from '../gex/gex-parser.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
+import { detectAllPatterns } from '../gex/gex-patterns.js';
 import { isPowerHour, isOpexWeek, isOpexDay } from '../utils/market-hours.js';
 import { detectChopMode } from '../store/state.js';
 
@@ -175,6 +176,11 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
     input.gex.spx.vex_confluence = vexConfluenceResult.slice(0, 5);
   }
 
+  // Detect GEX patterns for Lane A (pattern-based entries)
+  const nodeTouches = getNodeTouches();
+  input.patterns_detected = detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches);
+  input.lane = 'A';
+
   // Add position context when in a trade
   const pos = getCurrentPosition();
   if (pos) {
@@ -228,10 +234,12 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
       skipped: true,
     });
 
-    return { changed: false, decision: lastDecision, skipped: true };
+    // Still detect patterns even when agent is skipped (Lane B needs them)
+    const skippedPatterns = detectAllPatterns(scored, parsedData, multiAnalysis, getNodeTouches());
+    return { changed: false, decision: lastDecision, skipped: true, patterns: skippedPatterns };
   }
 
-  // 4. Build agent input (now includes multi-ticker data)
+  // 4. Build agent input (now includes multi-ticker data + patterns)
   const input = buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalysis, trinityState);
 
   // 5. Call the agent
@@ -299,7 +307,7 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
     log.info(`Decision changed: ${previousAction} → ${agentResult.action} (${agentResult.confidence})`);
   }
 
-  return { changed, decision, skipped: false };
+  return { changed, decision, skipped: false, patterns: input.patterns_detected };
 }
 
 /**

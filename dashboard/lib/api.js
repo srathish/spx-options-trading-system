@@ -70,6 +70,13 @@ export function fetchTradeIdeas(date) {
   return fetchJson(`/api/trade-ideas${query}`);
 }
 
+// ---- Phantoms (all: open + closed) ----
+
+export function fetchAllPhantoms(date) {
+  const query = date ? `?date=${date}` : '';
+  return fetchJson(`/api/phantoms/today${query}`);
+}
+
 // ---- Alerts ----
 
 export function fetchAlerts(limit = 50) {

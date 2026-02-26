@@ -230,6 +230,11 @@ db.exec(`
   );
 `);
 
+// Migrations — add columns that may not exist in older databases
+try { db.exec('ALTER TABLE trades ADD COLUMN strategy_lane TEXT DEFAULT NULL'); } catch (_) {}
+try { db.exec('ALTER TABLE trades ADD COLUMN entry_trigger TEXT DEFAULT NULL'); } catch (_) {}
+try { db.exec('ALTER TABLE trades ADD COLUMN entry_context TEXT DEFAULT NULL'); } catch (_) {}
+
 log.info(`Database initialized at ${dbPath}`);
 
 // ---- Prepared statements ----
@@ -381,8 +386,9 @@ const selectRecentClosedTrades = db.prepare(`
 const insertTrade = db.prepare(`
   INSERT INTO trades (opened_at, contract, direction, strike, entry_price, entry_spx,
     target_price, stop_price, target_spx, stop_spx, greeks_at_entry, gex_state_at_entry,
-    tv_state_at_entry, agent_reasoning, is_phantom, state, last_update_at, strategy_version)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    tv_state_at_entry, agent_reasoning, is_phantom, state, last_update_at, strategy_version,
+    strategy_lane, entry_trigger, entry_context)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateTradeClose = db.prepare(`
@@ -598,6 +604,9 @@ export function openTrade(trade) {
     trade.state || 'PENDING',
     ts,
     trade.strategyVersion || 'v1',
+    trade.strategyLane || null,
+    trade.entryTrigger || null,
+    trade.entryContext ? JSON.stringify(trade.entryContext) : null,
   );
   return result.lastInsertRowid;
 }
@@ -801,6 +810,14 @@ export function getPhantomTradesByDate(dateStr) {
 
 export function getTradesByDate(dateStr) {
   return db.prepare("SELECT * FROM trades WHERE is_phantom = 0 AND opened_at LIKE ? || '%' ORDER BY id ASC").all(dateStr);
+}
+
+export function getTradesByLane(lane, dateStr) {
+  return db.prepare("SELECT * FROM trades WHERE strategy_lane = ? AND opened_at LIKE ? || '%' ORDER BY id ASC").all(lane, dateStr);
+}
+
+export function getTradesByTrigger(trigger, dateStr) {
+  return db.prepare("SELECT * FROM trades WHERE entry_trigger = ? AND opened_at LIKE ? || '%' ORDER BY id ASC").all(trigger, dateStr);
 }
 
 export function cleanupOldData(daysToKeep = 7) {

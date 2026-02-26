@@ -14,7 +14,7 @@ import { config } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
 import { getLoopStatus } from '../pipeline/loop-status.js';
 import { getSchedulePhase, nowET, formatET } from '../utils/market-hours.js';
-import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getTodaysDecisions, getCheckedPredictionsToday, getTodaysPredictions, getPredictionsByDate, getAllVersions, getRecentRollbacks, getLatestBriefing, getAlertsFeed } from '../store/db.js';
+import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getPhantomTradesByDate, getTodaysDecisions, getCheckedPredictionsToday, getTodaysPredictions, getPredictionsByDate, getAllVersions, getRecentRollbacks, getLatestBriefing, getAlertsFeed } from '../store/db.js';
 import { getPositionState, getCurrentPosition } from '../trades/trade-manager.js';
 import { getCurrentDecision } from '../agent/decision-engine.js';
 import { getSignalSnapshot, getDetailedState, updateSignal } from '../tv/tv-signal-store.js';
@@ -147,6 +147,19 @@ function createApi() {
     try {
       res.json(getOpenPhantoms());
     } catch (err) {
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // GET /api/phantoms/today — all phantoms (open + closed) for a date
+  app.get('/api/phantoms/today', (req, res) => {
+    try {
+      const date = req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+        ? req.query.date
+        : nowET().toISOString().slice(0, 10);
+      res.json(getPhantomTradesByDate(date));
+    } catch (err) {
+      log.error('GET /api/phantoms/today error:', err.message);
       res.status(500).json({ error: 'Internal error' });
     }
   });

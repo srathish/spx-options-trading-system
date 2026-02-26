@@ -13,7 +13,7 @@ import {
 
 const NAV = [
   { href: '/', label: 'Trading', icon: BoltIcon },
-  { href: '/ideas', label: 'Ideas', icon: LightBulbIcon },
+  { href: '/ideas', label: 'Phantoms', icon: LightBulbIcon },
   { href: '/performance', label: 'Performance', icon: ChartBarIcon },
   { href: '/strategy', label: 'Strategy', icon: AdjustmentsHorizontalIcon },
   { href: '/system', label: 'System', icon: CpuChipIcon },
@@ -24,7 +24,7 @@ export function Sidebar() {
 
   return (
     <nav className="w-16 bg-[var(--surface)] border-r border-[var(--border)] flex flex-col items-center py-4 gap-2 shrink-0">
-      <div className="text-lg font-bold text-green-400 mb-4">OC</div>
+      <div className="text-lg font-bold text-green-400 mb-4">GC</div>
       {NAV.map(({ href, label, icon: Icon }) => {
         const active = pathname === href;
         return (

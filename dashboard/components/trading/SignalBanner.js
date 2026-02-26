@@ -45,6 +45,14 @@ export function SignalBanner() {
         {pos?.contract && (
           <span className="font-mono text-sm opacity-80">{pos.contract}</span>
         )}
+        {pos?.strategyLane && posState !== 'FLAT' && (
+          <span className={cn('text-xs px-1.5 py-0.5 rounded font-medium',
+            pos.strategyLane === 'A' ? 'bg-blue-500/20 text-blue-300' : 'bg-purple-500/20 text-purple-300'
+          )}>Lane {pos.strategyLane}</span>
+        )}
+        {pos?.entryTrigger && posState !== 'FLAT' && (
+          <span className="text-xs opacity-60">{pos.entryTrigger.replace(/_/g, ' ')}</span>
+        )}
         {decision?.confidence && (
           <span className="text-xs opacity-60">Confidence: {decision.confidence}</span>
         )}

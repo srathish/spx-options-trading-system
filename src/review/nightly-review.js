@@ -12,7 +12,7 @@ import {
   getTradesByDateRange, getTradesForVersion,
   getRecentPhantomComparisons, getRecentClosedTrades,
   getDecisionsByDate, getGexSnapshotsByDate, getTvSignalLogByDate,
-  getAllVersions,
+  getAllVersions, getTradesByLane,
 } from '../store/db.js';
 import {
   getActiveConfig, getActiveVersionNumber, getVersionLabel,
@@ -23,12 +23,12 @@ const log = createLogger('Review');
 
 // ---- Review System Prompt ----
 
-const REVIEW_SYSTEM_PROMPT = `You are OpenClaw's self-improvement engine — an autonomous 0DTE SPX options trading system. You analyze daily trading performance data and recommend specific, data-backed strategy adjustments.
+const REVIEW_SYSTEM_PROMPT = `You are GexClaw's self-improvement engine — an autonomous 0DTE SPX options trading system. You analyze daily trading performance data and recommend specific, data-backed strategy adjustments.
 
 ## Your Role
 You receive a comprehensive data package each night containing:
 - 10-dimension trade analysis (GEX scores, alignment, TV signals, time-of-day, direction, exits, strikes, phantoms)
-- Enrichment data (blocked entries, GEX score distribution, TV signal transitions, previous review findings)
+- Enrichment data (blocked entries, GEX score distribution, TV signal transitions, previous review findings, lane comparison)
 - Current strategy config with 38+ tunable parameters
 
 ## Rules
@@ -63,6 +63,39 @@ You receive a comprehensive data package each night containing:
 - delta_sweet_spot_low, delta_sweet_spot_high: Target delta range for strike selection
 - min_rr_ratio: Minimum risk:reward ratio for entry
 - chop_lookback_cycles, chop_flip_threshold, chop_stddev_threshold: Chop detection tuning
+- pattern_min_wall_pct: Minimum wall size for pattern detection (% of largest wall)
+- pattern_king_node_max_touches: Max touches for fresh king node bounce
+- pattern_pika_max_dist_pct: Max distance to floor for pika pillow pattern
+- pattern_air_pocket_min_quality: Minimum air pocket quality (HIGH, MEDIUM, LOW)
+- pattern_range_fade_max_touches: Max gatekeeper touches for range edge fade
+- lane_b_min_tv_weight: Minimum TV weighted score for Lane B entry
+- lane_b_min_tv_indicators: Minimum TV indicators confirming direction for Lane B
+
+### Algorithmic Entry Engine
+- gex_only_min_score: Minimum GEX score for algorithmic pattern entry (Lane A)
+- alignment_override_gex_score: GEX score that overrides alignment requirement
+- power_hour_min_gex_score: Minimum GEX score for entries during power hour
+
+### Entry Quality Gates
+- entry_min_spacing_ms: Minimum milliseconds between ANY entries
+- entry_blackout_start, entry_blackout_end: No-entry blackout period (e.g., 09:30-09:33)
+- consecutive_loss_limit: Same-direction losses before cooldown triggers
+- consecutive_loss_cooldown_ms: Cooldown duration after loss streak
+
+### NODE_SUPPORT_BREAK Exit
+- node_break_buffer_pts: SPX points buffer before triggering node support break exit
+
+### MOMENTUM_TIMEOUT Exit (3 phases)
+- momentum_phase1_minutes, momentum_phase1_min_pts: Phase 1 stall detection (min progress after N minutes)
+- momentum_phase2_minutes, momentum_phase2_target_pct: Phase 2 (min % of target distance after N minutes)
+- momentum_phase3_minutes: Phase 3 (must be net positive after N minutes)
+
+### TV_COUNTER_FLIP Exit
+- tv_counter_flip_enabled: Whether Bravo+Tango counter-flip exit is active
+- tv_counter_flip_min_indicators: Min indicators flipping against position to trigger exit
+
+### Pattern-Specific
+- rug_pull_min_value, pika_pillow_min_value, king_node_min_value: Minimum GEX wall values for pattern detection
 
 ## Output Format
 Respond with ONLY valid JSON in this exact format:
@@ -86,7 +119,9 @@ Respond with ONLY valid JSON in this exact format:
     "blocked_entry_review": "Were blocked entries justified? Any good setups filtered out?",
     "exit_effectiveness": "Which exit triggers worked well, which need tuning?",
     "tv_signal_value": "How much value did TV signals add to entry/exit decisions?",
-    "time_patterns": "Any time-of-day patterns worth noting?"
+    "time_patterns": "Any time-of-day patterns worth noting?",
+    "lane_comparison": "Compare Lane A (GEX-only live) vs Lane B (GEX+TV phantom). Which produced better results? Should TV requirement be added or relaxed?",
+    "trigger_analysis": "Which GEX patterns (entry triggers) performed best? Any patterns to avoid?"
   },
   "narrative": {
     "today_story": "Natural language summary of the trading day — what happened, key moments, overall character of the day",
@@ -268,6 +303,8 @@ export function buildReviewInput() {
         changes: safeParseJson(previousReview.changes_json),
         analysis: safeParseJson(previousReview.analysis_json)?.analysis_summary,
       } : null,
+      lane_comparison: buildLaneComparison(todayStr),
+      trigger_effectiveness: buildTriggerEffectiveness(todayStr),
     },
   };
 }
@@ -528,6 +565,71 @@ function summarizeBlockReasons(blocked) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5)
     .map(([reason, count]) => ({ reason, count }));
+}
+
+function buildLaneComparison(dateStr) {
+  const laneATrades = getTradesByLane('A', dateStr);
+  const laneBTrades = getTradesByLane('B', dateStr);
+
+  function countTriggers(trades) {
+    const triggers = {};
+    for (const t of trades) {
+      const trigger = t.entry_trigger || 'unknown';
+      triggers[trigger] = (triggers[trigger] || 0) + 1;
+    }
+    return triggers;
+  }
+
+  function laneMetrics(trades) {
+    const closed = trades.filter(t => t.closed_at);
+    return {
+      count: trades.length,
+      closed: closed.length,
+      wins: closed.filter(t => (t.pnl_dollars || 0) > 0).length,
+      losses: closed.filter(t => (t.pnl_dollars || 0) <= 0).length,
+      total_pnl: Math.round(closed.reduce((s, t) => s + (t.pnl_dollars || 0), 0) * 100) / 100,
+      triggers: countTriggers(trades),
+    };
+  }
+
+  return {
+    lane_a: laneMetrics(laneATrades),
+    lane_b: laneMetrics(laneBTrades),
+  };
+}
+
+/**
+ * Build trigger effectiveness: win rate by entry_trigger pattern.
+ * Combines both lanes for overall trigger performance.
+ */
+function buildTriggerEffectiveness(dateStr) {
+  const laneATrades = getTradesByLane('A', dateStr);
+  const laneBTrades = getTradesByLane('B', dateStr);
+  const allTrades = [...laneATrades, ...laneBTrades];
+
+  const triggers = {};
+  for (const t of allTrades) {
+    const trigger = t.entry_trigger || 'unknown';
+    if (!triggers[trigger]) {
+      triggers[trigger] = { total: 0, closed: 0, wins: 0, losses: 0, total_pnl: 0 };
+    }
+    triggers[trigger].total++;
+    if (t.closed_at) {
+      triggers[trigger].closed++;
+      const pnl = t.pnl_dollars || 0;
+      triggers[trigger].total_pnl = Math.round((triggers[trigger].total_pnl + pnl) * 100) / 100;
+      if (pnl > 0) triggers[trigger].wins++;
+      else triggers[trigger].losses++;
+    }
+  }
+
+  // Convert to array with win rate
+  return Object.entries(triggers).map(([trigger, stats]) => ({
+    trigger,
+    ...stats,
+    win_rate: stats.closed > 0 ? Math.round((stats.wins / stats.closed) * 1000) / 10 : null,
+    avg_pnl: stats.closed > 0 ? Math.round((stats.total_pnl / stats.closed) * 100) / 100 : null,
+  })).sort((a, b) => (b.closed || 0) - (a.closed || 0));
 }
 
 // ---- Validation ----

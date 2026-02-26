@@ -72,9 +72,66 @@ const V1_BASELINE = {
   delta_sweet_spot_high: 0.55,
 
   // Self-improvement settings
-  learning_period_days: 5,
+  learning_period_days: 0,
   min_trades_for_adjustment: 5,
   max_adjustments_per_review: 3,
+
+  // GEX Pattern thresholds
+  pattern_min_wall_pct: 0.15,
+  pattern_rug_max_gap_strikes: 2,
+  pattern_king_node_max_touches: 1,
+  pattern_pika_max_dist_pct: 0.30,
+  pattern_air_pocket_min_quality: 'HIGH',
+  pattern_range_fade_max_touches: 1,
+  pattern_triple_min_walls: 3,
+
+  // Dual-lane config
+  lane_a_enabled: true,
+  lane_b_enabled: true,
+  lane_b_min_tv_weight: 0.5,
+  lane_b_min_tv_indicators: 1,
+
+  // Algorithmic entry engine
+  gex_only_min_score: 50,
+  alignment_override_gex_score: 85,
+  power_hour_min_gex_score: 80,
+
+  // Entry quality gates
+  entry_min_spacing_ms: 60_000,
+  entry_blackout_start: '09:30',
+  entry_blackout_end: '09:33',
+  consecutive_loss_limit: 2,
+  consecutive_loss_cooldown_ms: 15 * 60_000,
+
+  // NODE_SUPPORT_BREAK exit
+  node_break_buffer_pts: 2,
+
+  // MOMENTUM_TIMEOUT exit (3 phases)
+  momentum_min_hold_minutes: 3,
+  momentum_phase1_minutes: 5,
+  momentum_phase1_min_pts: 2,
+  momentum_phase2_minutes: 10,
+  momentum_phase2_target_pct: 0.40,
+  momentum_phase3_minutes: 15,
+
+  // TV_COUNTER_FLIP exit
+  tv_counter_flip_enabled: true,
+  tv_counter_flip_min_indicators: 2,
+
+  // Pattern trigger weights (for ranking when multiple patterns fire)
+  trigger_weight_rug_pull: 1.2,
+  trigger_weight_reverse_rug: 1.1,
+  trigger_weight_king_node_bounce: 1.0,
+  trigger_weight_pika_pillow: 1.0,
+  trigger_weight_triple_ceiling: 0.9,
+  trigger_weight_triple_floor: 0.9,
+  trigger_weight_air_pocket: 1.1,
+  trigger_weight_range_edge_fade: 0.8,
+
+  // Pattern-specific minimum wall values
+  rug_pull_min_value: 3_000_000,
+  pika_pillow_min_value: 5_000_000,
+  king_node_min_value: 3_000_000,
 };
 
 // ---- In-memory cache ----
@@ -249,7 +306,7 @@ export function isLearningPeriod() {
 
   const createdAt = new Date(v1.created_at);
   const daysSinceCreation = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
-  const learningDays = activeConfig?.learning_period_days || 7;
+  const learningDays = activeConfig?.learning_period_days ?? 7;
 
   return daysSinceCreation < learningDays;
 }

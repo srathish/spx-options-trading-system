@@ -28,6 +28,9 @@ let lastUpdateSentAt = 0;
 export function initTradeManager() {
   const open = getOpenTrade();
   if (open) {
+    let entryCtx = null;
+    try { entryCtx = open.entry_context ? JSON.parse(open.entry_context) : null; } catch { /* ignore */ }
+
     currentPosition = {
       id: open.id,
       contract: open.contract,
@@ -43,6 +46,8 @@ export function initTradeManager() {
       state: open.state,
       openedAt: open.opened_at,
       currentPnlPct: open.current_pnl_pct || 0,
+      bestSpxChange: 0,
+      entryContext: entryCtx,
     };
     log.info(`Resumed position: ${currentPosition.contract} (${currentPosition.state})`);
   } else {
@@ -72,6 +77,7 @@ export function enterPosition({
   contract, direction, strike, entryPrice, entrySpx,
   targetPrice, stopPrice, targetSpx, stopSpx,
   greeks, gexState, tvState, agentReasoning,
+  strategyLane, entryTrigger, entryContext,
 }) {
   if (currentPosition) {
     log.warn('Already in a position — cannot enter another');
@@ -85,6 +91,9 @@ export function enterPosition({
     isPhantom: false,
     state: 'PENDING',
     strategyVersion: getVersionLabel(),
+    strategyLane: strategyLane || null,
+    entryTrigger: entryTrigger || null,
+    entryContext: entryContext || null,
   });
 
   currentPosition = {
@@ -94,6 +103,7 @@ export function enterPosition({
     openedAt: new Date().toISOString(),
     currentPnlPct: 0,
     bestSpxChange: 0,
+    entryContext: entryContext || null,
   };
 
   lastUpdateSentAt = Date.now();
@@ -157,6 +167,27 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
+  // 3a2. NODE_SUPPORT_BREAK — price broke past the structural node that defined the trade thesis
+  if (currentPosition.entryContext) {
+    const ctx = currentPosition.entryContext;
+    const buffer = cfg.node_break_buffer_pts ?? 2;
+
+    if (isBullish && ctx.support_node?.strike) {
+      if (currentSpot < ctx.support_node.strike - buffer) {
+        result.exitTriggered = true;
+        result.exitReason = 'NODE_SUPPORT_BREAK';
+        return result;
+      }
+    }
+    if (!isBullish && ctx.ceiling_node?.strike) {
+      if (currentSpot > ctx.ceiling_node.strike + buffer) {
+        result.exitTriggered = true;
+        result.exitReason = 'NODE_SUPPORT_BREAK';
+        return result;
+      }
+    }
+  }
+
   // 3b. Stop hit — SPX broke through stop level
   if (currentPosition.stopSpx) {
     const stopHit = isBullish
@@ -195,6 +226,31 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   const holdTimeMs = now - new Date(currentPosition.openedAt).getTime();
   const holdTooShort = holdTimeMs < MIN_HOLD_BEFORE_SOFT_EXIT_MS;
 
+  // 3d2. TV_COUNTER_FLIP — both Bravo AND Tango 3m flipped against position
+  if (cfg.tv_counter_flip_enabled !== false && !holdTooShort && context.tvSnapshot) {
+    const signals = context.tvSnapshot.spx?.signals || {};
+    const bravo3 = signals['bravo_3m'];
+    const tango3 = signals['tango_3m'];
+
+    const bravoAgainst = bravo3 && !bravo3.isStale && (
+      (isBullish && bravo3.classification === 'BEARISH') ||
+      (!isBullish && bravo3.classification === 'BULLISH')
+    );
+    const tangoAgainst = tango3 && !tango3.isStale && (
+      (isBullish && tango3.classification === 'BEARISH') ||
+      (!isBullish && tango3.classification === 'BULLISH')
+    );
+
+    const minIndicators = cfg.tv_counter_flip_min_indicators ?? 2;
+    const counterCount = (bravoAgainst ? 1 : 0) + (tangoAgainst ? 1 : 0);
+
+    if (counterCount >= minIndicators) {
+      result.exitTriggered = true;
+      result.exitReason = 'TV_COUNTER_FLIP';
+      return result;
+    }
+  }
+
   // 3e. Opposing wall — large positive wall materialized against our position
   const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
   if (!holdTooShort && scored) {
@@ -203,6 +259,44 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     if (bigOpposing) {
       result.exitTriggered = true;
       result.exitReason = 'OPPOSING_WALL';
+      return result;
+    }
+  }
+
+  // 3e2. MOMENTUM_TIMEOUT — 3 progressive phases of stall detection
+  if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
+    const holdMinutes = holdTimeMs / 60_000;
+    const spxProgress = isBullish
+      ? currentSpot - currentPosition.entrySpx
+      : currentPosition.entrySpx - currentSpot;
+
+    const phase1Min = cfg.momentum_phase1_minutes ?? 5;
+    const phase1Pts = cfg.momentum_phase1_min_pts ?? 2;
+    const phase2Min = cfg.momentum_phase2_minutes ?? 10;
+    const phase2Pct = cfg.momentum_phase2_target_pct ?? 0.40;
+    const phase3Min = cfg.momentum_phase3_minutes ?? 15;
+
+    // Phase 1: After 5 min, must have moved +2 pts
+    if (holdMinutes >= phase1Min && spxProgress < phase1Pts) {
+      result.exitTriggered = true;
+      result.exitReason = 'MOMENTUM_TIMEOUT';
+      return result;
+    }
+
+    // Phase 2: After 10 min, must be 40% of the way to target
+    if (holdMinutes >= phase2Min && currentPosition.targetSpx) {
+      const totalTarget = Math.abs(currentPosition.targetSpx - currentPosition.entrySpx);
+      if (totalTarget > 0 && spxProgress < totalTarget * phase2Pct) {
+        result.exitTriggered = true;
+        result.exitReason = 'MOMENTUM_TIMEOUT';
+        return result;
+      }
+    }
+
+    // Phase 3: After 15 min, must be net positive
+    if (holdMinutes >= phase3Min && spxProgress <= 0) {
+      result.exitTriggered = true;
+      result.exitReason = 'MOMENTUM_TIMEOUT';
       return result;
     }
   }
@@ -335,10 +429,12 @@ export function exitPosition(exitReason, exitSpx) {
     pnlPct: Math.round(pnlPct * 10) / 10,
     exitReason,
     isWin: spxChange > 0,
+    strategyLane: currentPosition.strategyLane || null,
+    entryTrigger: currentPosition.entryTrigger || null,
   };
 
   log.info(
-    `Closed: ${currentPosition.contract} | ${exitReason} | ` +
+    `Closed: ${currentPosition.contract} [Lane ${currentPosition.strategyLane || '?'}] | ${exitReason} | ` +
     `SPX ${currentPosition.entrySpx} → ${exitSpx} (${spxChange > 0 ? '+' : ''}${result.spxChange} pts) | ${result.isWin ? 'WIN' : 'LOSS'}`
   );
 

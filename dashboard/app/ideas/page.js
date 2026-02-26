@@ -1,9 +1,9 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { fetchTradeIdeas } from '../../lib/api';
-import { TradeIdeasFeed } from '../../components/ideas/TradeIdeasFeed';
-import { TradeIdeasTable } from '../../components/ideas/TradeIdeasTable';
+import { fetchAllPhantoms } from '../../lib/api';
+import { PhantomAlertsFeed } from '../../components/ideas/PhantomAlertsFeed';
+import { PhantomAlertsTable } from '../../components/ideas/PhantomAlertsTable';
 import { Card } from '../../components/ui/Card';
 import { cn } from '../../lib/utils';
 
@@ -18,7 +18,7 @@ function formatDateLabel(dateStr) {
 }
 
 export default function IdeasPage() {
-  const [ideas, setIdeas] = useState([]);
+  const [phantoms, setPhantoms] = useState([]);
   const [view, setView] = useState('feed');
   const [date, setDate] = useState(todayET());
   const [loading, setLoading] = useState(true);
@@ -29,8 +29,8 @@ export default function IdeasPage() {
 
     function load() {
       const dateParam = date === todayET() ? undefined : date;
-      fetchTradeIdeas(dateParam)
-        .then(data => { if (active) { setIdeas(data); setLoading(false); } })
+      fetchAllPhantoms(dateParam)
+        .then(data => { if (active) { setPhantoms(data); setLoading(false); } })
         .catch(() => { if (active) setLoading(false); });
     }
 
@@ -42,7 +42,7 @@ export default function IdeasPage() {
 
   return (
     <div className="space-y-4">
-      <Card title="Trade Ideas">
+      <Card title="Phantom Alerts">
         {/* Controls: view toggle + date picker */}
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
@@ -109,9 +109,9 @@ export default function IdeasPage() {
         {loading ? (
           <div className="text-center py-8 text-[var(--muted)] text-sm">Loading...</div>
         ) : view === 'feed' ? (
-          <TradeIdeasFeed ideas={ideas} />
+          <PhantomAlertsFeed phantoms={phantoms} />
         ) : (
-          <TradeIdeasTable ideas={ideas} />
+          <PhantomAlertsTable phantoms={phantoms} />
         )}
       </Card>
     </div>

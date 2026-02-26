@@ -1,5 +1,5 @@
 /**
- * Discord Webhook Integration for OpenClaw SPX GEX Scanner.
+ * Discord Webhook Integration for GexClaw SPX GEX Scanner.
  * Sends formatted embeds and text alerts to Discord.
  */
 
@@ -180,7 +180,7 @@ export async function sendSpxAnalysis(result) {
         inline: false,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -223,7 +223,7 @@ export async function sendOpeningSummary(result) {
         inline: false,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -257,7 +257,7 @@ export async function sendLiveAlert(alertType, details) {
     title: `${emojiMap[alertType] || '\uD83D\uDD14'} SPX GEX ALERT — ${alertType.replace(/_/g, ' ')}`,
     description: details,
     color: colorMap[alertType] || COLORS.SYSTEM,
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -300,7 +300,7 @@ export async function sendEodRecap(predictions) {
     title: '\uD83D\uDCCA SPX GEX — END OF DAY RECAP',
     description: recapStr,
     color: COLORS.INFO,
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -422,7 +422,7 @@ export async function sendCombinedSignalAlert(decision) {
     color,
     fields: [],
     footer: {
-      text: `OpenClaw | Agent: ${decision.responseTimeMs || decision.response_time_ms || '--'}ms | Tokens: ${decision.inputTokens || decision.input_tokens || '--'} in / ${decision.outputTokens || decision.output_tokens || '--'} out`,
+      text: `GexClaw | Agent: ${decision.responseTimeMs || decision.response_time_ms || '--'}ms | Tokens: ${decision.inputTokens || decision.input_tokens || '--'} in / ${decision.outputTokens || decision.output_tokens || '--'} out`,
     },
     timestamp: new Date().toISOString(),
   };
@@ -490,7 +490,7 @@ export async function sendCombinedSignalAlert(decision) {
  * Send system health heartbeat.
  */
 export async function sendHealthHeartbeat(status) {
-  const msg = `\u2764\uFE0F **OpenClaw** | ${status.phase} | Cycles: ${status.cycleCount} | Last: ${status.lastScore || '--'}/100 ${status.lastDirection || '--'} | Spot: $${status.lastSpot?.toFixed(2) || '--'}`;
+  const msg = `\u2764\uFE0F **GexClaw** | ${status.phase} | Cycles: ${status.cycleCount} | Last: ${status.lastScore || '--'}/100 ${status.lastDirection || '--'} | Spot: $${status.lastSpot?.toFixed(2) || '--'}`;
   await sendWebhook(msg);
   log.debug('Health heartbeat sent');
 }
@@ -507,13 +507,17 @@ export async function sendTradeCard(trade) {
   const typeLabel = isCalls ? 'CALLS' : 'PUTS';
   const now = formatET(nowET());
 
+  // Lane tag: [GEX-ONLY] for Lane A, [GEX+TV PHANTOM] for Lane B
+  const laneTag = trade.strategyLane === 'B' ? '[GEX+TV]' : '[GEX-ONLY]';
+  const triggerTag = trade.entryTrigger ? ` | ${trade.entryTrigger.replace(/_/g, ' ')}` : '';
+
   const embed = {
-    title: `${isCalls ? '\uD83D\uDFE2' : '\uD83D\uDD34'} ENTER ${typeLabel} \u2014 Trade Card`,
+    title: `${isCalls ? '\uD83D\uDFE2' : '\uD83D\uDD34'} ENTER ${typeLabel} ${laneTag}${triggerTag}`,
     color,
     fields: [
       {
         name: 'Trade',
-        value: `**SPX ${typeLabel} ${trade.strike}**`,
+        value: `**SPX ${typeLabel} ${trade.strike}** | Lane ${trade.strategyLane || '?'}`,
         inline: false,
       },
       {
@@ -532,13 +536,21 @@ export async function sendTradeCard(trade) {
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw v3.0 | ${now} ET` },
+    footer: { text: `GexClaw v3.0 | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
+  if (trade.entryTrigger) {
+    embed.fields.push({
+      name: 'Entry Trigger',
+      value: trade.entryTrigger.replace(/_/g, ' '),
+      inline: true,
+    });
+  }
+
   if (trade.agentReasoning) {
     embed.fields.push({
-      name: 'Agent Reasoning',
+      name: 'Reasoning',
       value: trade.agentReasoning.slice(0, 200),
       inline: false,
     });
@@ -574,7 +586,7 @@ export async function sendPositionUpdate(update) {
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -593,10 +605,13 @@ export async function sendTradeClosed(result) {
 
   const exitReasonLabels = {
     TARGET_HIT: 'Target Hit',
+    NODE_SUPPORT_BREAK: 'Node Support Break',
     STOP_HIT: 'Stop Hit',
     PROFIT_TARGET: 'Profit Target',
+    TV_COUNTER_FLIP: 'TV Counter Flip',
     STOP_LOSS: 'Stop Loss',
     OPPOSING_WALL: 'Opposing Wall',
+    MOMENTUM_TIMEOUT: 'Momentum Timeout',
     TV_FLIP: 'TV Signal Flip',
     MAP_RESHUFFLE: 'Map Reshuffle',
     TRAILING_STOP: 'Trailing Stop',
@@ -605,13 +620,16 @@ export async function sendTradeClosed(result) {
     GEX_FLIP: 'GEX Direction Flip',
   };
 
+  const laneLabel = result.strategyLane ? ` | Lane ${result.strategyLane}` : '';
+  const triggerLabel = result.entryTrigger ? ` | ${result.entryTrigger.replace(/_/g, ' ')}` : '';
+
   const embed = {
     title: `${isWin ? '\uD83C\uDFC6' : '\uD83D\uDCB8'} TRADE CLOSED \u2014 ${isWin ? 'WIN' : 'LOSS'}`,
     color,
     fields: [
       {
         name: 'Contract',
-        value: `\`${result.contract}\` | ${result.direction}`,
+        value: `\`${result.contract}\` | ${result.direction}${laneLabel}${triggerLabel}`,
         inline: false,
       },
       {
@@ -630,7 +648,7 @@ export async function sendTradeClosed(result) {
         inline: false,
       },
     ],
-    footer: { text: `OpenClaw v3.0 | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw v3.0 | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -661,7 +679,7 @@ export async function sendStrategyChange(reviewResult) {
         inline: false,
       },
     ],
-    footer: { text: `OpenClaw | v${reviewResult.previousVersion} → v${reviewResult.newVersion} | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | v${reviewResult.previousVersion} → v${reviewResult.newVersion} | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -698,7 +716,7 @@ export async function sendStrategyRollback(rollback) {
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -716,7 +734,7 @@ export async function sendNoChange(reviewResult) {
     description: reviewResult.analysis?.analysis_summary || reviewResult.reason || 'Strategy performing within expectations.',
     color: 0x6B7280, // gray
     fields: [],
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -746,7 +764,7 @@ export async function sendMapReshuffleAlert(reshuffle) {
       value: 'Previous wall analysis invalidated. Wait for new map to stabilize.',
       inline: false,
     }],
-    footer: { text: `OpenClaw | ${formatET(nowET())} ET` },
+    footer: { text: `GexClaw | ${formatET(nowET())} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -865,7 +883,7 @@ export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog,
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -929,7 +947,7 @@ export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog,
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -956,7 +974,7 @@ export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog,
     title: '\uD83D\uDCDD TRADE LOG',
     description: `\`\`\`\n${tradeLogStr}\`\`\``,
     color: closedTrades.length > 0 ? (totalPnlPts >= 0 ? COLORS.BULLISH : COLORS.BEARISH) : COLORS.SYSTEM,
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1005,7 +1023,7 @@ export async function sendEodSummary({ trades, phantoms, decisions, tvSignalLog,
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1066,7 +1084,7 @@ export async function sendReviewReport(reviewResult) {
         inline: true,
       },
     ],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1111,7 +1129,7 @@ export async function sendReviewReport(reviewResult) {
     title: '\uD83D\uDD0D Pattern Analysis',
     color: COLORS.INFO,
     fields: patternFields.length > 0 ? patternFields : [{ name: 'Analysis', value: 'No patterns detected yet — need more data.', inline: false }],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1139,7 +1157,7 @@ export async function sendReviewReport(reviewResult) {
     description: truncate(changesDescription, 2048),
     color: hasChanges ? 0x7C3AED : COLORS.SYSTEM, // purple if changes, gray if not
     fields: [],
-    footer: { text: `OpenClaw | ${now} ET` },
+    footer: { text: `GexClaw | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1181,7 +1199,7 @@ export async function sendReviewReport(reviewResult) {
     title: '\uD83D\uDCDD Narrative & Memory',
     color: 0x1E3A5F, // dark blue
     fields: narrativeFields.length > 0 ? narrativeFields : [{ name: 'Narrative', value: 'Building narrative — more data needed.', inline: false }],
-    footer: { text: `OpenClaw | ${reviewType} Review | ${now} ET` },
+    footer: { text: `GexClaw | ${reviewType} Review | ${now} ET` },
     timestamp: new Date().toISOString(),
   };
 
@@ -1207,14 +1225,14 @@ function truncate(text, maxLen = 1024) {
  */
 export async function sendTest() {
   const embed = {
-    title: '\uD83D\uDD27 OpenClaw Test Message',
+    title: '\uD83D\uDD27 GexClaw Test Message',
     description: 'If you see this, the Discord webhook is working correctly.',
     color: COLORS.SYSTEM,
     fields: [
       { name: 'Status', value: 'Connected', inline: true },
       { name: 'Time', value: formatET(nowET()) + ' ET', inline: true },
     ],
-    footer: { text: 'OpenClaw SPX Trading System' },
+    footer: { text: 'GexClaw SPX Trading System' },
     timestamp: new Date().toISOString(),
   };
 

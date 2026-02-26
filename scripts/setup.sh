@@ -1,8 +1,8 @@
 #!/bin/bash
-# OpenClaw Setup Script
+# GexClaw Setup Script
 set -e
 
-echo "Setting up OpenClaw SPX Trading System..."
+echo "Setting up GexClaw SPX Trading System..."
 
 # Check Node.js
 if ! command -v node &> /dev/null; then

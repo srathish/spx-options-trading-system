@@ -1,7 +1,6 @@
 'use client';
 
-import { formatCurrency, formatPct, pnlColor } from '../../lib/utils';
-import { Card } from '../ui/Card';
+import { formatCurrency, pnlColor } from '../../lib/utils';
 
 function StatCard({ label, value, className }) {
   return (
@@ -12,26 +11,39 @@ function StatCard({ label, value, className }) {
   );
 }
 
-export function TodaySummary({ performance }) {
-  if (!performance) return null;
+export function TodaySummary({ trades }) {
+  if (!trades?.length) return null;
+
+  const closedTrades = trades.filter(t => t.exit_reason);
+  const wins = closedTrades.filter(t => {
+    const spxChange = t.exit_spx && t.entry_spx
+      ? (t.direction === 'BULLISH' ? t.exit_spx - t.entry_spx : t.entry_spx - t.exit_spx)
+      : 0;
+    return spxChange > 0;
+  });
+  const losses = closedTrades.length - wins.length;
+  const totalPnl = closedTrades.reduce((s, t) => s + (t.pnl_dollars || 0), 0);
+  const winRate = closedTrades.length > 0 ? (wins.length / closedTrades.length * 100).toFixed(1) : 0;
+  const openCount = trades.length - closedTrades.length;
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-      <StatCard label="Trades" value={performance.trades || 0} />
-      <StatCard label="W / L" value={`${performance.wins || 0} / ${performance.losses || 0}`} />
+      <StatCard label="Trades" value={`${closedTrades.length}${openCount > 0 ? ` (+${openCount} open)` : ''}`} />
+      <StatCard label="W / L" value={`${wins.length} / ${losses}`} />
       <StatCard
         label="Win Rate"
-        value={performance.trades > 0 ? `${performance.winRate}%` : '—'}
-        className={Number(performance.winRate) >= 50 ? 'text-green-400' : 'text-red-400'}
+        value={closedTrades.length > 0 ? `${winRate}%` : '—'}
+        className={Number(winRate) >= 50 ? 'text-green-400' : 'text-red-400'}
       />
       <StatCard
         label="P&L"
-        value={formatCurrency(performance.totalPnl)}
-        className={pnlColor(performance.totalPnl)}
+        value={formatCurrency(totalPnl)}
+        className={pnlColor(totalPnl)}
       />
       <StatCard
-        label="Predictions"
-        value={`${performance.predictions?.correct || 0}/${performance.predictions?.total || 0}`}
+        label="Avg P&L"
+        value={closedTrades.length > 0 ? formatCurrency(totalPnl / closedTrades.length) : '—'}
+        className={pnlColor(totalPnl)}
       />
     </div>
   );

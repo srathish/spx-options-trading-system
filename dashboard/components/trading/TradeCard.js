@@ -108,11 +108,23 @@ export function TradeCard() {
     return (
       <Card title="Active Position">
         <div className="space-y-3">
-          {/* Contract + state */}
+          {/* Contract + state + lane/trigger */}
           <div className="flex items-center justify-between">
-            <span className="font-medium text-sm">{formatContract(pos.contract)}</span>
+            <div className="flex items-center gap-2">
+              <span className="font-medium text-sm">{formatContract(pos.contract)}</span>
+              {pos.strategyLane && (
+                <span className={cn('text-xs font-medium px-1.5 py-0.5 rounded',
+                  pos.strategyLane === 'A' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'
+                )}>Lane {pos.strategyLane}</span>
+              )}
+            </div>
             <Badge label={posState} />
           </div>
+          {pos.entryTrigger && (
+            <div className="text-xs text-[var(--muted)]">
+              Trigger: {pos.entryTrigger.replace(/_/g, ' ')}
+            </div>
+          )}
 
           {/* P&L in SPX points */}
           <div className="flex items-center gap-4">

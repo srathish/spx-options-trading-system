@@ -28,7 +28,7 @@ export function Header({ chatOpen, onChatToggle }) {
 
   return (
     <header className="h-12 bg-[var(--surface)] border-b border-[var(--border)] flex items-center px-4 gap-6 shrink-0">
-      <span className="text-sm font-medium text-[var(--foreground)]">OpenClaw</span>
+      <span className="text-sm font-medium text-[var(--foreground)]">GexClaw</span>
 
       <div className="flex items-center gap-2 text-sm">
         <span className="text-[var(--muted)]">SPX</span>
