@@ -414,7 +414,7 @@ const selectOpenPhantoms = db.prepare(`
 `);
 
 const selectTodaysTrades = db.prepare(`
-  SELECT * FROM trades WHERE opened_at LIKE ? || '%' ORDER BY id DESC
+  SELECT * FROM trades WHERE is_phantom = 0 AND opened_at LIKE ? || '%' ORDER BY id DESC
 `);
 
 const selectTradeById = db.prepare(`

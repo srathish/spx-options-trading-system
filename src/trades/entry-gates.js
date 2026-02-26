@@ -28,8 +28,10 @@ let consecutiveLossCooldownUntil = { BULLISH: 0, BEARISH: 0 };
  * @param {string} action - 'ENTER_CALLS' or 'ENTER_PUTS'
  * @param {object} scored - Scored GEX state
  * @param {object} multiAnalysis - Multi-ticker analysis
+ * @param {object} [opts] - Options
+ * @param {string} [opts.lane] - 'A' or 'B' — Lane A skips TV regime gate
  */
-export function checkEntryGates(action, scored, multiAnalysis) {
+export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const direction = action === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
   const cfg = getActiveConfig() || {};
   const etNow = nowET();
@@ -57,7 +59,8 @@ export function checkEntryGates(action, scored, multiAnalysis) {
   }
 
   // Gate 4: TV Regime gate (Pink Diamond = no calls, Blue Diamond = no puts)
-  const tvRegime = getTvRegime();
+  // Lane A is GEX-only — skip TV regime check
+  const tvRegime = opts.lane === 'A' ? { direction: null } : getTvRegime();
   if (tvRegime.direction) {
     if (direction === 'BULLISH' && tvRegime.direction === 'BEARISH') {
       const ageMin = tvRegime.setAt ? Math.round((Date.now() - tvRegime.setAt) / 60000) : '?';

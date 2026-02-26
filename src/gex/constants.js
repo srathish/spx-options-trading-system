@@ -31,14 +31,14 @@ export const NEUTRAL_THRESHOLD = 35;
 
 // Momentum scoring — price trend over recent reads
 export const MOMENTUM = {
-  LOOKBACK: 10,              // number of spot reads to track (~5 min at 30s cycles)
+  LOOKBACK: 60,              // number of spot reads to track (~5 min at 5s cycles)
   STRONG_MOVE_PTS: 15,       // $15+ move in lookback window = strong momentum
   MODERATE_MOVE_PTS: 8,      // $8+ move = moderate momentum
   STRONG_BONUS: 25,          // +25 to aligned direction for strong momentum
   MODERATE_BONUS: 15,        // +15 for moderate momentum
   CONTRARY_PENALTY: -20,     // -20 from the direction fighting momentum
   // Drift detection — catches slow grinds that evade the 5-min window
-  DRIFT_LOOKBACK: 30,        // 30 reads ≈ 15 min at 30s cycles
+  DRIFT_LOOKBACK: 180,       // 180 reads ≈ 15 min at 5s cycles
   DRIFT_MODERATE_PTS: 6,     // $6+ cumulative drift = MODERATE momentum
   DRIFT_STRONG_PTS: 12,      // $12+ cumulative drift = STRONG momentum
 };
@@ -55,7 +55,7 @@ export const HEALTH_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 
 // Multi-ticker analysis thresholds
 export const MULTI_TICKER = {
-  STAGGER_MS: 100,              // ms between API requests
+  STAGGER_MS: 50,               // ms between API requests
   KING_NODE_PROXIMITY_PCT: 0.3, // within 0.3% of spot = "at king node"
   STACKED_MIN_STRIKES: 3,       // min consecutive same-sign strikes for "stacked"
   STACKED_MIN_VALUE: 0.05,      // each strike must be ≥5% of largest wall

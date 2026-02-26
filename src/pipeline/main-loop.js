@@ -391,59 +391,50 @@ async function runCycle(phase) {
       }
     }
 
-    // ---- PHASE 2: DECISION ENGINE (GEX + TV → Agent) ----
+    // ---- PHASE 2: PATTERN DETECTION + DECISION ENGINE ----
     let agentAction = null;
     let detectedPatterns = [];
     let agentEntryTrigger = null;
-    try {
-      const decisionResult = await runDecisionCycle(scored, parsed, wallTrends, multiAnalysis, trinityState);
-      detectedPatterns = decisionResult?.patterns || [];
 
-      // Emit patterns to dashboard
+    // Always detect patterns (fast, algorithmic — <1ms)
+    try {
+      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches());
       if (detectedPatterns.length > 0) {
         log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
         try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}
       }
+    } catch (patternErr) {
+      log.error('Pattern detection error:', patternErr.message);
+    }
 
-      if (decisionResult && decisionResult.changed && !decisionResult.skipped) {
-        // Action or confidence changed — send combined signal alert
-        const decision = decisionResult.decision;
-        decision.spotPrice = parsed.spotPrice; // inject for Discord formatting
-        await sendCombinedSignalAlert(decision);
-        try {
-          const alertData = { type: 'SIGNAL', message: `${decision.action.replace(/_/g, ' ')} — ${decision.confidence} confidence`, details: { action: decision.action, confidence: decision.confidence, reason: decision.reason, spotPrice: parsed.spotPrice, score: scored.score, direction: scored.direction } };
-          dashboardEmitter.emit('alert', alertData);
-          saveAlert('SIGNAL', alertData);
-        } catch (_) {}
-        agentAction = decision.action;
-        agentEntryTrigger = decision.entry_trigger || null;
-
-        // Save prediction for ENTER signals so trade ideas appear in dashboard Ideas tab
-        if (decision.action?.startsWith('ENTER')) {
-          savePrediction(
-            scored.direction, scored.score, parsed.spotPrice,
-            scored.targetWall?.strike || decision.target_wall?.strike || null,
-            scored.floorWall?.strike || decision.stop_level?.strike || null,
-          );
-        }
-
-        const isAdvisory = decision.action?.startsWith('ENTER');
-        log.info(`Decision: ${decision.action} (${decision.confidence})${isAdvisory ? ' [advisory — entries are algorithmic]' : ''} — alert sent`);
-      } else if (decisionResult && decisionResult.skipped) {
-        agentAction = decisionResult.decision?.action || null;
-        log.debug('Decision: agent skipped (no change)');
-      } else if (decisionResult) {
-        agentAction = decisionResult.decision?.action || null;
-        log.debug(`Decision: ${decisionResult.decision?.action} (no change)`);
-      }
-      // Dashboard: emit decision update (include market mode for CHOP badge)
-      try { dashboardEmitter.emit('decision_update', { action: agentAction, decision: decisionResult?.decision, marketMode: detectChopMode('SPXW') }); } catch (_) {}
-    } catch (decisionErr) {
-      log.error('Decision engine error:', decisionErr.message);
-      // Fallback: detect patterns independently so algorithmic entries still work
+    // Agent call: ONLY when in a position (exit advisory) — entries are algorithmic
+    const posStateForAgent = getPositionState();
+    if (posStateForAgent !== 'FLAT') {
       try {
-        detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches());
-      } catch (_) {}
+        const decisionResult = await runDecisionCycle(scored, parsed, wallTrends, multiAnalysis, trinityState);
+
+        if (decisionResult && decisionResult.changed && !decisionResult.skipped) {
+          const decision = decisionResult.decision;
+          decision.spotPrice = parsed.spotPrice;
+          await sendCombinedSignalAlert(decision);
+          try {
+            const alertData = { type: 'SIGNAL', message: `${decision.action.replace(/_/g, ' ')} — ${decision.confidence} confidence`, details: { action: decision.action, confidence: decision.confidence, reason: decision.reason, spotPrice: parsed.spotPrice, score: scored.score, direction: scored.direction } };
+            dashboardEmitter.emit('alert', alertData);
+            saveAlert('SIGNAL', alertData);
+          } catch (_) {}
+          agentAction = decision.action;
+          agentEntryTrigger = decision.entry_trigger || null;
+          log.info(`Decision: ${decision.action} (${decision.confidence}) — alert sent`);
+        } else if (decisionResult) {
+          agentAction = decisionResult.decision?.action || null;
+        }
+        try { dashboardEmitter.emit('decision_update', { action: agentAction, decision: decisionResult?.decision, marketMode: detectChopMode('SPXW') }); } catch (_) {}
+      } catch (decisionErr) {
+        log.error('Decision engine error:', decisionErr.message);
+      }
+    } else {
+      // FLAT — emit dashboard update without agent call
+      try { dashboardEmitter.emit('decision_update', { action: 'WAIT', marketMode: detectChopMode('SPXW') }); } catch (_) {}
     }
 
     // ---- PHASE 3: TRADE EXECUTION ----
@@ -512,7 +503,7 @@ async function runCycle(phase) {
         const laneAResult = checkGexOnlyEntry(entryState);
 
         if (laneAResult?.shouldEnter) {
-          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis);
+          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis, { lane: 'A' });
           if (guardrail.allowed) {
             const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
             await handleTradeEntry(laneAResult.action, parsed, scored, wallTrends, {
@@ -523,6 +514,35 @@ async function runCycle(phase) {
             recordEntryForGates();
           } else {
             log.warn(`Lane A entry BLOCKED: ${laneAResult.action} — ${guardrail.reason}`);
+            // Create phantom trade for gate-blocked entries so we can track what would have happened
+            try {
+              const direction = laneAResult.trigger.direction;
+              const spotPrice = parsed.spotPrice;
+              const atm = Math.round(spotPrice / 5) * 5;
+              const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+              const optType = direction === 'BULLISH' ? 'C' : 'P';
+              const contract = `SPX${expDate}${optType}${atm}`;
+              const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
+              recordPhantom({
+                contract,
+                direction,
+                strike: atm,
+                entryPrice: 0,
+                entrySpx: spotPrice,
+                targetPrice: 0,
+                stopPrice: 0,
+                targetSpx: laneAResult.trigger.target_strike,
+                stopSpx: laneAResult.trigger.stop_strike,
+                greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
+                gexState: { score: scored.score, direction: scored.direction },
+                tvState: getSignalSnapshot(),
+                agentReasoning: `Lane A blocked: ${laneAResult.trigger.pattern} — gate: ${guardrail.reason}`,
+                strategyLane: 'A',
+                entryTrigger: laneAResult.trigger.pattern,
+                entryContext,
+              });
+              log.info(`Lane A phantom (blocked): ${contract} ${direction} via ${laneAResult.trigger.pattern} — ${guardrail.reason}`);
+            } catch (_) {}
             try {
               saveAlert('ENTRY_BLOCKED', { type: 'ENTRY_BLOCKED', message: `Lane A ${laneAResult.action} blocked — ${guardrail.reason}`, details: { action: laneAResult.action, reason: guardrail.reason, score: scored.score, direction: scored.direction, spotPrice: parsed.spotPrice, trigger: laneAResult.trigger.pattern } });
             } catch (_) {}

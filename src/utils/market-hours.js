@@ -23,37 +23,37 @@ export function getSchedulePhase() {
 
   // 9:00 AM - 9:14 AM → PRE-MARKET GEX
   if (mins >= 540 && mins < 555) {
-    return { phase: 'PRE_MARKET', pollIntervalMs: 60000, alertsActive: false, description: 'Pre-market GEX collection' };
+    return { phase: 'PRE_MARKET', pollIntervalMs: 30000, alertsActive: false, description: 'Pre-market GEX collection' };
   }
 
   // 9:15 AM → PRE-MARKET BRIEFING (1-minute window)
   if (mins >= 555 && mins < 556) {
-    return { phase: 'PRE_MARKET_BRIEFING', pollIntervalMs: 60000, alertsActive: true, description: 'Pre-market briefing' };
+    return { phase: 'PRE_MARKET_BRIEFING', pollIntervalMs: 30000, alertsActive: true, description: 'Pre-market briefing' };
   }
 
   // 9:16 AM - 9:24 AM → PRE-MARKET continued
   if (mins >= 556 && mins < 565) {
-    return { phase: 'PRE_MARKET', pollIntervalMs: 60000, alertsActive: false, description: 'Pre-market GEX collection' };
+    return { phase: 'PRE_MARKET', pollIntervalMs: 30000, alertsActive: false, description: 'Pre-market GEX collection' };
   }
 
   // 9:25 AM - 9:29 AM → WARM-UP
   if (mins >= 565 && mins < 570) {
-    return { phase: 'WARM_UP', pollIntervalMs: 30000, alertsActive: false, description: 'Warm-up — increased polling' };
+    return { phase: 'WARM_UP', pollIntervalMs: 5000, alertsActive: false, description: 'Warm-up — fast polling' };
   }
 
   // 9:30 AM - 9:35 AM → OPEN VOLATILITY
   if (mins >= 570 && mins < 575) {
-    return { phase: 'OPEN_VOLATILITY', pollIntervalMs: 15000, alertsActive: true, description: 'Market open — high-frequency polling' };
+    return { phase: 'OPEN_VOLATILITY', pollIntervalMs: 5000, alertsActive: true, description: 'Market open — fast polling' };
   }
 
   // 9:35 AM - 3:29 PM → NORMAL TRADING
   if (mins >= 575 && mins < 930) {
-    return { phase: 'NORMAL_TRADING', pollIntervalMs: 30000, alertsActive: true, description: 'Normal trading hours' };
+    return { phase: 'NORMAL_TRADING', pollIntervalMs: 5000, alertsActive: true, description: 'Normal trading hours' };
   }
 
   // 3:30 PM - 3:59 PM → THETA WARNING
   if (mins >= 930 && mins < 960) {
-    return { phase: 'THETA_WARNING', pollIntervalMs: 15000, alertsActive: true, description: 'Theta warning — increased urgency' };
+    return { phase: 'THETA_WARNING', pollIntervalMs: 5000, alertsActive: true, description: 'Theta warning — fast polling' };
   }
 
   // 4:00 PM - 4:01 PM → MARKET CLOSE
