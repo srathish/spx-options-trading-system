@@ -156,7 +156,7 @@ function createApi() {
     try {
       const date = req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
         ? req.query.date
-        : nowET().toISOString().slice(0, 10);
+        : nowET().toFormat('yyyy-MM-dd');
       res.json(getPhantomTradesByDate(date));
     } catch (err) {
       log.error('GET /api/phantoms/today error:', err.message);
