@@ -74,9 +74,14 @@ export function validateGexOnlyEntry(trigger, state, config) {
   const minAlignment = cfg.alignment_min_for_entry ?? 2;
   const overrideScore = cfg.alignment_override_gex_score ?? 85;
 
-  // Gate 1: Alignment check
+  // Gate 1: Alignment check (bypass for structural single-ticker patterns)
+  const STRUCTURAL_PATTERNS_ALIGN = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW'];
   if (alignment < minAlignment) {
-    if (!(alignment >= 1 && scored.score >= overrideScore)) {
+    if (STRUCTURAL_PATTERNS_ALIGN.includes(trigger.pattern) && trigger.confidence !== 'LOW') {
+      log.info(`Gate 1 bypass: ${trigger.pattern} (${trigger.confidence}) — structural setup, alignment ${alignment}/3 waived`);
+    } else if (alignment >= 1 && scored.score >= overrideScore) {
+      // Original override: 1/3 alignment + high score
+    } else {
       return { valid: false, reason: `Alignment ${alignment}/3 < ${minAlignment} (GEX ${scored.score} < override ${overrideScore})` };
     }
   }
@@ -97,10 +102,15 @@ export function validateGexOnlyEntry(trigger, state, config) {
     }
   }
 
-  // Gate 3: Minimum GEX score
+  // Gate 3: Minimum GEX score (bypass for structural patterns)
+  const STRUCTURAL_PATTERNS = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW'];
   const minScore = cfg.gex_only_min_score ?? 50;
   if (scored.score < minScore) {
-    return { valid: false, reason: `GEX score ${scored.score} < min ${minScore}` };
+    if (STRUCTURAL_PATTERNS.includes(trigger.pattern) && trigger.confidence !== 'LOW') {
+      log.info(`Gate 3 bypass: ${trigger.pattern} (${trigger.confidence}) overrides GEX score ${scored.score} < ${minScore}`);
+    } else {
+      return { valid: false, reason: `GEX score ${scored.score} < min ${minScore}` };
+    }
   }
 
   // Gate 4: Power hour check (after 3:30 PM ET)

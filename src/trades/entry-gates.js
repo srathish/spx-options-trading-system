@@ -82,11 +82,7 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     }
   }
 
-  // Gate 6: Max trades per day
-  const maxTrades = cfg.max_trades_per_day ?? 8;
-  if (todayTradeCount >= maxTrades) {
-    return { allowed: false, reason: `Max trades reached: ${todayTradeCount}/${maxTrades}` };
-  }
+  // Gate 6: removed (no daily trade limit)
 
   // Gate 7: Direction stability — must be stable for 3 cycles
   if (!isDirectionStable('SPXW', 3)) {
@@ -98,8 +94,8 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     return { allowed: false, reason: 'Direction flipped in last 4 cycles — wait for stabilization' };
   }
 
-  // Gate 9: No entries after 3:00 PM ET (0DTE theta decay)
-  const noEntryAfter = cfg.no_entry_after || '15:00';
+  // Gate 9: No entries after 3:30 PM ET (0DTE theta decay)
+  const noEntryAfter = cfg.no_entry_after || '15:30';
   if (timeET >= noEntryAfter) {
     return { allowed: false, reason: `Time gate: no entries after ${noEntryAfter} ET` };
   }

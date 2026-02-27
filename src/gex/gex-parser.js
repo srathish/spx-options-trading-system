@@ -105,37 +105,45 @@ export function parseGexResponse(raw) {
 
 /**
  * Identify significant GEX walls (concentrations) in the data.
+ * Uses top-N by absolute value + percentile ranking (no neighbor comparison).
  */
 export function identifyWalls(parsedData) {
   const { aggregatedGex, strikes, spotPrice } = parsedData;
   const minWallSize = WALL_MIN_INDEX;
 
-  // Calculate the median absolute GEX across all strikes
-  const absValues = strikes.map(s => Math.abs(aggregatedGex.get(s) || 0)).sort((a, b) => a - b);
-  const medianGex = absValues[Math.floor(absValues.length / 2)] || 1;
+  // Step 1: Compute percentile ranks for ALL strikes
+  const allAbs = strikes.map(s => Math.abs(aggregatedGex.get(s) || 0)).sort((a, b) => a - b);
+  const p90Threshold = allAbs[Math.floor(allAbs.length * 0.90)] || 0;
 
+  // Step 2: Top 10 by absolute value within ±100pts of spot
+  const nearSpot = strikes
+    .filter(s => Math.abs(s - spotPrice) <= 100)
+    .map(s => ({ strike: s, absGex: Math.abs(aggregatedGex.get(s) || 0) }))
+    .sort((a, b) => b.absGex - a.absGex)
+    .slice(0, 10);
+
+  const topNStrikes = new Set(nearSpot.map(n => n.strike));
+
+  // Step 3: Add any strike in top 10% by absolute value (within ±150pts)
+  for (const strike of strikes) {
+    if (Math.abs(strike - spotPrice) > 150) continue;
+    const absGex = Math.abs(aggregatedGex.get(strike) || 0);
+    if (absGex >= p90Threshold && absGex >= minWallSize) {
+      topNStrikes.add(strike);
+    }
+  }
+
+  // Step 4: Build wall objects (filter by min threshold)
   const walls = [];
-
-  for (let i = 0; i < strikes.length; i++) {
-    const strike = strikes[i];
+  for (const strike of topNStrikes) {
     const gex = aggregatedGex.get(strike) || 0;
     const absGex = Math.abs(gex);
-
     if (absGex < minWallSize) continue;
 
-    // Check if this strike stands out vs neighbors (5 on each side)
-    const neighborStart = Math.max(0, i - 5);
-    const neighborEnd = Math.min(strikes.length, i + 6);
-    const neighbors = [];
-    for (let j = neighborStart; j < neighborEnd; j++) {
-      if (j !== i) neighbors.push(Math.abs(aggregatedGex.get(strikes[j]) || 0));
-    }
-    const neighborMedian = neighbors.length > 0
-      ? neighbors.sort((a, b) => a - b)[Math.floor(neighbors.length / 2)]
-      : 0;
-
-    // Must be at least 2x the neighbor median to qualify as a wall
-    if (neighborMedian > 0 && absGex < neighborMedian * 2) continue;
+    // Compute percentile rank
+    let rank = allAbs.findIndex(v => v >= absGex);
+    if (rank < 0) rank = allAbs.length;
+    const percentileRank = Math.round((rank / allAbs.length) * 100);
 
     walls.push({
       strike,
@@ -145,6 +153,7 @@ export function identifyWalls(parsedData) {
       relativeToSpot: strike > spotPrice ? 'above' : strike < spotPrice ? 'below' : 'at',
       distanceFromSpot: Math.abs(strike - spotPrice),
       distancePct: (Math.abs(strike - spotPrice) / spotPrice * 100),
+      percentileRank,
     });
   }
 

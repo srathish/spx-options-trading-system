@@ -318,11 +318,11 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  // 3g. Map reshuffle — GEX map changed dramatically
+  // 3g. Map reshuffle — flag for agent review, don't auto-exit
+  // The agent gets reshuffle context and decides: 'minor shift, hold' vs 'thesis broken, exit'
   if (!holdTooShort && context.multiAnalysis?.reshuffles?.some(r => r.detected)) {
-    result.exitTriggered = true;
-    result.exitReason = 'MAP_RESHUFFLE';
-    return result;
+    result.reshuffleDetected = true;
+    log.info('Map reshuffle detected — flagged for agent review (no auto-exit)');
   }
 
   // 3h. Trailing stop — activated after threshold, trails behind best price
@@ -345,7 +345,11 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  // 3i. Agent EXIT signal — requires minimum hold time
+  // 3i. Agent EXIT signal — advisory only, requires structural confirmation
+  // Agent has 33% win rate on discretionary exits — only act when confirmed by:
+  //   - Price broke support/ceiling node (within 3pts)
+  //   - Momentum stalled (< +1pt progress after 5+ min)
+  //   - GEX score dropped below exit threshold
   if (agentAction) {
     const action = agentAction.toUpperCase();
     if (
@@ -353,11 +357,51 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
       (currentPosition.state === 'IN_PUTS' && (action === 'EXIT_PUTS' || action === 'EXIT'))
     ) {
       if (holdTooShort) {
-        log.debug(`Agent says exit but holding — ${Math.round((MIN_HOLD_BEFORE_SOFT_EXIT_MS - holdTimeMs) / 1000)}s until min hold`);
+        log.debug(`Agent recommends exit but holding — ${Math.round((MIN_HOLD_BEFORE_SOFT_EXIT_MS - holdTimeMs) / 1000)}s until min hold`);
       } else {
-        result.exitTriggered = true;
-        result.exitReason = 'AGENT_EXIT';
-        return result;
+        // Check for structural confirmation before acting on agent exit
+        let confirmed = false;
+        let confirmReason = '';
+
+        // Confirmation 1: Price near/past support or ceiling node
+        if (currentPosition.entryContext) {
+          const ctx = currentPosition.entryContext;
+          const nearBuffer = 3; // within 3pts of node
+          if (isBullish && ctx.support_node?.strike && currentSpot < ctx.support_node.strike + nearBuffer) {
+            confirmed = true;
+            confirmReason = `price near support ${ctx.support_node.strike}`;
+          }
+          if (!isBullish && ctx.ceiling_node?.strike && currentSpot > ctx.ceiling_node.strike - nearBuffer) {
+            confirmed = true;
+            confirmReason = `price near ceiling ${ctx.ceiling_node.strike}`;
+          }
+        }
+
+        // Confirmation 2: Momentum stalled (< +1pt after 5+ min hold)
+        if (!confirmed && holdTimeMs >= 5 * 60_000) {
+          const spxProgress = isBullish
+            ? currentSpot - currentPosition.entrySpx
+            : currentPosition.entrySpx - currentSpot;
+          if (spxProgress < 1) {
+            confirmed = true;
+            confirmReason = `momentum stalled (${spxProgress.toFixed(1)}pts after ${Math.round(holdTimeMs / 60_000)}min)`;
+          }
+        }
+
+        // Confirmation 3: GEX score dropped below exit threshold
+        if (!confirmed && scored && scored.score < (cfg.gex_exit_threshold || 40)) {
+          confirmed = true;
+          confirmReason = `GEX score ${scored.score} < exit threshold`;
+        }
+
+        if (confirmed) {
+          result.exitTriggered = true;
+          result.exitReason = 'AGENT_EXIT';
+          log.info(`Agent exit CONFIRMED: ${confirmReason}`);
+          return result;
+        } else {
+          log.info(`Agent recommends exit but NO structural confirmation — holding position`);
+        }
       }
     }
   }

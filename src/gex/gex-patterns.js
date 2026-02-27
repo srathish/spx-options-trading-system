@@ -107,7 +107,7 @@ function detectRugPull(ctx) {
     if (rug.ticker !== 'SPXW') continue; // Only trade SPX patterns
 
     const distPct = Math.abs(rug.posStrike - scored.spotPrice) / scored.spotPrice * 100;
-    if (distPct > 1.0) continue; // Too far from spot
+    if (distPct > 1.5) continue; // Too far from spot
 
     // Confidence scoring
     let confidence = 'MEDIUM';
@@ -118,7 +118,7 @@ function detectRugPull(ctx) {
     // Lower confidence if positive wall has been tested multiple times (weakened)
     if (touches >= 2) confidence = 'HIGH'; // Wall weakened = rug more likely
     // Lower if spot is far from the setup
-    if (distPct > 0.5) confidence = 'LOW';
+    if (distPct > 0.75) confidence = 'LOW';
 
     // Target must be BELOW spot for bearish — use negStrike only if below, else nearest wall below
     const targetStrike = rug.negStrike < scored.spotPrice
@@ -153,14 +153,14 @@ function detectReverseRug(ctx) {
     if (rug.ticker !== 'SPXW') continue;
 
     const distPct = Math.abs(rug.posStrike - scored.spotPrice) / scored.spotPrice * 100;
-    if (distPct > 1.0) continue;
+    if (distPct > 1.5) continue;
 
     let confidence = 'MEDIUM';
     const touches = nodeTouches[rug.posStrike]?.touches || 0;
 
     if (scored.gexAtSpot < 0) confidence = 'HIGH';
     if (touches >= 2) confidence = 'HIGH';
-    if (distPct > 0.5) confidence = 'LOW';
+    if (distPct > 0.75) confidence = 'LOW';
 
     // Target must be ABOVE spot for bullish — use negStrike only if above, else nearest wall above
     const targetStrike = rug.negStrike > scored.spotPrice
@@ -193,7 +193,11 @@ function detectKingNodeBounce(ctx) {
 
   // Only check SPXW king node for trade decisions
   const kn = kingNodes.SPXW;
-  if (!kn || !kn.isNear) return results;
+  if (!kn) return results;
+
+  // Within 10pts of spot (2 strikes) — clearer than percentage-based
+  const knDistPts = Math.abs(kn.strike - scored.spotPrice);
+  if (knDistPts > 10) return results;
 
   // Skip negative king nodes (magnets pull, not bounce)
   if (kn.type === 'negative') return results;
@@ -239,22 +243,28 @@ function detectPikaPillow(ctx) {
   const { scored, cfg } = ctx;
   const results = [];
 
-  // Requires: positive floor below + negative gamma at spot
+  // Requires: positive floor below spot
   if (!scored.floorWall) return results;
-  if (scored.gexAtSpot >= 0) return results; // Need negative gamma
   if (scored.floorWall.type !== 'positive') return results;
 
-  const maxDistPct = cfg.pattern_pika_max_dist_pct ?? 0.30;
+  const maxDistPct = cfg.pattern_pika_max_dist_pct ?? 0.20;
   const distPct = Math.abs(scored.spotPrice - scored.floorWall.strike) / scored.spotPrice * 100;
-  if (distPct > maxDistPct) return results; // Floor too far
+  const distPts = Math.abs(scored.spotPrice - scored.floorWall.strike);
+  // Allow if within percentage OR within 15pts absolute (whichever is more permissive)
+  if (distPct > maxDistPct && distPts > 15) return results;
 
   // Target: nearest negative wall above (magnet pulling up)
   const negAbove = scored.wallsAbove?.find(w => w.type === 'negative');
   if (!negAbove) return results; // No upside magnet
 
   let confidence = 'MEDIUM';
-  if (distPct <= 0.10 && scored.score >= 70) confidence = 'HIGH';
-  if (distPct > 0.20) confidence = 'LOW';
+  if (distPts <= 5 && scored.score >= 70) confidence = 'HIGH';
+  if (distPts > 10) confidence = 'LOW';
+  // Positive gamma at spot = less amplification → downgrade one tier
+  if (scored.gexAtSpot >= 0 && confidence === 'HIGH') confidence = 'MEDIUM';
+  else if (scored.gexAtSpot >= 0 && confidence === 'MEDIUM') confidence = 'LOW';
+
+  const env = scored.gexAtSpot < 0 ? 'neg gamma' : 'pos gamma (reduced)';
 
   results.push({
     pattern: 'PIKA_PILLOW',
@@ -263,7 +273,7 @@ function detectPikaPillow(ctx) {
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: negAbove.strike,
     stop_strike: scored.floorWall.strike - (cfg.stop_buffer_pct || 0.05) / 100 * scored.spotPrice,
-    reasoning: `Pos floor at ${scored.floorWall.strike} (${distPct.toFixed(2)}% below) in neg gamma — pika pillow, target ${negAbove.strike}`,
+    reasoning: `Pos floor at ${scored.floorWall.strike} (${distPts.toFixed(0)}pts below) in ${env} — pika pillow, target ${negAbove.strike}`,
     source_ticker: 'SPXW',
     walls: { floor: scored.floorWall.strike, target: negAbove.strike },
   });
@@ -342,8 +352,10 @@ function detectAirPocket(ctx) {
   const results = [];
 
   if (!scored.targetWall) return results;
-  if (scored.gexAtSpot >= 0) return results; // Need negative gamma for momentum
-  if (scored.targetWall.type !== 'negative') return results; // Target should be a magnet
+
+  // Positive gamma or positive target wall → downgrade confidence, don't hard skip
+  let positiveGammaDowngrade = scored.gexAtSpot >= 0;
+  let positiveTargetDowngrade = scored.targetWall.type !== 'negative';
 
   const direction = scored.direction === 'BULLISH' ? 'above' : 'below';
   const airPocket = characterizeAirPocket(
@@ -355,12 +367,17 @@ function detectAirPocket(ctx) {
     scored.targetWall.absGexValue,
   );
 
-  const minQuality = cfg.pattern_air_pocket_min_quality || 'HIGH';
+  const minQuality = cfg.pattern_air_pocket_min_quality || 'MEDIUM';
   const qualityOrder = { HIGH: 0, MEDIUM: 1, LOW: 2, BLOCKED: 3 };
   if ((qualityOrder[airPocket.quality] || 3) > (qualityOrder[minQuality] || 0)) return results;
 
   let confidence = airPocket.quality === 'HIGH' ? 'HIGH' : 'MEDIUM';
   if (scored.score < 60) confidence = 'LOW';
+  // Downgrade confidence for positive gamma or positive target (resistance, not magnet)
+  if (positiveGammaDowngrade || positiveTargetDowngrade) {
+    if (confidence === 'HIGH') confidence = 'MEDIUM';
+    else if (confidence === 'MEDIUM') confidence = 'LOW';
+  }
 
   const tradeDirection = scored.direction;
   if (tradeDirection !== 'BULLISH' && tradeDirection !== 'BEARISH') return results;

@@ -238,10 +238,17 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
     }
   }
 
-  // -20: Positive wall above larger than negative wall (caps upside)
+  // -20 (or -5): Positive wall above larger than negative wall (caps upside)
+  // Reduced to -5 when walls are within 4 strikes — that's a rug setup, not noise
   if (significantPosAbove.length > 0 && targetWall && significantPosAbove[0].absGexValue > targetWall.absGexValue) {
-    score += SCORE.CONFLICTING_WALL_PENALTY;
-    breakdown.push(`-20: Pos wall above (${significantPosAbove[0].strike}) larger than neg target — caps upside`);
+    const strikeGap = Math.abs(significantPosAbove[0].strike - targetWall.strike) / 5; // SPX $5 steps
+    if (strikeGap <= 4) {
+      score -= 5;
+      breakdown.push(`-5: Pos wall above (${significantPosAbove[0].strike}) near neg target (${strikeGap} strikes) — possible rug setup, reduced penalty`);
+    } else {
+      score += SCORE.CONFLICTING_WALL_PENALTY;
+      breakdown.push(`-20: Pos wall above (${significantPosAbove[0].strike}) larger than neg target — caps upside`);
+    }
   }
 
   score = Math.max(0, Math.min(100, score));
@@ -329,10 +336,17 @@ function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTr
     }
   }
 
-  // -20: Large positive GEX floor below target blocks downside
+  // -20 (or -5): Large positive GEX floor below target blocks downside
+  // Reduced to -5 when walls are within 4 strikes — that's a rug setup, not noise
   if (significantPosBelow.length > 0 && targetWall && significantPosBelow[0].absGexValue > targetWall.absGexValue * 0.5) {
-    score += SCORE.CONFLICTING_WALL_PENALTY;
-    breakdown.push(`-20: Pos floor below (${significantPosBelow[0].strike}) could block downside`);
+    const strikeGap = Math.abs(significantPosBelow[0].strike - targetWall.strike) / 5;
+    if (strikeGap <= 4) {
+      score -= 5;
+      breakdown.push(`-5: Pos floor below (${significantPosBelow[0].strike}) near neg target (${strikeGap} strikes) — possible rug setup, reduced penalty`);
+    } else {
+      score += SCORE.CONFLICTING_WALL_PENALTY;
+      breakdown.push(`-20: Pos floor below (${significantPosBelow[0].strike}) could block downside`);
+    }
   }
 
   score = Math.max(0, Math.min(100, score));

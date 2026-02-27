@@ -80,8 +80,8 @@ const V1_BASELINE = {
   pattern_min_wall_pct: 0.15,
   pattern_rug_max_gap_strikes: 2,
   pattern_king_node_max_touches: 1,
-  pattern_pika_max_dist_pct: 0.30,
-  pattern_air_pocket_min_quality: 'HIGH',
+  pattern_pika_max_dist_pct: 0.20,
+  pattern_air_pocket_min_quality: 'MEDIUM',
   pattern_range_fade_max_touches: 1,
   pattern_triple_min_walls: 3,
 

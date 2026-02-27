@@ -112,6 +112,16 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
         walls_above: wallsAbove,
         walls_below: wallsBelow,
         wall_trends: trends,
+        top_nodes: [...parsedData.aggregatedGex.entries()]
+          .filter(([strike]) => Math.abs(strike - scored.spotPrice) <= 100)
+          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+          .slice(0, 10)
+          .map(([strike, value]) => ({
+            strike,
+            value,
+            type: value > 0 ? 'positive' : 'negative',
+            dist_from_spot: strike - scored.spotPrice,
+          })),
       },
       spy: spyState?.scored ? {
         score: spyState.scored.score,

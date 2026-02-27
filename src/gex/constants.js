@@ -56,11 +56,11 @@ export const HEALTH_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 // Multi-ticker analysis thresholds
 export const MULTI_TICKER = {
   STAGGER_MS: 50,               // ms between API requests
-  KING_NODE_PROXIMITY_PCT: 0.3, // within 0.3% of spot = "at king node"
+  KING_NODE_PROXIMITY_PCT: 0.15, // within 0.15% of spot (~10pts) = "at king node"
   STACKED_MIN_STRIKES: 3,       // min consecutive same-sign strikes for "stacked"
   STACKED_MIN_VALUE: 0.05,      // each strike must be ≥5% of largest wall
   NODE_SLIDE_GROWTH_PCT: 1.0,   // 100% growth = "node slide"
-  RUG_MAX_STRIKE_GAP: 2,        // neg wall within 2 strikes of pos wall = rug
+  RUG_MAX_STRIKE_GAP: 4,        // neg wall within 4 strikes ($20) of pos wall = rug
   ALIGNMENT_BONUS: { 0: 0, 1: 5, 2: 10, 3: 15 },
   DRIVER_BONUS: 5,              // extra +5 when driver aligns with SPX direction
 };
