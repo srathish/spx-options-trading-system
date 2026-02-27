@@ -34,13 +34,13 @@ Every 15-30 seconds (depending on market phase), the main loop:
 4. **Analyzes** cross-market patterns (driver detection, alignment, stacked walls, rug setups, node slides)
 5. **Combines** with TradingView signals (Echo, Bravo, Tango across SPX/SPY/QQQ on 1m and 3m timeframes)
 6. **Decides** via Kimi K2.5 AI agent: ENTER_CALLS, ENTER_PUTS, EXIT_CALLS, EXIT_PUTS, or WAIT
-7. **Manages** positions with 11 exit triggers (target, stop, profit target, trailing stop, TV flip, etc.)
+7. **Manages** positions with 12 exit triggers (target, stop, profit target, trailing stop, phase 0 momentum, TV flip, etc.)
 8. **Alerts** Discord with trade cards, signal changes, wall movements, and health heartbeats
 9. **Records** trade ideas to SQLite for historical analysis via the dashboard Ideas tab
 
 ### Trade Management
 
-The system uses SPX-based P&L tracking (no live options pricing needed) with 11 exit triggers in priority order:
+The system uses SPX-based P&L tracking (no live options pricing needed) with 12 exit triggers in priority order:
 
 | # | Trigger | Type | Description |
 |---|---------|------|-------------|
@@ -48,17 +48,18 @@ The system uses SPX-based P&L tracking (no live options pricing needed) with 11 
 | 2 | STOP_HIT | Immediate | SPX broke through the stop level |
 | 3 | PROFIT_TARGET | Immediate | +0.15% SPX move (configurable) |
 | 4 | STOP_LOSS | Immediate | -0.20% adverse move (configurable) |
-| 5 | OPPOSING_WALL | 3 min hold | Large positive wall ($5M+) materialized against position |
-| 6 | TV_FLIP | 3 min hold | 2+ opposing 3m TradingView signals |
-| 7 | MAP_RESHUFFLE | 3 min hold | GEX map changed dramatically |
-| 8 | TRAILING_STOP | 3 min hold | Activated after +8pt, trails 5pt behind best |
-| 9 | AGENT_EXIT | 3 min hold | AI agent recommends exit |
-| 10 | THETA_DEATH | Immediate | 3:30 PM ET cutoff for 0DTE |
-| 11 | GEX_FLIP | 3 min hold | GEX direction flipped against position |
+| 5 | NODE_SUPPORT_BREAK | Immediate | Trend-aware: GONE = instant exit, WEAKENING = tighter buffer, GROWING = wider buffer |
+| 6 | OPPOSING_WALL | 3 min hold | Large positive wall ($5M+) materialized against position |
+| 7 | TV_FLIP | 3 min hold | 2+ opposing 3m TradingView signals |
+| 8 | MOMENTUM_TIMEOUT | Phase 0: 60s | Phase 0 catches dead trades at 60s; phases 1-3 at 5/10/15 min |
+| 9 | MAP_RESHUFFLE | 3 min hold | GEX map changed dramatically |
+| 10 | TRAILING_STOP | 3 min hold | Activated after +8pt, trails 5pt behind best |
+| 11 | AGENT_EXIT | 3 min hold | AI agent recommends exit |
+| 12 | THETA_DEATH | Immediate | 3:30 PM ET cutoff for 0DTE |
 
 ### Entry Guardrails
 
-10 rules gate every entry signal from the AI agent:
+12 rules gate every entry signal from the AI agent:
 
 1. **TV Regime** — Pink Diamond = bearish regime (no calls until Blue Diamond)
 2. **Alignment + TV** — Need 2/3 ticker alignment or TV confirmation (configurable)
@@ -70,6 +71,8 @@ The system uses SPX-based P&L tracking (no live options pricing needed) with 11 
 8. **Time gate** — No entries after 3:00 PM ET
 9. **Opening caution** — Score >= 85 and 3/3 alignment during 9:30-9:40 AM
 10. **Chop mode** — Score >= 80 required when chop detected (6+ direction flips or score stddev > 20)
+11. **Consecutive loss cooldown** — 15 min cooldown after 2 consecutive losses
+12. **Regime persistence** — Blocks entries against a persistent opposing GEX regime (36+ consecutive cycles)
 
 ### Self-Improvement Loop
 
@@ -78,6 +81,7 @@ The system uses SPX-based P&L tracking (no live options pricing needed) with 11 
 - **Phantom trades**: When already in a position, alternative entries are tracked as "phantom" trades for comparison
 - **Auto-rollback**: If a new strategy version underperforms, automatically reverts to the previous version
 - **Strategy versioning**: Every parameter change is versioned and auditable (40+ tunable params)
+- **Pattern outcome tracking**: 7-day rolling win rate and P&L by entry trigger pattern, fed into nightly reviews for data-backed trigger weight adjustments
 
 ### Chop Mode Detection
 
@@ -173,6 +177,11 @@ pm2 logs gexclaw
 | **OPEX Awareness** | Magnifies wall importance during monthly options expiration week/day |
 | **Hedge Nodes** | Identifies institutional multi-day hedges via allExp/0DTE ratio analysis |
 | **VEX Confluence** | Analyzes vanna + gamma alignment at walls (REINFORCING vs OPPOSING) |
+| **Node Strength Trends** | Tracks wall growth/decay over time: GROWING, STABLE, WEAKENING, GONE |
+| **Conflicting Pattern Resolution** | When BULLISH and BEARISH patterns fire simultaneously, downgrades the side opposing GEX structure |
+| **Multi-Exp Wall Confirmation** | Walls with 50%+ extra GEX from non-0DTE expirations get confidence upgrades (structurally stronger) |
+| **Position-Aware Patterns** | Patterns opposing current position flagged for exit consideration rather than entry |
+| **GEX Regime Persistence** | Tracks consecutive same-direction cycles; 36+ cycles = persistent regime gates entries |
 
 ## TradingView Indicators
 
