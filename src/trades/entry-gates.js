@@ -35,12 +35,13 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const direction = action === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
   const cfg = getActiveConfig() || {};
   const etNow = opts.timeOverride || nowET();
+  const now = opts.nowMs || Date.now();
   const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
 
   // Gate 1: 60s minimum spacing between ANY entries
   const minSpacing = cfg.entry_min_spacing_ms ?? 60_000;
-  if (lastEntryTime > 0 && (Date.now() - lastEntryTime) < minSpacing) {
-    const remaining = Math.round((minSpacing - (Date.now() - lastEntryTime)) / 1000);
+  if (lastEntryTime > 0 && (now - lastEntryTime) < minSpacing) {
+    const remaining = Math.round((minSpacing - (now - lastEntryTime)) / 1000);
     return { allowed: false, reason: `Entry spacing: ${remaining}s until next entry allowed` };
   }
 
@@ -53,8 +54,8 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
 
   // Gate 3: Consecutive same-direction loss cooldown
   const cooldownUntil = consecutiveLossCooldownUntil[direction] || 0;
-  if (Date.now() < cooldownUntil) {
-    const remaining = Math.round((cooldownUntil - Date.now()) / 60_000);
+  if (now < cooldownUntil) {
+    const remaining = Math.round((cooldownUntil - now) / 60_000);
     return { allowed: false, reason: `Loss cooldown: ${consecutiveLosses[direction]} consecutive ${direction} losses, ${remaining}m remaining` };
   }
 
@@ -63,11 +64,11 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const tvRegime = opts.lane === 'A' ? { direction: null } : getTvRegime();
   if (tvRegime.direction) {
     if (direction === 'BULLISH' && tvRegime.direction === 'BEARISH') {
-      const ageMin = tvRegime.setAt ? Math.round((Date.now() - tvRegime.setAt) / 60000) : '?';
+      const ageMin = tvRegime.setAt ? Math.round((now - tvRegime.setAt) / 60000) : '?';
       return { allowed: false, reason: `TV regime BEARISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${ageMin}m ago) — need Blue Diamond for calls` };
     }
     if (direction === 'BEARISH' && tvRegime.direction === 'BULLISH') {
-      const ageMin = tvRegime.setAt ? Math.round((Date.now() - tvRegime.setAt) / 60000) : '?';
+      const ageMin = tvRegime.setAt ? Math.round((now - tvRegime.setAt) / 60000) : '?';
       return { allowed: false, reason: `TV regime BULLISH (${tvRegime.ticker?.toUpperCase()} ${tvRegime.signal} ${ageMin}m ago) — need Pink Diamond for puts` };
     }
   }
@@ -75,7 +76,7 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   // Gate 5: Re-entry cooldown (same direction, after exit)
   if (lastExitTime > 0 && lastExitDirection === direction) {
     const reentryMs = cfg.entry_min_spacing_ms ?? 60_000; // Use same spacing
-    const elapsed = Date.now() - lastExitTime;
+    const elapsed = now - lastExitTime;
     if (elapsed < reentryMs) {
       const remaining = Math.round((reentryMs - elapsed) / 1000);
       return { allowed: false, reason: `Re-entry cooldown: exited ${direction} ${Math.round(elapsed / 1000)}s ago, wait ${remaining}s` };
@@ -130,9 +131,10 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
 
 /**
  * Record that an entry was made. Call after successful trade/phantom entry.
+ * @param {number} [nowMs] - Optional timestamp override (for replay engine)
  */
-export function recordEntryForGates() {
-  lastEntryTime = Date.now();
+export function recordEntryForGates(nowMs) {
+  lastEntryTime = nowMs || Date.now();
   todayTradeCount++;
 }
 
@@ -140,9 +142,11 @@ export function recordEntryForGates() {
  * Record that a position was exited. Tracks loss streaks for cooldown.
  * @param {string} direction - 'BULLISH' or 'BEARISH'
  * @param {boolean} isLoss - Whether the trade was a loss
+ * @param {number} [nowMs] - Optional timestamp override (for replay engine)
  */
-export function recordExitForGates(direction, isLoss) {
-  lastExitTime = Date.now();
+export function recordExitForGates(direction, isLoss, nowMs) {
+  const now = nowMs || Date.now();
+  lastExitTime = now;
   lastExitDirection = direction;
 
   if (isLoss) {
@@ -151,7 +155,7 @@ export function recordExitForGates(direction, isLoss) {
     const lossLimit = cfg.consecutive_loss_limit ?? 2;
     if (consecutiveLosses[direction] >= lossLimit) {
       const cooldown = cfg.consecutive_loss_cooldown_ms ?? 15 * 60_000;
-      consecutiveLossCooldownUntil[direction] = Date.now() + cooldown;
+      consecutiveLossCooldownUntil[direction] = now + cooldown;
       log.warn(`${direction} loss streak: ${consecutiveLosses[direction]} consecutive → ${cooldown / 60_000}m cooldown`);
     }
   } else {

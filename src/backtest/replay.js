@@ -165,9 +165,10 @@ function replayCycle(cycleData, state, cfg) {
       const laneAResult = checkGexOnlyEntry(entryState);
 
       if (laneAResult?.shouldEnter) {
+        const replayMs = replayTime.toMillis();
         const guardrail = checkEntryGates(
           laneAResult.action, scored, storedMultiAnalysis,
-          { lane: 'A', timeOverride: replayTime }
+          { lane: 'A', timeOverride: replayTime, nowMs: replayMs }
         );
 
         if (guardrail.allowed) {
@@ -180,7 +181,7 @@ function replayCycle(cycleData, state, cfg) {
             entryContext,
             timestamp: spxwRow.timestamp,
           });
-          recordEntryForGates();
+          recordEntryForGates(replayMs);
         } else {
           state.blockedEntries.push({
             timestamp: spxwRow.timestamp,
@@ -225,6 +226,9 @@ function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
   const spxChange = isBullish ? exitSpx - pos.entrySpx : pos.entrySpx - exitSpx;
   const pnlPct = (spxChange / pos.entrySpx) * 100;
 
+  // Parse timestamp for nowMs override
+  const exitMs = DateTime.fromFormat(timestamp, 'yyyy-MM-dd HH:mm:ss', { zone: 'America/New_York' }).toMillis();
+
   state.trades.push({
     direction: pos.direction,
     pattern: pos.pattern,
@@ -244,7 +248,7 @@ function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
   log.info(`EXIT  ${timestamp} | ${pos.direction} ${exitReason} | ${pnlStr} | ${spxChange > 0 ? 'WIN' : 'LOSS'}`);
 
   state.position = null;
-  recordExitForGates(pos.direction, spxChange <= 0);
+  recordExitForGates(pos.direction, spxChange <= 0, exitMs);
 }
 
 // ---- Exit Trigger Checks (Pure, No DB Writes) ----
