@@ -11,16 +11,29 @@ Heatseeker API ──┐
 TradingView ─────┤    │  (scoring +  │    │  Engine      │    │  (SPX-based │
   (Echo/Bravo/   │    │  multi-ticker│    │  (Kimi K2.5) │    │   P&L)      │
    Tango)        │    │  analysis)   │    └──────┬───────┘    └──────┬──────┘
-                  │    └─────────────┘           │                    │
-                  │                               v                    v
-                  │                        ┌─────────────┐    ┌──────────────┐
-                  │                        │  Discord     │    │  Dashboard   │
-                  │                        │  Alerts      │    │  (Next.js)   │
-                  │                        └─────────────┘    └──────────────┘
-                  │
+                  │    └──────┬──────┘           │                    │
+                  │           │                   v                    v
+                  │           │            ┌─────────────┐    ┌──────────────┐
+                  │           │            │  Discord     │    │  Dashboard   │
+                  │           │            │  Alerts      │    │  (Next.js)   │
+                  │           │            └─────────────┘    └──────────────┘
+                  │           │
+                  │           v
                   │    ┌─────────────────────────────────────────────────────┐
-                  └───>│  Self-Improvement Loop                              │
-                       │  (Nightly reviews, phantom trades, auto-rollback)   │
+                  │    │  Raw GEX Snapshots (SQLite)                         │
+                  │    │  Strike-level Maps stored every cycle (30-day)      │
+                  │    └──────────────────────┬──────────────────────────────┘
+                  │                           │
+                  │                           v
+                  │    ┌─────────────────────────────────────────────────────┐
+                  ├───>│  Self-Improvement Loop                              │
+                  │    │  (Nightly reviews, phantom trades, auto-rollback)   │
+                  │    └─────────────────────────────────────────────────────┘
+                  │                           │
+                  │                           v
+                  │    ┌─────────────────────────────────────────────────────┐
+                  └───>│  Replay Engine (./claw replay <date>)               │
+                       │  Full-day backtesting with current strategy config   │
                        └─────────────────────────────────────────────────────┘
 ```
 
