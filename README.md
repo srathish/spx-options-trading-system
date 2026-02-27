@@ -44,7 +44,7 @@ TradingView ─────┤     │  (scoring +  │    │  Entry Engine │
 
 ### Core Pipeline
 
-Every 15-30 seconds (depending on market phase), the main loop:
+Every 5 seconds during market hours (30s pre-market), the main loop:
 
 1. **Fetches** GEX data for SPXW, SPY, and QQQ in parallel via the Heatseeker API
 2. **Parses** gamma + vanna exposure across all strikes, identifies walls
