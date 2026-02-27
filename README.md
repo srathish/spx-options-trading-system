@@ -1,23 +1,28 @@
 # GexClaw
 
-Autonomous SPX 0DTE options trading system. Analyzes gamma exposure (GEX) data from Heatseeker, combines it with TradingView technical indicator signals (Echo + Bravo + Tango), and uses a Kimi K2.5 AI decision engine to generate structured trading decisions in real time.
+Autonomous SPX 0DTE options trading system. Analyzes gamma exposure (GEX) data from Heatseeker, combines it with TradingView technical indicator signals (Echo + Bravo + Tango), and executes algorithmic trades based on detected GEX patterns. A Kimi K2.5 AI agent provides exit advisory when in a position.
 
 ## Architecture
 
 ```
 Heatseeker API ──┐
   (SPXW/SPY/QQQ) │     ┌───────────── ┐    ┌──────────────┐    ┌─────────────┐
-                 ├───> │  GEX Engine  ├───>│  Decision    ├───>│  Trade Exec │
-TradingView ─────┤     │  (scoring +  │    │  Engine      │    │  (SPX-based │
-  (Echo/Bravo/   │     │  multi-ticker│    │  (Kimi K2.5) │    │   P&L)      │
+                 ├───> │  GEX Engine  ├───>│  Algorithmic ├───>│  Trade Exec │
+TradingView ─────┤     │  (scoring +  │    │  Entry Engine │    │  (SPX-based │
+  (Echo/Bravo/   │     │  multi-ticker│    │  (Lane A/B)  │    │   P&L)      │
    Tango)        │     │  analysis)   │    └──────┬───────┘    └──────┬──────┘
                   │    └──────┬────── ┘           │                   │
                   │           │                   v                   v
                   │           │            ┌─────────────┐    ┌──────────────┐
-                  │           │            │  Discord    │    │  Dashboard   │
-                  │           │            │  Alerts     │    │  (Next.js)   │
-                  │           │            └─────────────┘    └──────────────┘
-                  │           │
+                  │           │            │  Kimi K2.5   │    │  Dashboard   │
+                  │           │            │  Exit Advisor│    │  (Next.js)   │
+                  │           │            └──────┬──────┘    └──────────────┘
+                  │           │                   │
+                  │           │                   v
+                  │           │            ┌─────────────┐
+                  │           │            │  Discord     │
+                  │           │            │  Alerts      │
+                  │           │            └─────────────┘
                   │           v
                   │    ┌─────────────────────────────────────────────────────┐
                   │    │  Raw GEX Snapshots (SQLite)                         │
@@ -41,57 +46,73 @@ TradingView ─────┤     │  (scoring +  │    │  Engine      │ 
 
 Every 15-30 seconds (depending on market phase), the main loop:
 
-1. **Fetches** GEX data for SPXW, SPY, and QQQ via the Heatseeker API
-2. **Parses** gamma + vanna exposure across all strikes
-3. **Scores** directional bias (0-100) with wall classification, midpoint detection, air pocket quality
-4. **Analyzes** cross-market patterns (driver detection, alignment, stacked walls, rug setups, node slides)
-5. **Combines** with TradingView signals (Echo, Bravo, Tango across SPX/SPY/QQQ on 1m and 3m timeframes)
-6. **Decides** via Kimi K2.5 AI agent: ENTER_CALLS, ENTER_PUTS, EXIT_CALLS, EXIT_PUTS, or WAIT
-7. **Manages** positions with 12 exit triggers (target, stop, profit target, trailing stop, phase 0 momentum, TV flip, etc.)
-8. **Alerts** Discord with trade cards, signal changes, wall movements, and health heartbeats
-9. **Records** trade ideas to SQLite for historical analysis via the dashboard Ideas tab
+1. **Fetches** GEX data for SPXW, SPY, and QQQ in parallel via the Heatseeker API
+2. **Parses** gamma + vanna exposure across all strikes, identifies walls
+3. **Scores** directional bias (0-100) with EMA smoothing, wall classification, midpoint detection, air pocket quality
+4. **Analyzes** cross-market patterns (driver detection, alignment, stacked walls, rug setups, node slides, reshuffles)
+5. **Tracks** node touches, wall strength trends (GROWING/STABLE/WEAKENING/GONE), regime persistence, chop mode
+6. **Detects** entry patterns algorithmically (no AI needed): RUG_PULL, REVERSE_RUG, AIR_POCKET, KING_NODE_BOUNCE, PIKA_PILLOW, etc.
+7. **Enters** via Lane A (GEX-only patterns → live trades) after passing 12 entry quality gates
+8. **Manages** positions with 13 exit triggers (target, stop, profit target, trailing stop, momentum phases, TV flip, GEX flip, etc.)
+9. **Advises** via Kimi K2.5 AI agent — called ONLY when in a position, for exit advisory (requires structural confirmation)
+10. **Phantoms** blocked entries and Lane B (GEX+TV) signals as phantom trades for comparison
+11. **Alerts** Discord with trade cards, signal changes, wall movements, and health heartbeats
+12. **Snapshots** raw strike-level GEX data to SQLite for replay engine backtesting
+
+### Two-Lane Entry System
+
+Entries are fully algorithmic — no AI agent call needed. The system uses two lanes:
+
+- **Lane A (GEX-only)**: Detected patterns pass 4 structural gates (alignment, midpoint, min score, power hour) + 12 quality gates → live trades
+- **Lane B (GEX+TV)**: Same pattern detection + requires TradingView confirmation (min TV weight + indicator count) → phantom trades for performance comparison
+
+When a Lane A entry is blocked by quality gates, a phantom trade is created to track what would have happened. This data feeds into nightly reviews.
 
 ### Trade Management
 
-The system uses SPX-based P&L tracking (no live options pricing needed) with 12 exit triggers in priority order:
+The system uses SPX-based P&L tracking (no live options pricing needed) with 13 exit triggers in priority order:
 
 | # | Trigger | Type | Description |
 |---|---------|------|-------------|
 | 1 | TARGET_HIT | Immediate | SPX reached the target GEX wall |
-| 2 | STOP_HIT | Immediate | SPX broke through the stop level |
-| 3 | PROFIT_TARGET | Immediate | +0.15% SPX move (configurable) |
-| 4 | STOP_LOSS | Immediate | -0.20% adverse move (configurable) |
-| 5 | NODE_SUPPORT_BREAK | Immediate | Trend-aware: GONE = instant exit, WEAKENING = tighter buffer, GROWING = wider buffer |
-| 6 | OPPOSING_WALL | 3 min hold | Large positive wall ($5M+) materialized against position |
-| 7 | TV_FLIP | 3 min hold | 2+ opposing 3m TradingView signals |
-| 8 | MOMENTUM_TIMEOUT | Phase 0: 60s | Phase 0 catches dead trades at 60s; phases 1-3 at 5/10/15 min |
-| 9 | MAP_RESHUFFLE | 3 min hold | GEX map changed dramatically |
+| 2 | NODE_SUPPORT_BREAK | Immediate | Trend-aware: GONE = instant exit, WEAKENING = tighter buffer, GROWING = wider buffer |
+| 3 | STOP_HIT | Immediate | SPX broke through the stop level |
+| 4 | PROFIT_TARGET | Immediate | +0.15% SPX move (configurable) |
+| 5 | STOP_LOSS | Immediate | -0.20% adverse move (configurable) |
+| 6 | TV_COUNTER_FLIP | 3 min hold | Both Bravo AND Tango 3m flipped against position |
+| 7 | OPPOSING_WALL | 3 min hold | Large positive wall ($5M+) materialized against position |
+| 8 | MOMENTUM_TIMEOUT | Phase 0: 60s | Phase 0 catches dead trades (< 1pt after 60s); phases 1-3 at 5/10/15 min with progressive thresholds |
+| 9 | TV_FLIP | 3 min hold | 2+ opposing 3m TradingView signals (all 3m indicators, not just Bravo/Tango) |
 | 10 | TRAILING_STOP | 3 min hold | Activated after +8pt, trails 5pt behind best |
-| 11 | AGENT_EXIT | 3 min hold | AI agent recommends exit |
+| 11 | AGENT_EXIT | 3 min hold | AI agent recommends exit — requires structural confirmation (price near node, momentum stalled, or GEX score dropped) |
 | 12 | THETA_DEATH | Immediate | 3:30 PM ET cutoff for 0DTE |
+| 13 | GEX_FLIP | 3 min hold | GEX direction flipped against position with score above exit threshold |
 
-### Entry Guardrails
+Note: MAP_RESHUFFLE is detected and flagged for agent review but does not auto-exit.
 
-12 rules gate every entry signal from the AI agent:
+### Entry Quality Gates
 
-1. **TV Regime** — Pink Diamond = bearish regime (no calls until Blue Diamond)
-2. **Alignment + TV** — Need 2/3 ticker alignment or TV confirmation (configurable)
-3. **Re-entry cooldown** — 5 min after exiting same direction
-4. **Max trades/day** — 8 trades maximum
-5. **Min time between entries** — 5 min between any entries
+12 gates validate every algorithmic entry signal:
+
+1. **Entry spacing** — 60s minimum between any entries (configurable)
+2. **Blackout period** — No entries 9:30-9:33 AM ET (first 3 minutes of market open)
+3. **Consecutive loss cooldown** — 15 min cooldown after 2 consecutive same-direction losses
+4. **TV Regime** — Pink Diamond = bearish regime blocks calls; Blue Diamond = bullish regime blocks puts (Lane A skips this gate)
+5. **Re-entry cooldown** — Same spacing after exiting same direction
 6. **Direction stability** — Score must agree 3 consecutive cycles
 7. **Direction flip wait** — 4 cycles after a direction flip
-8. **Time gate** — No entries after 3:00 PM ET
-9. **Opening caution** — Score >= 85 and 3/3 alignment during 9:30-9:40 AM
+8. **Time gate** — No entries after 3:30 PM ET (configurable via `no_entry_after`)
+9. **Opening caution** — Score >= 85 and 3/3 alignment during 9:33-9:40 AM
 10. **Chop mode** — Score >= 80 required when chop detected (6+ direction flips or score stddev > 20)
-11. **Consecutive loss cooldown** — 15 min cooldown after 2 consecutive losses
+11. **Alignment** — Need 2/3 ticker alignment or high GEX score override (configurable)
 12. **Regime persistence** — Blocks entries against a persistent opposing GEX regime (36+ consecutive cycles)
 
 ### Self-Improvement Loop
 
-- **Nightly reviews** (2 AM ET): Kimi analyzes the day's trades, adjusts strategy parameters, creates new strategy version
+- **Nightly reviews** (4:10 PM ET, right after market close): Kimi analyzes the day's trades, adjusts strategy parameters, creates new strategy version, generates morning briefing
 - **Weekly reviews** (Sundays): Broader pattern analysis across the week
-- **Phantom trades**: When already in a position, alternative entries are tracked as "phantom" trades for comparison
+- **Phantom trades**: Blocked entries and Lane B signals tracked as phantom trades for comparison against live performance
+- **Phantom comparison**: After each trade close, compares live result against phantom alternatives
 - **Auto-rollback**: If a new strategy version underperforms, automatically reverts to the previous version
 - **Strategy versioning**: Every parameter change is versioned and auditable (40+ tunable params)
 - **Pattern outcome tracking**: 7-day rolling win rate and P&L by entry trigger pattern, fed into nightly reviews for data-backed trigger weight adjustments
@@ -111,8 +132,8 @@ Output includes trade log, P&L summary, pattern performance, and exit reason bre
 ### Chop Mode Detection
 
 The system tracks GEX score history over a 30-minute rolling window and detects market chop:
-- **Direction flips**: 6+ direction changes in 60 cycles = CHOP
-- **Score volatility**: Standard deviation > 20 = CHOP
+- **Direction flips**: 6+ direction changes in 60 cycles = CHOP (configurable)
+- **Score volatility**: Standard deviation > 20 = CHOP (configurable)
 - During chop: entries require GEX score >= 80, agent receives `market_mode` context
 - Dashboard shows a CHOP badge on the signal banner
 
@@ -120,15 +141,22 @@ The system tracks GEX score history over a 30-minute rolling window and detects 
 
 ```
 src/
-  agent/           Kimi K2.5 decision engine + system prompt + chat agent
+  agent/           Kimi K2.5 exit advisor + system prompt + chat agent
   alerts/          Discord webhook alerts + throttling
   backtest/        Replay engine for backtesting against stored GEX snapshots
   dashboard/       Express + WebSocket server for Next.js dashboard
   gex/             GEX parsing, scoring, multi-ticker analysis, node tracking
+    trinity.js       Multi-ticker parallel fetch (SPXW/SPY/QQQ)
+    multi-ticker-analyzer.js  Driver detection, alignment, stacked walls, rug setups, node slides
   pipeline/        Main polling loop + loop status
   review/          Nightly/weekly reviews, phantom engine, rollback, strategy store
+    phantom-engine.js  Post-trade phantom comparison
+    rollback-engine.js Strategy rollback triggers
   store/           SQLite database (better-sqlite3) + state management
-  trades/          Trade manager, target calculator, phantom tracker
+  trades/          Trade manager, entry engine, entry gates, phantom tracker
+    entry-engine.js   Lane A (GEX-only) + Lane B (GEX+TV) algorithmic entries
+    entry-gates.js    12 entry quality gates
+    entry-context.js  Support/ceiling node context for exit tracking
   tv/              TradingView webhook server + multi-indicator signal store
   utils/           Config, logger, market hours
 dashboard/         Next.js 14 dashboard (App Router + Tailwind)
@@ -144,10 +172,10 @@ claw               CLI tool for quick commands
 
 Real-time Next.js dashboard with WebSocket updates:
 
-- **Trading** — Signal banner, position card (active or last trade), GEX panel, TV grid, alert feed
+- **Trading** — Signal banner, position card (active or last trade), GEX panel, TV grid, alert feed, chop mode badge
 - **Ideas** — Scrollable feed and compact table of all trade ideas with date picker (historical browsing)
 - **Performance** — Trade log with P&L, win rate, and analytics
-- **Strategy** — Version history, wall map visualization
+- **Strategy** — Version history, wall map visualization, rollback history
 - **System** — Service health grid, connection status
 
 ## Setup
@@ -209,6 +237,8 @@ pm2 logs gexclaw
 | **Multi-Exp Wall Confirmation** | Walls with 50%+ extra GEX from non-0DTE expirations get confidence upgrades (structurally stronger) |
 | **Position-Aware Patterns** | Patterns opposing current position flagged for exit consideration rather than entry |
 | **GEX Regime Persistence** | Tracks consecutive same-direction cycles; 36+ cycles = persistent regime gates entries |
+| **EMA Score Smoothing** | Smoothed GEX score reduces noise from cycle-to-cycle variance |
+| **Spot Momentum** | 15-reading smoothed momentum tracking for trend confirmation |
 
 ## TradingView Indicators
 
@@ -217,16 +247,18 @@ pm2 logs gexclaw
 | Indicator | Timeframes | Weight | Description |
 |-----------|------------|--------|-------------|
 | **Echo** | 3m (SPX only) | 0.75 | Fastest early warning. Blue = bullish, Pink = bearish |
-| **Bravo** | 1m (0.75), 3m (1.0) | Primary | Confirmation indicator. Diamond signals set the TV regime |
+| **Bravo** | 1m (0.75), 3m (1.0) | Primary | Confirmation indicator. Diamond signals set the TV regime (Pink Diamond = bearish, Blue Diamond = bullish) |
 | **Tango** | 1m (1.0), 3m (1.5) | Highest | Slowest, highest conviction. When Tango confirms, confidence jumps |
 
 TV confidence levels: MASTER (3/3 SPX 3m agree), INTERMEDIATE (2/3), BEGINNER (1/3), NONE.
 
+Signal staleness: 1m signals expire after 3 min, 3m signals after 9 min.
+
 ## Tech Stack
 
 - **Runtime**: Node.js 20+ (ES modules)
-- **Database**: SQLite via better-sqlite3 (WAL mode, 7-day data retention)
-- **AI Agent**: Kimi K2.5 via Moonshot API (OpenAI-compatible)
+- **Database**: SQLite via better-sqlite3 (WAL mode, 7-day scored data + 30-day raw snapshots)
+- **AI Agent**: Kimi K2.5 via Moonshot API (OpenAI-compatible) — exit advisory only, entries are algorithmic
 - **Market Data**: Heatseeker (GEX), TradingView (technicals via webhooks)
 - **Dashboard**: Next.js 14, Tailwind CSS, WebSocket real-time updates
 - **Alerts**: Discord webhooks
