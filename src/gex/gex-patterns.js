@@ -31,11 +31,11 @@ const log = createLogger('Patterns');
  */
 export { allTickersShowSameSetup, detectNodePolarityFlips };
 
-export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches) {
+export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, nodeTrends) {
   if (!scored || !parsedData || !multiAnalysis) return [];
 
   const cfg = getActiveConfig() || {};
-  const ctx = { scored, parsedData, multiAnalysis, nodeTouches: nodeTouches || {}, cfg };
+  const ctx = { scored, parsedData, multiAnalysis, nodeTouches: nodeTouches || {}, cfg, nodeTrends: nodeTrends || new Map() };
 
   const patterns = [
     ...detectRugPull(ctx),
@@ -95,10 +95,21 @@ export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches
   return deduped;
 }
 
+// ---- Trend-based confidence adjustment ----
+
+function adjustConfidence(confidence, direction) {
+  const tiers = ['LOW', 'MEDIUM', 'HIGH'];
+  const idx = tiers.indexOf(confidence);
+  if (idx === -1) return confidence;
+  if (direction === 'upgrade' && idx < 2) return tiers[idx + 1];
+  if (direction === 'downgrade' && idx > 0) return tiers[idx - 1];
+  return confidence;
+}
+
 // ---- Pattern 1: Rug Pull (BEARISH) ----
 
 function detectRugPull(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg } = ctx;
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
   const rugSetups = multiAnalysis.rug_setups || [];
   const results = [];
 
@@ -119,6 +130,11 @@ function detectRugPull(ctx) {
     if (touches >= 2) confidence = 'HIGH'; // Wall weakened = rug more likely
     // Lower if spot is far from the setup
     if (distPct > 0.75) confidence = 'LOW';
+
+    // Trend adjustment: WEAKENING support = rug more likely, GROWING = less likely
+    const posTrend = nodeTrends.get(rug.posStrike);
+    if (posTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'upgrade');
+    else if (posTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'downgrade');
 
     // Target must be BELOW spot for bearish — use negStrike only if below, else nearest wall below
     const targetStrike = rug.negStrike < scored.spotPrice
@@ -144,7 +160,7 @@ function detectRugPull(ctx) {
 // ---- Pattern 2: Reverse Rug (BULLISH) ----
 
 function detectReverseRug(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg } = ctx;
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
   const rugSetups = multiAnalysis.rug_setups || [];
   const results = [];
 
@@ -161,6 +177,11 @@ function detectReverseRug(ctx) {
     if (scored.gexAtSpot < 0) confidence = 'HIGH';
     if (touches >= 2) confidence = 'HIGH';
     if (distPct > 0.75) confidence = 'LOW';
+
+    // Trend adjustment: GROWING floor = stronger setup, WEAKENING = floor dissolving
+    const posTrend = nodeTrends.get(rug.posStrike);
+    if (posTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+    else if (posTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
 
     // Target must be ABOVE spot for bullish — use negStrike only if above, else nearest wall above
     const targetStrike = rug.negStrike > scored.spotPrice
@@ -186,7 +207,7 @@ function detectReverseRug(ctx) {
 // ---- Pattern 3: King Node Bounce ----
 
 function detectKingNodeBounce(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg } = ctx;
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
   const kingNodes = multiAnalysis.king_nodes || {};
   const results = [];
   const maxTouches = cfg.pattern_king_node_max_touches ?? 1;
@@ -210,6 +231,11 @@ function detectKingNodeBounce(ctx) {
   if (kn.absGexValue < (scored.wallsAbove[0]?.absGexValue || 1) * 0.30) {
     confidence = 'LOW';
   }
+
+  // Trend adjustment: GROWING king = stronger rejection, WEAKENING = less likely to hold
+  const knTrend = nodeTrends.get(kn.strike);
+  if (knTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+  else if (knTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
 
   // Positive wall above → price bounces down (BEARISH)
   // Positive wall below → price bounces up (BULLISH)
@@ -240,7 +266,7 @@ function detectKingNodeBounce(ctx) {
 // ---- Pattern 4: Pika Pillow (BULLISH) ----
 
 function detectPikaPillow(ctx) {
-  const { scored, cfg } = ctx;
+  const { scored, cfg, nodeTrends } = ctx;
   const results = [];
 
   // Requires: positive floor below spot
@@ -263,6 +289,11 @@ function detectPikaPillow(ctx) {
   // Positive gamma at spot = less amplification → downgrade one tier
   if (scored.gexAtSpot >= 0 && confidence === 'HIGH') confidence = 'MEDIUM';
   else if (scored.gexAtSpot >= 0 && confidence === 'MEDIUM') confidence = 'LOW';
+
+  // Trend adjustment: GROWING pillow = strengthening, WEAKENING = dissolving
+  const floorTrend = nodeTrends.get(scored.floorWall.strike);
+  if (floorTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+  else if (floorTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
 
   const env = scored.gexAtSpot < 0 ? 'neg gamma' : 'pos gamma (reduced)';
 
@@ -348,7 +379,7 @@ function detectTripleCeilingFloor(ctx) {
 // ---- Pattern 6: Air Pocket ----
 
 function detectAirPocket(ctx) {
-  const { scored, parsedData, cfg } = ctx;
+  const { scored, parsedData, cfg, nodeTrends } = ctx;
   const results = [];
 
   if (!scored.targetWall) return results;
@@ -379,6 +410,11 @@ function detectAirPocket(ctx) {
     else if (confidence === 'MEDIUM') confidence = 'LOW';
   }
 
+  // Trend adjustment: GROWING magnet = stronger pull, WEAKENING = fading
+  const targetTrend = nodeTrends.get(scored.targetWall.strike);
+  if (targetTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+  else if (targetTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
+
   const tradeDirection = scored.direction;
   if (tradeDirection !== 'BULLISH' && tradeDirection !== 'BEARISH') return results;
 
@@ -402,7 +438,7 @@ function detectAirPocket(ctx) {
 // ---- Pattern 7: Range Edge Fade ----
 
 function detectRangeEdgeFade(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg } = ctx;
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
   const classifications = multiAnalysis.wall_classifications || [];
   const results = [];
   const maxTouches = cfg.pattern_range_fade_max_touches ?? 1;
@@ -432,6 +468,11 @@ function detectRangeEdgeFade(ctx) {
 
     let confidence = touches === 0 ? 'MEDIUM' : 'LOW';
     if (gk.size_pct > 0.50 && touches === 0) confidence = 'HIGH'; // Very large fresh gatekeeper
+
+    // Trend adjustment: GROWING gatekeeper = stronger rejection, WEAKENING = failing
+    const gkTrend = nodeTrends.get(gk.strike);
+    if (gkTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+    else if (gkTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
 
     results.push({
       pattern: 'RANGE_EDGE_FADE',

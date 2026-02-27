@@ -398,7 +398,7 @@ async function runCycle(phase) {
 
     // Always detect patterns (fast, algorithmic — <1ms)
     try {
-      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches());
+      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends);
       if (detectedPatterns.length > 0) {
         log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
         try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}

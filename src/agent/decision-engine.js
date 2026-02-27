@@ -112,16 +112,27 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
         walls_above: wallsAbove,
         walls_below: wallsBelow,
         wall_trends: trends,
-        top_nodes: [...parsedData.aggregatedGex.entries()]
-          .filter(([strike]) => Math.abs(strike - scored.spotPrice) <= 100)
-          .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
-          .slice(0, 10)
-          .map(([strike, value]) => ({
-            strike,
-            value,
-            type: value > 0 ? 'positive' : 'negative',
-            dist_from_spot: strike - scored.spotPrice,
-          })),
+        top_nodes: (() => {
+          const nt = trinityState?.spxw?.nodeTrends || new Map();
+          return [...parsedData.aggregatedGex.entries()]
+            .filter(([strike]) => Math.abs(strike - scored.spotPrice) <= 100)
+            .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+            .slice(0, 10)
+            .map(([strike, value]) => ({
+              strike,
+              value,
+              type: value > 0 ? 'positive' : 'negative',
+              dist_from_spot: strike - scored.spotPrice,
+              trend: nt.get(strike)?.trend || 'UNKNOWN',
+            }));
+        })(),
+        gone_nodes: (() => {
+          const nt = trinityState?.spxw?.nodeTrends || new Map();
+          return [...nt.entries()]
+            .filter(([, info]) => info.trend === 'GONE')
+            .map(([strike, info]) => ({ strike, last_value: info.prevValue10 }))
+            .slice(0, 5);
+        })(),
       },
       spy: spyState?.scored ? {
         score: spyState.scored.score,
@@ -188,7 +199,8 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
 
   // Detect GEX patterns for Lane A (pattern-based entries)
   const nodeTouches = getNodeTouches();
-  input.patterns_detected = detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches);
+  const spxwNodeTrends = trinityState?.spxw?.nodeTrends || new Map();
+  input.patterns_detected = detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, spxwNodeTrends);
   input.lane = 'A';
 
   // Add position context when in a trade
@@ -245,7 +257,8 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
     });
 
     // Still detect patterns even when agent is skipped (Lane B needs them)
-    const skippedPatterns = detectAllPatterns(scored, parsedData, multiAnalysis, getNodeTouches());
+    const skippedNodeTrends = trinityState?.spxw?.nodeTrends || new Map();
+    const skippedPatterns = detectAllPatterns(scored, parsedData, multiAnalysis, getNodeTouches(), skippedNodeTrends);
     return { changed: false, decision: lastDecision, skipped: true, patterns: skippedPatterns };
   }
 

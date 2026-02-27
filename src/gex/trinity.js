@@ -8,7 +8,7 @@ import { fetchGexData } from './gex-ingester.js';
 import { parseGexResponse, identifyWalls, getGexAtSpot } from './gex-parser.js';
 import { scoreSpxGex } from './gex-scorer.js';
 import { WALL_MIN_INDEX, WALL_MIN_QQQ, MULTI_TICKER } from './constants.js';
-import { saveGexRead, getGexHistory, detectWallTrends } from '../store/state.js';
+import { saveGexRead, getGexHistory, detectWallTrends, saveNodeSnapshot, getNodeTrends } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Trinity');
@@ -44,13 +44,15 @@ export async function fetchTrinityData() {
 
       // Save to per-ticker history and compute wall trends
       saveGexRead(parsed, ticker);
+      saveNodeSnapshot(walls, ticker);
       const history = getGexHistory(ticker);
       const wallTrends = history.length >= 2 ? detectWallTrends(walls, history) : [];
+      const nodeTrends = getNodeTrends(ticker);
 
       // Full scoring (same scorer as SPXW) — pass ticker for per-ticker gexAtSpot smoothing
       const scored = scoreSpxGex(parsed, wallTrends, 0, ticker);
 
-      results[ticker] = { raw, parsed, walls, scored, wallTrends };
+      results[ticker] = { raw, parsed, walls, scored, wallTrends, nodeTrends };
     } catch (err) {
       log.warn(`${ticker} fetch failed: ${err.message}`);
       results[ticker] = null;
@@ -87,7 +89,7 @@ export async function fetchTrinityData() {
  * Build a full ticker state object for dashboard + multi-ticker analyzer.
  */
 function buildTickerState(ticker, data) {
-  const { parsed, walls, scored, wallTrends } = data;
+  const { parsed, walls, scored, wallTrends, nodeTrends } = data;
   const spotPrice = parsed.spotPrice;
 
   // Get strikes around spot (±20 strikes) with their GEX values
@@ -147,6 +149,7 @@ function buildTickerState(ticker, data) {
     topWalls: walls.slice(0, 10),
     largestWall,
     wallTrends: wallTrends || [],
+    nodeTrends: nodeTrends || new Map(),
     // Advanced analysis data (Gaps 9, 10)
     aggregatedGex: parsed.aggregatedGex,  // 0DTE Map — for hedge node + wall classification
     allExpGex: parsed.allExpGex,          // All expirations Map — for hedge node detection

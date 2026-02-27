@@ -35,6 +35,10 @@ const DIRECTION_HISTORY_SIZE = 10;
 const scoreHistory = { SPXW: [], SPY: [], QQQ: [] };
 const SCORE_HISTORY_SIZE = 60; // 60 cycles = ~30 min
 
+// Node strength trending — rolling buffer of top 10 walls per cycle (~100s at 5s polling)
+const nodeHistory = { SPXW: [], SPY: [], QQQ: [] };
+const NODE_HISTORY_SIZE = 20;
+
 /**
  * Save a GEX read for trend detection (keeps last 3 in memory per ticker).
  * Also tracks spot price in ring buffer for momentum detection.
@@ -71,6 +75,108 @@ export function saveGexRead(parsedData, ticker = 'SPXW') {
   while (driftBuffer[ticker].length > MOMENTUM.DRIFT_LOOKBACK) {
     driftBuffer[ticker].shift();
   }
+}
+
+/**
+ * Save a node snapshot for trend detection (keeps last 20 cycles per ticker).
+ * Stores top 10 walls by absolute value with their strike and value.
+ * Called each cycle after identifyWalls().
+ */
+export function saveNodeSnapshot(walls, ticker = 'SPXW') {
+  if (!nodeHistory[ticker]) nodeHistory[ticker] = [];
+  if (!walls || walls.length === 0) return;
+
+  const top10 = [...walls]
+    .sort((a, b) => (b.absGexValue || Math.abs(b.gexValue || 0)) - (a.absGexValue || Math.abs(a.gexValue || 0)))
+    .slice(0, 10)
+    .map(w => ({
+      strike: w.strike,
+      value: w.absGexValue || Math.abs(w.gexValue || 0),
+      rawValue: w.gexValue || 0,
+    }));
+
+  nodeHistory[ticker].push({ timestamp: Date.now(), walls: top10 });
+  while (nodeHistory[ticker].length > NODE_HISTORY_SIZE) {
+    nodeHistory[ticker].shift();
+  }
+}
+
+/**
+ * Get node trends for a ticker by comparing current walls to 5 and 10 cycles ago.
+ * Returns Map<strike, { trend, currentValue, prevValue5, prevValue10, changePct10 }>
+ * Trends: GROWING (≥20% increase), WEAKENING (≥20% decrease), STABLE, NEW, GONE
+ */
+export function getNodeTrends(ticker = 'SPXW') {
+  const history = nodeHistory[ticker] || [];
+  const trends = new Map();
+
+  if (history.length < 2) return trends;
+
+  const current = history[history.length - 1];
+  const ago5 = history.length >= 6 ? history[history.length - 6] : null;
+  const ago10 = history.length >= 11 ? history[history.length - 11] : null;
+
+  // Build lookup maps for past snapshots
+  const map5 = new Map();
+  const map10 = new Map();
+  if (ago5) ago5.walls.forEach(w => map5.set(w.strike, w.value));
+  if (ago10) ago10.walls.forEach(w => map10.set(w.strike, w.value));
+
+  // Classify each current wall
+  for (const wall of current.walls) {
+    const prev5 = map5.get(wall.strike);
+    const prev10 = map10.get(wall.strike);
+
+    let trend;
+    let changePct10 = 0;
+
+    if (ago10 && prev10 === undefined) {
+      // Didn't exist 10 cycles ago
+      trend = 'NEW';
+    } else if (ago10 && prev10 !== undefined) {
+      changePct10 = prev10 > 0 ? ((wall.value - prev10) / prev10) : 0;
+
+      if (changePct10 >= 0.20) trend = 'GROWING';
+      else if (changePct10 <= -0.20) trend = 'WEAKENING';
+      else trend = 'STABLE';
+    } else if (ago5 && prev5 !== undefined) {
+      // Not enough history for 10-cycle, use 5-cycle with tighter thresholds
+      const changePct5 = prev5 > 0 ? ((wall.value - prev5) / prev5) : 0;
+      changePct10 = changePct5; // store what we have
+
+      if (changePct5 >= 0.10) trend = 'GROWING';
+      else if (changePct5 <= -0.10) trend = 'WEAKENING';
+      else trend = 'STABLE';
+    } else {
+      trend = 'NEW'; // Not enough history
+    }
+
+    trends.set(wall.strike, {
+      trend,
+      currentValue: wall.value,
+      prevValue5: prev5 ?? null,
+      prevValue10: prev10 ?? null,
+      changePct10: parseFloat(changePct10.toFixed(3)),
+    });
+  }
+
+  // Find GONE walls — existed 10 cycles ago but not in current snapshot
+  if (ago10) {
+    const currentStrikes = new Set(current.walls.map(w => w.strike));
+    for (const wall of ago10.walls) {
+      if (!currentStrikes.has(wall.strike)) {
+        trends.set(wall.strike, {
+          trend: 'GONE',
+          currentValue: 0,
+          prevValue5: map5.get(wall.strike) ?? null,
+          prevValue10: wall.value,
+          changePct10: -1,
+        });
+      }
+    }
+  }
+
+  return trends;
 }
 
 /**
@@ -354,6 +460,9 @@ export function resetDailyState() {
   scoreHistory.SPXW = [];
   scoreHistory.SPY = [];
   scoreHistory.QQQ = [];
+  nodeHistory.SPXW = [];
+  nodeHistory.SPY = [];
+  nodeHistory.QQQ = [];
 }
 
 /**
