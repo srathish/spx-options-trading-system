@@ -106,7 +106,9 @@ const V1_BASELINE = {
   // NODE_SUPPORT_BREAK exit
   node_break_buffer_pts: 2,
 
-  // MOMENTUM_TIMEOUT exit (3 phases)
+  // MOMENTUM_TIMEOUT exit (4 phases — phase 0 exempt from min hold)
+  momentum_phase0_seconds: 60,
+  momentum_phase0_min_pts: 1,
   momentum_min_hold_minutes: 3,
   momentum_phase1_minutes: 5,
   momentum_phase1_min_pts: 2,

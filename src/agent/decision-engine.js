@@ -13,7 +13,7 @@ import { detectVexConfluence } from '../gex/gex-parser.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
 import { isPowerHour, isOpexWeek, isOpexDay } from '../utils/market-hours.js';
-import { detectChopMode } from '../store/state.js';
+import { detectChopMode, getRegime } from '../store/state.js';
 
 const log = createLogger('Decision');
 
@@ -174,6 +174,7 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
       is_opex_week: isOpexWeek(),
       is_opex_day: isOpexDay(),
       market_mode: detectChopMode('SPXW'),
+      regime: getRegime('SPXW'),
     },
   };
 
@@ -200,7 +201,7 @@ function buildAgentInput(scored, parsedData, tvSnapshot, wallTrends, multiAnalys
   // Detect GEX patterns for Lane A (pattern-based entries)
   const nodeTouches = getNodeTouches();
   const spxwNodeTrends = trinityState?.spxw?.nodeTrends || new Map();
-  input.patterns_detected = detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, spxwNodeTrends);
+  input.patterns_detected = detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, spxwNodeTrends, getCurrentPosition()?.direction || null);
   input.lane = 'A';
 
   // Add position context when in a trade
@@ -258,7 +259,7 @@ export async function runDecisionCycle(scored, parsedData, wallTrends = [], mult
 
     // Still detect patterns even when agent is skipped (Lane B needs them)
     const skippedNodeTrends = trinityState?.spxw?.nodeTrends || new Map();
-    const skippedPatterns = detectAllPatterns(scored, parsedData, multiAnalysis, getNodeTouches(), skippedNodeTrends);
+    const skippedPatterns = detectAllPatterns(scored, parsedData, multiAnalysis, getNodeTouches(), skippedNodeTrends, getCurrentPosition()?.direction || null);
     return { changed: false, decision: lastDecision, skipped: true, patterns: skippedPatterns };
   }
 

@@ -53,7 +53,7 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   const momentum = getSpotMomentum(ticker);
 
   // Score both directions — use smoothed gexAtSpot for sign determination
-  const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot);
+  const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot, wallTrends);
   const bearish = scoreBearish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs, momentum, gexAtSpot);
 
   // Apply momentum — direction-conflict penalty with CHOP override
@@ -168,7 +168,7 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   };
 }
 
-function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs, momentum, rawGexAtSpot) {
+function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs, momentum, rawGexAtSpot, wallTrends) {
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
@@ -215,10 +215,12 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
   }
 
   // +20: Open air to target / no resistance above
+  let gotTrendBonus = false;
   if (targetWall) {
     const hasOpenAir = checkOpenAir(spotPrice, targetWall.strike, 'above', data.aggregatedGex, data.strikes, targetWall.absGexValue);
     if (hasOpenAir) {
       score += SCORE.OPEN_AIR;
+      gotTrendBonus = true;
       breakdown.push('+20: Open air to target (no blocking walls)');
     }
   } else if (hasUnobstructedUpside) {
@@ -234,7 +236,18 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
     }
     if (!blocked) {
       score += SCORE.OPEN_AIR;
+      gotTrendBonus = true;
       breakdown.push('+20: Open air above — no significant positive GEX resistance');
+    }
+  }
+
+  // +20: Target wall growing between reads (wall trend confirmation)
+  if (wallTrends && targetWall) {
+    const growing = wallTrends.find(t => t.type === 'WALL_GROWTH' && t.wall.strike === targetWall.strike);
+    if (growing && !gotTrendBonus) {
+      score += SCORE.OPEN_AIR;
+      gotTrendBonus = true;
+      breakdown.push(`+20: Target wall growing (${(growing.growthPct * 100).toFixed(0)}% increase)`);
     }
   }
 

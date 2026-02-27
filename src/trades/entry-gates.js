@@ -6,7 +6,7 @@
 
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
-import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, detectChopMode } from '../store/state.js';
+import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, detectChopMode, getRegime } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -115,6 +115,12 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const chopResult = detectChopMode('SPXW', cfg.chop_lookback_cycles || 60);
   if (chopResult.isChop && scored.score < (cfg.gex_strong_score || 80)) {
     return { allowed: false, reason: `Chop mode (${chopResult.reason}) — need score >= ${cfg.gex_strong_score || 80}, got ${scored.score}` };
+  }
+
+  // Gate 12: Regime conflict — don't enter against a persistent opposing regime
+  const regime = getRegime('SPXW');
+  if (regime.persistent && regime.direction !== direction) {
+    return { allowed: false, reason: `Persistent ${regime.direction} regime (${regime.cycles} cycles, ${regime.minutes}m) — blocks ${direction} entry` };
   }
 
   return { allowed: true };

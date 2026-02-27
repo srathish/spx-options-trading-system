@@ -19,7 +19,7 @@ import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
-import { resetDailyState, updateLatestSpot, recordScore, detectChopMode } from '../store/state.js';
+import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
@@ -219,8 +219,9 @@ async function runCycle(phase) {
     lastScore = scored.score;
     updateLoopStatus({ cycleCount, lastSpot, lastScore, lastDirection: scored.direction });
 
-    // Record score for chop detection
+    // Record score for chop detection + regime tracking
     recordScore('SPXW', scored.score, scored.direction);
+    updateRegime('SPXW', scored.direction);
 
     // Dashboard: emit GEX update (include full analysis data for trade idea)
     try {
@@ -398,7 +399,7 @@ async function runCycle(phase) {
 
     // Always detect patterns (fast, algorithmic — <1ms)
     try {
-      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends);
+      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends, getCurrentPosition()?.direction || null);
       if (detectedPatterns.length > 0) {
         log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
         try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}

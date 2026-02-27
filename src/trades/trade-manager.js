@@ -10,6 +10,7 @@ import {
 } from '../store/db.js';
 import { nowET } from '../utils/market-hours.js';
 import { getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
+import { getNodeTrends } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('TradeManager');
@@ -168,11 +169,22 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   }
 
   // 3a2. NODE_SUPPORT_BREAK — price broke past the structural node that defined the trade thesis
+  // Trend-aware: WEAKENING node → tighter buffer, GONE → immediate exit, GROWING → wider buffer
   if (currentPosition.entryContext) {
     const ctx = currentPosition.entryContext;
-    const buffer = cfg.node_break_buffer_pts ?? 2;
+    const nodeTrends = getNodeTrends('SPXW');
+    let buffer = cfg.node_break_buffer_pts ?? 2;
 
     if (isBullish && ctx.support_node?.strike) {
+      const trend = nodeTrends.get(ctx.support_node.strike);
+      if (trend?.trend === 'GONE') {
+        result.exitTriggered = true;
+        result.exitReason = 'NODE_SUPPORT_BREAK';
+        log.warn(`Support node ${ctx.support_node.strike} GONE — exiting`);
+        return result;
+      }
+      if (trend?.trend === 'WEAKENING') buffer = 0;
+      else if (trend?.trend === 'GROWING') buffer += 1;
       if (currentSpot < ctx.support_node.strike - buffer) {
         result.exitTriggered = true;
         result.exitReason = 'NODE_SUPPORT_BREAK';
@@ -180,6 +192,15 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
       }
     }
     if (!isBullish && ctx.ceiling_node?.strike) {
+      const trend = nodeTrends.get(ctx.ceiling_node.strike);
+      if (trend?.trend === 'GONE') {
+        result.exitTriggered = true;
+        result.exitReason = 'NODE_SUPPORT_BREAK';
+        log.warn(`Ceiling node ${ctx.ceiling_node.strike} GONE — exiting`);
+        return result;
+      }
+      if (trend?.trend === 'WEAKENING') buffer = 0;
+      else if (trend?.trend === 'GROWING') buffer += 1;
       if (currentSpot > ctx.ceiling_node.strike + buffer) {
         result.exitTriggered = true;
         result.exitReason = 'NODE_SUPPORT_BREAK';
@@ -263,7 +284,27 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  // 3e2. MOMENTUM_TIMEOUT — 3 progressive phases of stall detection
+  // 3e2. MOMENTUM_TIMEOUT — 4 progressive phases of stall detection
+  // Phase 0 fires at 60s (exempt from min hold) to catch dead entries early
+  if (currentPosition.entrySpx && currentSpot) {
+    const holdSeconds = holdTimeMs / 1_000;
+    const phase0Seconds = cfg.momentum_phase0_seconds ?? 60;
+    const phase0MinPts = cfg.momentum_phase0_min_pts ?? 1;
+    const phase1MinSeconds = (cfg.momentum_phase1_minutes ?? 5) * 60;
+
+    if (holdSeconds >= phase0Seconds && holdSeconds < phase1MinSeconds) {
+      const moveInDirection = isBullish
+        ? currentSpot - currentPosition.entrySpx
+        : currentPosition.entrySpx - currentSpot;
+      if (moveInDirection < phase0MinPts) {
+        result.exitTriggered = true;
+        result.exitReason = 'MOMENTUM_TIMEOUT';
+        log.info(`Phase 0 timeout: ${moveInDirection.toFixed(1)}pts < ${phase0MinPts}pts after ${holdSeconds.toFixed(0)}s`);
+        return result;
+      }
+    }
+  }
+
   if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
     const holdMinutes = holdTimeMs / 60_000;
     const spxProgress = isBullish

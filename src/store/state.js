@@ -39,6 +39,13 @@ const SCORE_HISTORY_SIZE = 60; // 60 cycles = ~30 min
 const nodeHistory = { SPXW: [], SPY: [], QQQ: [] };
 const NODE_HISTORY_SIZE = 20;
 
+// GEX regime persistence — tracks consecutive same-direction cycles
+const regimeState = {
+  SPXW: { direction: null, startedAt: 0, cycles: 0 },
+  SPY: { direction: null, startedAt: 0, cycles: 0 },
+  QQQ: { direction: null, startedAt: 0, cycles: 0 },
+};
+
 /**
  * Save a GEX read for trend detection (keeps last 3 in memory per ticker).
  * Also tracks spot price in ring buffer for momentum detection.
@@ -448,6 +455,36 @@ export function getLatestSpot() {
 }
 
 /**
+ * Update GEX regime for a ticker. Call each cycle with the scored direction.
+ * Tracks consecutive same-direction cycles for regime persistence detection.
+ */
+export function updateRegime(ticker, direction) {
+  if (!regimeState[ticker]) regimeState[ticker] = { direction: null, startedAt: 0, cycles: 0 };
+  if (direction === regimeState[ticker].direction) {
+    regimeState[ticker].cycles++;
+  } else {
+    regimeState[ticker] = { direction, startedAt: Date.now(), cycles: 1 };
+  }
+}
+
+/**
+ * Get regime state for a ticker.
+ * Returns { direction, persistent, cycles, minutes }.
+ * persistent = true if same direction for 36+ cycles (~3 min at 5s polling).
+ */
+export function getRegime(ticker = 'SPXW') {
+  const r = regimeState[ticker];
+  if (!r || !r.direction) return { direction: null, persistent: false, cycles: 0, minutes: 0 };
+  const minutes = (Date.now() - r.startedAt) / 60_000;
+  return {
+    direction: r.direction,
+    persistent: r.cycles >= 36,
+    cycles: r.cycles,
+    minutes: Math.round(minutes),
+  };
+}
+
+/**
  * Reset daily state (call at 9:25 AM ET before warm-up).
  */
 export function resetDailyState() {
@@ -463,6 +500,9 @@ export function resetDailyState() {
   nodeHistory.SPXW = [];
   nodeHistory.SPY = [];
   nodeHistory.QQQ = [];
+  regimeState.SPXW = { direction: null, startedAt: 0, cycles: 0 };
+  regimeState.SPY = { direction: null, startedAt: 0, cycles: 0 };
+  regimeState.QQQ = { direction: null, startedAt: 0, cycles: 0 };
 }
 
 /**

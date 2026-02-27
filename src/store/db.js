@@ -820,6 +820,27 @@ export function getTradesByTrigger(trigger, dateStr) {
   return db.prepare("SELECT * FROM trades WHERE entry_trigger = ? AND opened_at LIKE ? || '%' ORDER BY id ASC").all(trigger, dateStr);
 }
 
+/**
+ * Get rolling pattern performance over multiple days.
+ * Returns win rate, avg P&L by entry_trigger pattern.
+ */
+export function getPatternPerformance(daysBack = 7) {
+  return db.prepare(`
+    SELECT entry_trigger,
+           COUNT(*) as total,
+           SUM(CASE WHEN pnl_dollars > 0 THEN 1 ELSE 0 END) as wins,
+           SUM(CASE WHEN pnl_dollars <= 0 THEN 1 ELSE 0 END) as losses,
+           ROUND(AVG(pnl_pct), 2) as avg_pnl_pct,
+           ROUND(AVG(CASE WHEN pnl_dollars > 0 THEN pnl_pct ELSE NULL END), 2) as avg_win_pct,
+           ROUND(AVG(CASE WHEN pnl_dollars <= 0 THEN pnl_pct ELSE NULL END), 2) as avg_loss_pct
+    FROM trades
+    WHERE entry_trigger IS NOT NULL
+      AND closed_at IS NOT NULL
+      AND opened_at >= datetime('now', '-' || ? || ' days')
+    GROUP BY entry_trigger
+  `).all(daysBack);
+}
+
 export function cleanupOldData(daysToKeep = 7) {
   const cutoff = formatET(nowET().minus({ days: daysToKeep }));
   const tables = ['gex_snapshots', 'wall_trends', 'alerts', 'health', 'predictions', 'tv_signal_log', 'decisions', 'multi_ticker_analysis'];

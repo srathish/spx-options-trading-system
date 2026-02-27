@@ -31,7 +31,7 @@ const log = createLogger('Patterns');
  */
 export { allTickersShowSameSetup, detectNodePolarityFlips };
 
-export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, nodeTrends) {
+export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, nodeTrends, currentDirection) {
   if (!scored || !parsedData || !multiAnalysis) return [];
 
   const cfg = getActiveConfig() || {};
@@ -88,8 +88,42 @@ export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches
     }
   }
 
+  // Fix 1: Resolve directional conflicts (e.g. RUG_PULL bearish + REVERSE_RUG bullish)
+  const bullishPatterns = deduped.filter(p => p.direction === 'BULLISH');
+  const bearishPatterns = deduped.filter(p => p.direction === 'BEARISH');
+  if (bullishPatterns.length > 0 && bearishPatterns.length > 0) {
+    const favored = scored.direction; // GEX structural direction as tiebreaker
+    for (const p of deduped) {
+      if (p.direction !== favored && favored !== 'CHOP' && favored !== 'NEUTRAL') {
+        p.confidence = adjustConfidence(p.confidence, 'downgrade');
+        p.conflicting = true;
+        p.reasoning += ` [CONFLICTING: GEX favors ${favored}]`;
+      }
+    }
+    // Re-sort after adjustment
+    deduped.sort((a, b) => (order[a.confidence] || 2) - (order[b.confidence] || 2));
+  }
+
+  // Fix 5: Multi-expiration wall strength — upgrade confidence if key wall has non-0DTE confirmation
+  for (const p of deduped) {
+    const keyStrike = getPatternKeyStrike(p);
+    if (keyStrike && hasMultiExpConfirmation(keyStrike, parsedData.aggregatedGex, parsedData.allExpGex)) {
+      p.confidence = adjustConfidence(p.confidence, 'upgrade');
+      p.reasoning += ' [MULTI-EXP confirmed]';
+    }
+  }
+
+  // Fix 6: Flag patterns opposing current position direction
+  if (currentDirection) {
+    for (const p of deduped) {
+      if (p.direction !== currentDirection) {
+        p.opposing_position = true;
+      }
+    }
+  }
+
   if (deduped.length > 0) {
-    log.debug(`Detected ${deduped.length} pattern(s): ${deduped.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
+    log.debug(`Detected ${deduped.length} pattern(s): ${deduped.map(p => `${p.pattern}(${p.direction}${p.conflicting ? ' CONFLICT' : ''})`).join(', ')}`);
   }
 
   return deduped;
@@ -104,6 +138,28 @@ function adjustConfidence(confidence, direction) {
   if (direction === 'upgrade' && idx < 2) return tiers[idx + 1];
   if (direction === 'downgrade' && idx > 0) return tiers[idx - 1];
   return confidence;
+}
+
+// ---- Multi-Expiration Confirmation (Fix 5) ----
+
+function hasMultiExpConfirmation(strike, aggregatedGex, allExpGex) {
+  if (!allExpGex) return false;
+  const odteValue = Math.abs(aggregatedGex.get(strike) || 0);
+  const allValue = Math.abs(allExpGex.get(strike) || 0);
+  if (odteValue < 1_000_000) return false; // Too small to matter
+  return allValue / odteValue >= 1.5; // 50%+ extra from other expirations
+}
+
+function getPatternKeyStrike(pattern) {
+  switch (pattern.pattern) {
+    case 'RUG_PULL': return pattern.walls?.pos;
+    case 'REVERSE_RUG': return pattern.walls?.pos;
+    case 'KING_NODE_BOUNCE': return pattern.walls?.king;
+    case 'PIKA_PILLOW': return pattern.walls?.floor;
+    case 'AIR_POCKET': return pattern.walls?.target;
+    case 'RANGE_EDGE_FADE': return pattern.walls?.gatekeeper;
+    default: return null;
+  }
 }
 
 // ---- Pattern 1: Rug Pull (BEARISH) ----

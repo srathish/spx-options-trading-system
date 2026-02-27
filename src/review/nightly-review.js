@@ -12,7 +12,7 @@ import {
   getTradesByDateRange, getTradesForVersion,
   getRecentPhantomComparisons, getRecentClosedTrades,
   getDecisionsByDate, getGexSnapshotsByDate, getTvSignalLogByDate,
-  getAllVersions, getTradesByLane,
+  getAllVersions, getTradesByLane, getPatternPerformance,
 } from '../store/db.js';
 import {
   getActiveConfig, getActiveVersionNumber, getVersionLabel,
@@ -305,6 +305,7 @@ export function buildReviewInput() {
       } : null,
       lane_comparison: buildLaneComparison(todayStr),
       trigger_effectiveness: buildTriggerEffectiveness(todayStr),
+      pattern_performance_7d: getPatternPerformance(7),
     },
   };
 }
