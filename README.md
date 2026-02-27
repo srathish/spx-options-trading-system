@@ -82,6 +82,18 @@ The system uses SPX-based P&L tracking (no live options pricing needed) with 12 
 - **Auto-rollback**: If a new strategy version underperforms, automatically reverts to the previous version
 - **Strategy versioning**: Every parameter change is versioned and auditable (40+ tunable params)
 - **Pattern outcome tracking**: 7-day rolling win rate and P&L by entry trigger pattern, fed into nightly reviews for data-backed trigger weight adjustments
+- **Replay engine**: Full-day backtesting against stored raw GEX snapshots — test strategy changes in minutes instead of waiting for live market sessions
+
+### Replay Engine
+
+Every cycle, the system stores raw strike-level GEX data (aggregatedGex, allExpGex, nearTermGex, vexMap) for SPXW, SPY, and QQQ. The replay engine reads these snapshots and drives the full pipeline — scoring, pattern detection, entry gates, exit triggers — using the current active strategy config.
+
+```bash
+./claw replay 2026-02-28       # Replay a specific date
+./claw replay                  # Show available dates
+```
+
+Output includes trade log, P&L summary, pattern performance, and exit reason breakdown. Change a strategy parameter, re-run replay, compare results instantly.
 
 ### Chop Mode Detection
 
@@ -97,6 +109,7 @@ The system tracks GEX score history over a 30-minute rolling window and detects 
 src/
   agent/           Kimi K2.5 decision engine + system prompt + chat agent
   alerts/          Discord webhook alerts + throttling
+  backtest/        Replay engine for backtesting against stored GEX snapshots
   dashboard/       Express + WebSocket server for Next.js dashboard
   gex/             GEX parsing, scoring, multi-ticker analysis, node tracking
   pipeline/        Main polling loop + loop status
@@ -155,11 +168,12 @@ pm2 logs gexclaw
 
 # CLI shortcuts
 ./claw status        # System status
-./claw score         # Current GEX score
-./claw decision      # Latest agent decision
-./claw trades        # Trade history
+./claw gex           # Latest GEX snapshot
 ./claw health        # Health check
 ./claw strategy      # Current strategy version
+./claw replay <date> # Replay a day through current strategy
+./claw review        # Run manual nightly review
+./claw briefing      # Show latest morning briefing
 ```
 
 ## GEX Analysis Features

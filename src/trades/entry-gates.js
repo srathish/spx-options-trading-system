@@ -34,7 +34,7 @@ let consecutiveLossCooldownUntil = { BULLISH: 0, BEARISH: 0 };
 export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const direction = action === 'ENTER_CALLS' ? 'BULLISH' : 'BEARISH';
   const cfg = getActiveConfig() || {};
-  const etNow = nowET();
+  const etNow = opts.timeOverride || nowET();
   const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
 
   // Gate 1: 60s minimum spacing between ANY entries

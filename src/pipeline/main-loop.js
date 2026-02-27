@@ -18,7 +18,7 @@ import { scoreSpxGex } from '../gex/gex-scorer.js';
 import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
-import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
+import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, saveRawSnapshot, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
 import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
@@ -58,6 +58,7 @@ let lastScore = null;
 let loopTimer = null;
 let reviewTimer = null;
 let eodSummaryTimer = null;
+let dailyCycleIndex = 0;
 let eodSummarySentDate = null;
 let nightlyReviewDate = null;
 let running = false;
@@ -213,6 +214,30 @@ async function runCycle(phase) {
     // Save SPXW to DB (history is saved per-ticker inside fetchTrinityData)
     saveSnapshot(scored);
     try { saveMultiAnalysis(multiAnalysis, trinityState); } catch (_) {}
+
+    // Save raw GEX snapshots for replay engine
+    dailyCycleIndex++;
+    try {
+      const tvSnapshotForCapture = getSignalSnapshot();
+      saveRawSnapshot({
+        ticker: 'SPXW', spotPrice: parsed.spotPrice, parsedData: parsed,
+        walls, multiAnalysis, tvSnapshot: tvSnapshotForCapture,
+        scoredDirection: scored.direction, scoredScore: scored.score,
+        cycleIndex: dailyCycleIndex,
+      });
+      for (const [ticker, data] of [['SPY', trinity.spy], ['QQQ', trinity.qqq]]) {
+        if (data) {
+          saveRawSnapshot({
+            ticker, spotPrice: data.parsed.spotPrice, parsedData: data.parsed,
+            walls: data.walls, multiAnalysis: null, tvSnapshot: null,
+            scoredDirection: data.scored.direction, scoredScore: data.scored.score,
+            cycleIndex: dailyCycleIndex,
+          });
+        }
+      }
+    } catch (snapErr) {
+      log.warn(`Raw snapshot save failed: ${snapErr.message}`);
+    }
 
     // Track state
     lastSpot = parsed.spotPrice;
@@ -882,7 +907,8 @@ function scheduleDailyReset() {
     resetNodeTouches();
     resetDailyState();
     resetDailyGates();
-    log.info('Daily reset: node tracker, smoothing, entry gates');
+    dailyCycleIndex = 0;
+    log.info('Daily reset: node tracker, smoothing, entry gates, cycle index');
 
     // Reschedule for next day
     scheduleDailyReset();
