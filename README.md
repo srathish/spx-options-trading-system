@@ -6,16 +6,16 @@ Autonomous SPX 0DTE options trading system. Analyzes gamma exposure (GEX) data f
 
 ```
 Heatseeker API ──┐
-  (SPXW/SPY/QQQ) │    ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-                  ├───>│  GEX Engine  ├───>│  Decision    ├───>│  Trade Exec │
-TradingView ─────┤    │  (scoring +  │    │  Engine      │    │  (SPX-based │
-  (Echo/Bravo/   │    │  multi-ticker│    │  (Kimi K2.5) │    │   P&L)      │
-   Tango)        │    │  analysis)   │    └──────┬───────┘    └──────┬──────┘
-                  │    └──────┬──────┘           │                    │
-                  │           │                   v                    v
+  (SPXW/SPY/QQQ) │     ┌───────────── ┐    ┌──────────────┐    ┌─────────────┐
+                 ├───> │  GEX Engine  ├───>│  Decision    ├───>│  Trade Exec │
+TradingView ─────┤     │  (scoring +  │    │  Engine      │    │  (SPX-based │
+  (Echo/Bravo/   │     │  multi-ticker│    │  (Kimi K2.5) │    │   P&L)      │
+   Tango)        │     │  analysis)   │    └──────┬───────┘    └──────┬──────┘
+                  │    └──────┬────── ┘           │                   │
+                  │           │                   v                   v
                   │           │            ┌─────────────┐    ┌──────────────┐
-                  │           │            │  Discord     │    │  Dashboard   │
-                  │           │            │  Alerts      │    │  (Next.js)   │
+                  │           │            │  Discord    │    │  Dashboard   │
+                  │           │            │  Alerts     │    │  (Next.js)   │
                   │           │            └─────────────┘    └──────────────┘
                   │           │
                   │           v
