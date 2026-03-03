@@ -618,6 +618,8 @@ export async function sendTradeClosed(result) {
     AGENT_EXIT: 'Agent Exit Signal',
     THETA_DEATH: 'Theta Death (3:30 PM)',
     GEX_FLIP: 'GEX Direction Flip',
+    TREND_FLOOR_BREAK: 'Trend Floor Break',
+    STACK_DISPERSED: 'Stack Dispersed',
   };
 
   const laneLabel = result.strategyLane ? ` | Lane ${result.strategyLane}` : '';
