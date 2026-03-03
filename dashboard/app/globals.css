@@ -33,3 +33,9 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
 }
+
+/* Backtest progress bar shimmer */
+@keyframes shimmer {
+  0% { transform: translateX(-150%); }
+  100% { transform: translateX(450%); }
+}

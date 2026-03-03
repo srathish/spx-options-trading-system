@@ -19,13 +19,13 @@ import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, saveRawSnapshot, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
-import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime } from '../store/state.js';
+import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime, saveKingNode, getNodeSignChanges, getKingNodeFlip } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
 import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
 import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
-import { checkGexOnlyEntry, checkLaneBEntry } from '../trades/entry-engine.js';
+import { checkGexOnlyEntry, checkLaneBEntry, checkTrendPullbackEntry } from '../trades/entry-engine.js';
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
@@ -42,6 +42,7 @@ import { runNightlyReview } from '../review/nightly-review.js';
 import { runWeeklyReview } from '../review/weekly-review.js';
 import { generateMorningBriefing } from '../review/morning-briefing.js';
 import { updateNodeTouches, resetNodeTouches } from '../gex/node-tracker.js';
+import { updateTrendBuffer, detectTrendDay, getTrendState, resetTrendDetector } from '../store/trend-detector.js';
 
 const log = createLogger('MainLoop');
 
@@ -215,6 +216,10 @@ async function runCycle(phase) {
     saveSnapshot(scored);
     try { saveMultiAnalysis(multiAnalysis, trinityState); } catch (_) {}
 
+    // Save king node for type flip detection
+    const spxwKingNode = multiAnalysis.king_nodes?.SPXW;
+    if (spxwKingNode) saveKingNode(spxwKingNode, 'SPXW');
+
     // Save raw GEX snapshots for replay engine
     dailyCycleIndex++;
     try {
@@ -245,8 +250,17 @@ async function runCycle(phase) {
     updateLoopStatus({ cycleCount, lastSpot, lastScore, lastDirection: scored.direction });
 
     // Record score for chop detection + regime tracking
-    recordScore('SPXW', scored.score, scored.direction);
+    recordScore('SPXW', scored.score, scored.direction, scored.spotPrice);
     updateRegime('SPXW', scored.direction);
+
+    // Trend day detection
+    const cfg = getActiveConfig() || {};
+    updateTrendBuffer(scored, cfg);
+    const trendState = detectTrendDay();
+    if (trendState.isTrend) {
+      log.info(`TREND: ${trendState.direction} (${trendState.strength}) | floor=${trendState.supportFloor?.strike || '?'} ceiling=${trendState.resistanceCeiling?.strike || '?'}`);
+      try { dashboardEmitter.emit('trend_update', trendState); } catch (_) {}
+    }
 
     // Dashboard: emit GEX update (include full analysis data for trade idea)
     try {
@@ -424,7 +438,9 @@ async function runCycle(phase) {
 
     // Always detect patterns (fast, algorithmic — <1ms)
     try {
-      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends, getCurrentPosition()?.direction || null);
+      const nodeSignChanges = getNodeSignChanges('SPXW');
+      const kingNodeFlip = getKingNodeFlip('SPXW');
+      detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends, getCurrentPosition()?.direction || null, nodeSignChanges, kingNodeFlip);
       if (detectedPatterns.length > 0) {
         log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
         try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}
@@ -473,13 +489,13 @@ async function runCycle(phase) {
       // A. If position OPEN → manage cycle (exit triggers, P&L updates)
       if (posState !== 'FLAT') {
         const tvSnapshotForExit = getSignalSnapshot();
-        const mgmt = managePosition(parsed.spotPrice, scored, agentAction, { tvSnapshot: tvSnapshotForExit, multiAnalysis });
+        const mgmt = managePosition(parsed.spotPrice, scored, agentAction, { tvSnapshot: tvSnapshotForExit, multiAnalysis, trendState: getTrendState() });
 
         if (mgmt.exitTriggered) {
           const result = exitPosition(mgmt.exitReason, parsed.spotPrice);
           if (result) {
             // Track exit for entry gates (loss streaks, re-entry cooldown)
-            recordExitForGates(result.direction, result.spxChange <= 0);
+            recordExitForGates(result.direction, result.spxChange <= 0, undefined, result.entryTrigger);
 
             await sendTradeClosed(result);
             try { dashboardEmitter.emit('trade_closed', result); } catch (_) {}
@@ -525,19 +541,21 @@ async function runCycle(phase) {
       // B. If FLAT → algorithmic Lane A entry (GEX-only, no agent call needed)
       if (getPositionState() === 'FLAT' && detectedPatterns.length > 0) {
         const nodeTouches = getNodeTouches();
-        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+        const currentTrendState = getTrendState();
+        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches, trendState: currentTrendState };
         const laneAResult = checkGexOnlyEntry(entryState);
 
         if (laneAResult?.shouldEnter) {
-          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis, { lane: 'A' });
+          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis, { lane: 'A', pattern: laneAResult.trigger.pattern, trendState: currentTrendState });
           if (guardrail.allowed) {
             const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
             await handleTradeEntry(laneAResult.action, parsed, scored, wallTrends, {
               strategyLane: 'A',
               entryTrigger: laneAResult.trigger.pattern,
               entryContext,
+              entryConfidence: laneAResult.confidence,
             });
-            recordEntryForGates();
+            recordEntryForGates(undefined, laneAResult.trigger.pattern);
           } else {
             log.warn(`Lane A entry BLOCKED: ${laneAResult.action} — ${guardrail.reason}`);
             // Create phantom trade for gate-blocked entries so we can track what would have happened
@@ -579,10 +597,55 @@ async function runCycle(phase) {
         }
       }
 
+      // B2. Trend pullback entry (only when Lane A didn't fire and we're FLAT)
+      if (getPositionState() === 'FLAT') {
+        const currentTrend = getTrendState();
+        if (currentTrend.isTrend) {
+          const pullbackResult = checkTrendPullbackEntry({ scored, multiAnalysis, nodeTouches: getNodeTouches() }, currentTrend);
+          if (pullbackResult?.shouldEnter) {
+            const guardrail = checkEntryGates(pullbackResult.action, scored, multiAnalysis,
+              { lane: 'A', pattern: 'TREND_PULLBACK', trendState: currentTrend });
+            if (guardrail.allowed) {
+              const entryContext = buildEntryContext(pullbackResult.trigger, scored, multiAnalysis);
+              await handleTradeEntry(pullbackResult.action, parsed, scored, wallTrends, {
+                strategyLane: 'A',
+                entryTrigger: 'TREND_PULLBACK',
+                entryContext,
+                entryConfidence: pullbackResult.confidence,
+              });
+              recordEntryForGates(undefined, 'TREND_PULLBACK');
+            } else {
+              log.warn(`Trend pullback entry BLOCKED: ${pullbackResult.action} — ${guardrail.reason}`);
+              // Phantom for blocked trend pullback
+              try {
+                const direction = pullbackResult.trigger.direction;
+                const spotPrice = parsed.spotPrice;
+                const atm = Math.round(spotPrice / 5) * 5;
+                const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+                const optType = direction === 'BULLISH' ? 'C' : 'P';
+                const contract = `SPX${expDate}${optType}${atm}`;
+                const entryContext = buildEntryContext(pullbackResult.trigger, scored, multiAnalysis);
+                recordPhantom({
+                  contract, direction, strike: atm, entryPrice: 0, entrySpx: spotPrice,
+                  targetPrice: 0, stopPrice: 0,
+                  targetSpx: pullbackResult.trigger.target_strike,
+                  stopSpx: pullbackResult.trigger.stop_strike,
+                  greeks: { delta: 0, gamma: 0, theta: 0, vega: 0, iv: 0 },
+                  gexState: { score: scored.score, direction: scored.direction },
+                  tvState: getSignalSnapshot(),
+                  agentReasoning: `Trend pullback blocked: ${guardrail.reason}`,
+                  strategyLane: 'A', entryTrigger: 'TREND_PULLBACK', entryContext,
+                });
+              } catch (_) {}
+            }
+          }
+        }
+      }
+
       // C. If NOT FLAT + Lane A pattern fires → phantom trade (Lane A skipped signal)
       if (getPositionState() !== 'FLAT' && detectedPatterns.length > 0 && shouldBePhantom()) {
         const nodeTouches = getNodeTouches();
-        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+        const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches, trendState: getTrendState() };
         const laneAResult = checkGexOnlyEntry(entryState);
 
         if (laneAResult?.shouldEnter) {
@@ -620,11 +683,11 @@ async function runCycle(phase) {
       if (detectedPatterns.length > 0 && laneBReady) {
         try {
           const nodeTouches = getNodeTouches();
-          const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches };
+          const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches, trendState: getTrendState() };
           const laneBResult = checkLaneBEntry(entryState);
 
           if (laneBResult?.shouldEnter) {
-            const guardrail = checkEntryGates(laneBResult.action, scored, multiAnalysis);
+            const guardrail = checkEntryGates(laneBResult.action, scored, multiAnalysis, { pattern: laneBResult.trigger.pattern });
             if (guardrail.allowed) {
               const direction = laneBResult.trigger.direction;
               const spotPrice = parsed.spotPrice;
@@ -818,12 +881,32 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends, laneOpt
     const strike = atm;
 
     // Target & stop from GEX walls — must be on correct side of spot
-    const targetSpx = direction === 'BULLISH'
+    let targetSpx = direction === 'BULLISH'
       ? (scored.wallsAbove?.[0]?.strike || spotPrice + 20)
       : (scored.wallsBelow?.[0]?.strike || spotPrice - 20);
-    const stopSpx = direction === 'BULLISH'
+    let stopSpx = direction === 'BULLISH'
       ? (scored.wallsBelow?.[0]?.strike || spotPrice - 10)
       : (scored.wallsAbove?.[0]?.strike || spotPrice + 10);
+
+    // Widen stop for trend days + breakouts
+    const entryCfg = getActiveConfig() || {};
+    const currentTrendState = getTrendState();
+    const entryTrendAligned = currentTrendState?.isTrend && currentTrendState.direction === direction
+      && (currentTrendState.strength === 'CONFIRMED' || currentTrendState.strength === 'STRONG');
+    if (entryTrendAligned) {
+      const stopDist = Math.abs(stopSpx - spotPrice);
+      const trendMult = entryCfg.trend_stop_multiplier ?? 1.5;
+      const newStopDist = stopDist * trendMult;
+      stopSpx = direction === 'BULLISH' ? spotPrice - newStopDist : spotPrice + newStopDist;
+      log.info(`Trend stop widened: ${stopDist.toFixed(1)} → ${newStopDist.toFixed(1)} pts (${trendMult}x)`);
+    }
+    if (scored.score >= (entryCfg.breakout_score_threshold ?? 90)) {
+      const stopDist = Math.abs(stopSpx - spotPrice);
+      const breakoutMult = entryCfg.breakout_stop_multiplier ?? 1.3;
+      const newStopDist = stopDist * breakoutMult;
+      stopSpx = direction === 'BULLISH' ? spotPrice - newStopDist : spotPrice + newStopDist;
+      log.info(`Breakout stop widened: ${stopDist.toFixed(1)} → ${newStopDist.toFixed(1)} pts (${breakoutMult}x, score=${scored.score})`);
+    }
 
     // Synthetic contract name (0DTE SPX format)
     const expDate = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -856,6 +939,7 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends, laneOpt
       strategyLane: laneOpts.strategyLane || null,
       entryTrigger: laneOpts.entryTrigger || null,
       entryContext: laneOpts.entryContext || null,
+      entryConfidence: laneOpts.entryConfidence || null,
     });
 
     if (pos) {
@@ -907,8 +991,9 @@ function scheduleDailyReset() {
     resetNodeTouches();
     resetDailyState();
     resetDailyGates();
+    resetTrendDetector();
     dailyCycleIndex = 0;
-    log.info('Daily reset: node tracker, smoothing, entry gates, cycle index');
+    log.info('Daily reset: node tracker, smoothing, entry gates, trend detector, cycle index');
 
     // Reschedule for next day
     scheduleDailyReset();

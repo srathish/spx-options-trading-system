@@ -7,7 +7,7 @@
  */
 
 import { getActiveConfig } from '../review/strategy-store.js';
-import { getSignalSnapshot } from '../tv/tv-signal-store.js';
+import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -23,22 +23,54 @@ const log = createLogger('EntryEngine');
  * @returns {object|null} { shouldEnter, trigger, confidence, action, reason } or null
  */
 export function checkGexOnlyEntry(state) {
-  const { patterns, scored, multiAnalysis, nodeTouches } = state;
+  const { patterns, scored, multiAnalysis, nodeTouches, trendState } = state;
   const cfg = getActiveConfig() || {};
 
   if (!patterns || patterns.length === 0) return null;
   if (cfg.lane_a_enabled === false) return null;
 
   for (const trigger of patterns) {
+    // Suppress counter-trend patterns: only use sticky dayTrendDirection (set after sustained CONFIRMED)
+    if (trendState?.dayTrendDirection && trigger.direction !== trendState.dayTrendDirection) {
+      log.info(`Trend filter: suppressing ${trigger.pattern} (${trigger.direction}) — day trend ${trendState.dayTrendDirection}`);
+      continue;
+    }
+
     const validation = validateGexOnlyEntry(trigger, state, cfg);
     if (!validation.valid) {
       log.debug(`Lane A skip ${trigger.pattern}: ${validation.reason}`);
       continue;
     }
 
-    const confidence = getGexOnlyConfidence(trigger, state);
+    // Gate: Minimum R:R at entry — GEX wall target distance must be >= 1.5x stop distance
+    const minRR = cfg.min_entry_rr_ratio ?? 1.5;
+    if (scored.spotPrice && trigger.target_strike && trigger.stop_strike) {
+      const targetDist = Math.abs(trigger.target_strike - scored.spotPrice);
+      const stopDist = Math.abs(trigger.stop_strike - scored.spotPrice);
+      if (stopDist > 0 && targetDist / stopDist < minRR) {
+        log.debug(`Lane A skip ${trigger.pattern}: R:R ${(targetDist / stopDist).toFixed(2)} < min ${minRR} (target=${trigger.target_strike} stop=${trigger.stop_strike})`);
+        continue;
+      }
+    }
+
+    let confidence = getGexOnlyConfidence(trigger, state);
+
+    // TV regime advisory: downgrade confidence if TV strongly opposes (Lane A only)
+    try {
+      const tvRegime = getTvRegime();
+      if (tvRegime.direction) {
+        const opposing = (trigger.direction === 'BULLISH' && tvRegime.direction === 'BEARISH') ||
+                         (trigger.direction === 'BEARISH' && tvRegime.direction === 'BULLISH');
+        if (opposing && confidence !== 'LOW') {
+          const downgraded = downgradeConfidence(confidence);
+          log.info(`TV regime opposing (${tvRegime.direction}) — downgrading ${trigger.pattern} confidence ${confidence} → ${downgraded}`);
+          confidence = downgraded;
+        }
+      }
+    } catch (_) {}
+
     if (confidence === 'LOW') {
-      log.debug(`Lane A skip ${trigger.pattern}: confidence too low`);
+      log.debug(`Lane A skip ${trigger.pattern}: confidence too low (after TV downgrade)`);
       continue;
     }
 
@@ -74,6 +106,27 @@ export function validateGexOnlyEntry(trigger, state, config) {
   const minAlignment = cfg.alignment_min_for_entry ?? 2;
   const overrideScore = cfg.alignment_override_gex_score ?? 85;
 
+  // Gate 0.5: Chop environment — require HIGH confidence + higher score for non-breakout patterns
+  // Skip for trend-aligned entries (consolidation within a trend is not chop)
+  if (scored.isChop) {
+    const trendState = state.trendState;
+    const isTrendAligned = trendState?.isTrend && trendState.direction === trigger.direction
+      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
+
+    if (!isTrendAligned) {
+      const CHOP_EXEMPT_PATTERNS = ['AIR_POCKET', 'KING_NODE_BOUNCE'];
+      if (!CHOP_EXEMPT_PATTERNS.includes(trigger.pattern)) {
+        if (trigger.confidence !== 'HIGH' && trigger.confidence !== 'VERY_HIGH') {
+          return { valid: false, reason: `CHOP environment — ${trigger.pattern} needs HIGH confidence, got ${trigger.confidence}` };
+        }
+        const chopMinScore = cfg.chop_min_entry_score ?? 80;
+        if (scored.score < chopMinScore) {
+          return { valid: false, reason: `CHOP environment — GEX ${scored.score} < ${chopMinScore} required` };
+        }
+      }
+    }
+  }
+
   // Gate 1: Alignment check (bypass for structural single-ticker patterns)
   const STRUCTURAL_PATTERNS_ALIGN = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW'];
   if (alignment < minAlignment) {
@@ -95,19 +148,25 @@ export function validateGexOnlyEntry(trigger, state, config) {
       if (nearestAbove.type === 'positive' && nearestBelow.type === 'positive') {
         const midpoint = (nearestAbove.strike + nearestBelow.strike) / 2;
         const distFromMidPct = Math.abs(scored.spotPrice - midpoint) / scored.spotPrice * 100;
-        if (distFromMidPct < 0.05) {
-          return { valid: false, reason: `At midpoint between ${nearestBelow.strike} and ${nearestAbove.strike} — R:R ~1:1` };
+        const midpointBuffer = cfg.midpoint_danger_zone_pct ?? 0.15;
+        if (distFromMidPct < midpointBuffer) {
+          return { valid: false, reason: `At midpoint between ${nearestBelow.strike} and ${nearestAbove.strike} — dist ${distFromMidPct.toFixed(2)}% < ${midpointBuffer}%` };
         }
       }
     }
   }
 
-  // Gate 3: Minimum GEX score (bypass for structural patterns)
+  // Gate 3: Minimum GEX score (conditional bypass for structural patterns)
   const STRUCTURAL_PATTERNS = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW'];
   const minScore = cfg.gex_only_min_score ?? 50;
+  const structuralMinScore = cfg.structural_min_score ?? 60;
   if (scored.score < minScore) {
     if (STRUCTURAL_PATTERNS.includes(trigger.pattern) && trigger.confidence !== 'LOW') {
-      log.info(`Gate 3 bypass: ${trigger.pattern} (${trigger.confidence}) overrides GEX score ${scored.score} < ${minScore}`);
+      // Structural patterns still need a minimum score floor
+      if (scored.score < structuralMinScore) {
+        return { valid: false, reason: `Structural ${trigger.pattern}: GEX ${scored.score} < structural min ${structuralMinScore}` };
+      }
+      log.info(`Gate 3 bypass: ${trigger.pattern} (${trigger.confidence}) overrides GEX score ${scored.score} < ${minScore} (above structural min ${structuralMinScore})`);
     } else {
       return { valid: false, reason: `GEX score ${scored.score} < min ${minScore}` };
     }
@@ -133,6 +192,11 @@ const CONFIDENCE_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH'];
 function upgradeConfidence(level) {
   const idx = CONFIDENCE_ORDER.indexOf(level);
   return idx < CONFIDENCE_ORDER.length - 1 ? CONFIDENCE_ORDER[idx + 1] : level;
+}
+
+export function downgradeConfidence(level) {
+  const idx = CONFIDENCE_ORDER.indexOf(level);
+  return idx > 0 ? CONFIDENCE_ORDER[idx - 1] : level;
 }
 
 /**
@@ -174,6 +238,146 @@ export function getGexOnlyConfidence(trigger, state) {
   return confidence;
 }
 
+// ---- Trend Pullback Entry ----
+
+/**
+ * Check for a trend pullback entry.
+ * Fires when price pulls back near the support floor (bullish) or resistance ceiling (bearish)
+ * during an active trend day.
+ *
+ * @param {object} state - { scored, multiAnalysis, nodeTouches }
+ * @param {object} trendState - From getTrendState()
+ * @returns {object|null} { shouldEnter, trigger, confidence, action, reason } or null
+ */
+export function checkTrendPullbackEntry(state, trendState) {
+  if (!trendState?.isTrend) return null;
+  // Only enter pullbacks when trend is CONFIRMED or STRONG (not EMERGING)
+  if (trendState.strength !== 'CONFIRMED' && trendState.strength !== 'STRONG') return null;
+
+  const { scored, multiAnalysis, nodeTouches } = state;
+  const cfg = getActiveConfig() || {};
+
+  if (cfg.trend_pullback_enabled === false) return null;
+
+  const direction = trendState.direction;
+  const minScore = cfg.trend_pullback_min_score ?? 40;
+  const maxDist = cfg.trend_pullback_max_dist_pts ?? 8;
+  const stopBuffer = cfg.trend_pullback_stop_buffer_pts ?? 5;
+
+  // Must be reading in trend direction
+  if (scored.direction !== direction) return null;
+
+  // Minimum GEX score
+  if (scored.score < minScore) return null;
+
+  if (direction === 'BULLISH') {
+    const floor = trendState.supportFloor;
+    if (!floor?.strike) return null;
+
+    // Price must be within maxDist pts of support floor
+    const dist = scored.spotPrice - floor.strike;
+    if (dist < 0 || dist > maxDist) return null;
+
+    // Target = resistance ceiling, stop = floor - buffer
+    const target = trendState.resistanceCeiling?.strike || (scored.spotPrice + 15);
+    const stop = floor.strike - stopBuffer;
+
+    // R:R check
+    const targetDist = target - scored.spotPrice;
+    const stopDist = scored.spotPrice - stop;
+    const minRR = cfg.min_entry_rr_ratio ?? 1.5;
+    if (stopDist > 0 && targetDist / stopDist < minRR) return null;
+
+    let confidence = strengthToConfidence(trendState.strength);
+
+    // TV regime advisory downgrade
+    try {
+      const tvRegime = getTvRegime();
+      if (tvRegime.direction === 'BEARISH' && confidence !== 'LOW') {
+        confidence = downgradeConfidence(confidence);
+      }
+    } catch (_) {}
+
+    if (confidence === 'LOW') return null;
+
+    const trigger = {
+      pattern: 'TREND_PULLBACK',
+      direction: 'BULLISH',
+      confidence,
+      target_strike: target,
+      stop_strike: stop,
+      reasoning: `Pullback to trend floor ${floor.strike} (dist ${dist.toFixed(1)}pts), target ${target}`,
+      walls: { floor: floor.strike, ceiling: target },
+    };
+
+    log.info(`Trend pullback entry: BULLISH near floor ${floor.strike} (dist ${dist.toFixed(1)}pts, ${trendState.strength})`);
+    return {
+      shouldEnter: true,
+      trigger,
+      confidence,
+      action: 'ENTER_CALLS',
+      reason: `Trend pullback: BULLISH near floor ${floor.strike} (${trendState.strength})`,
+    };
+  } else {
+    // BEARISH pullback — price near resistance ceiling
+    const ceiling = trendState.resistanceCeiling;
+    if (!ceiling?.strike) return null;
+
+    const dist = ceiling.strike - scored.spotPrice;
+    if (dist < 0 || dist > maxDist) return null;
+
+    const target = trendState.supportFloor?.strike || (scored.spotPrice - 15);
+    const stop = ceiling.strike + stopBuffer;
+
+    const targetDist = scored.spotPrice - target;
+    const stopDist = stop - scored.spotPrice;
+    const minRR = cfg.min_entry_rr_ratio ?? 1.5;
+    if (stopDist > 0 && targetDist / stopDist < minRR) return null;
+
+    let confidence = strengthToConfidence(trendState.strength);
+
+    try {
+      const tvRegime = getTvRegime();
+      if (tvRegime.direction === 'BULLISH' && confidence !== 'LOW') {
+        confidence = downgradeConfidence(confidence);
+      }
+    } catch (_) {}
+
+    if (confidence === 'LOW') return null;
+
+    const trigger = {
+      pattern: 'TREND_PULLBACK',
+      direction: 'BEARISH',
+      confidence,
+      target_strike: target,
+      stop_strike: stop,
+      reasoning: `Pullback to trend ceiling ${ceiling.strike} (dist ${dist.toFixed(1)}pts), target ${target}`,
+      walls: { floor: target, ceiling: ceiling.strike },
+    };
+
+    log.info(`Trend pullback entry: BEARISH near ceiling ${ceiling.strike} (dist ${dist.toFixed(1)}pts, ${trendState.strength})`);
+    return {
+      shouldEnter: true,
+      trigger,
+      confidence,
+      action: 'ENTER_PUTS',
+      reason: `Trend pullback: BEARISH near ceiling ${ceiling.strike} (${trendState.strength})`,
+    };
+  }
+}
+
+/**
+ * Map trend strength to confidence level.
+ */
+function strengthToConfidence(strength) {
+  switch (strength) {
+    case 'STRONG': return 'VERY_HIGH';
+    case 'CONFIRMED': return 'HIGH';
+    case 'EMERGING': return 'MEDIUM';
+    default: return 'LOW';
+  }
+}
+
 // ---- Lane B: GEX + TV Entry ----
 
 /**
@@ -181,7 +385,7 @@ export function getGexOnlyConfidence(trigger, state) {
  * Same pattern detection as Lane A, but ALSO requires TV confirmation.
  */
 export function checkLaneBEntry(state) {
-  const { patterns, scored, multiAnalysis } = state;
+  const { patterns, scored, multiAnalysis, trendState } = state;
   const cfg = getActiveConfig() || {};
 
   if (!patterns || patterns.length === 0) return null;
@@ -190,6 +394,12 @@ export function checkLaneBEntry(state) {
   const tvSnap = getSignalSnapshot();
 
   for (const trigger of patterns) {
+    // Suppress counter-trend patterns: only use sticky dayTrendDirection
+    if (trendState?.dayTrendDirection && trigger.direction !== trendState.dayTrendDirection) {
+      log.info(`Trend filter (Lane B): suppressing ${trigger.pattern} (${trigger.direction}) — day trend ${trendState.dayTrendDirection}`);
+      continue;
+    }
+
     // Same structural validation as Lane A
     const validation = validateGexOnlyEntry(trigger, state, cfg);
     if (!validation.valid) continue;

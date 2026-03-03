@@ -9,6 +9,7 @@ import {
   AdjustmentsHorizontalIcon,
   CpuChipIcon,
   LightBulbIcon,
+  BeakerIcon,
 } from '@heroicons/react/24/outline';
 
 const NAV = [
@@ -16,6 +17,7 @@ const NAV = [
   { href: '/ideas', label: 'Phantoms', icon: LightBulbIcon },
   { href: '/performance', label: 'Performance', icon: ChartBarIcon },
   { href: '/strategy', label: 'Strategy', icon: AdjustmentsHorizontalIcon },
+  { href: '/backtest', label: 'Backtest', icon: BeakerIcon },
   { href: '/system', label: 'System', icon: CpuChipIcon },
 ];
 

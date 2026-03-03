@@ -261,6 +261,16 @@ db.exec(`
     cycle_index INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_gex_raw_ts ON gex_raw_snapshots(timestamp, ticker);
+
+  -- Backtest presets: saved named parameter configs for replay engine
+  CREATE TABLE IF NOT EXISTS backtest_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    config TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // Migrations — add columns that may not exist in older databases
@@ -431,6 +441,28 @@ const selectRawSnapshotDates = db.prepare(`
   GROUP BY date
   ORDER BY date DESC
   LIMIT ?
+`);
+
+// Backtest preset prepared statements
+const upsertBacktestPreset = db.prepare(`
+  INSERT INTO backtest_presets (name, config, description, created_at, updated_at)
+  VALUES (?, ?, ?, datetime('now'), datetime('now'))
+  ON CONFLICT(name) DO UPDATE SET
+    config = excluded.config,
+    description = excluded.description,
+    updated_at = datetime('now')
+`);
+
+const selectAllBacktestPresets = db.prepare(`
+  SELECT * FROM backtest_presets ORDER BY updated_at DESC
+`);
+
+const selectBacktestPreset = db.prepare(`
+  SELECT * FROM backtest_presets WHERE name = ?
+`);
+
+const deleteBacktestPresetStmt = db.prepare(`
+  DELETE FROM backtest_presets WHERE name = ?
 `);
 
 const selectTradesByDateRange = db.prepare(`
@@ -946,6 +978,29 @@ export function getPatternPerformance(daysBack = 7) {
       AND opened_at >= datetime('now', '-' || ? || ' days')
     GROUP BY entry_trigger
   `).all(daysBack);
+}
+
+// ---- Backtest preset helpers ----
+
+export function saveBacktestPreset(name, config, description = null) {
+  upsertBacktestPreset.run(name, JSON.stringify(config), description);
+}
+
+export function getBacktestPresets() {
+  return selectAllBacktestPresets.all().map(p => ({
+    ...p,
+    config: JSON.parse(p.config),
+  }));
+}
+
+export function getBacktestPreset(name) {
+  const row = selectBacktestPreset.get(name);
+  if (!row) return null;
+  return { ...row, config: JSON.parse(row.config) };
+}
+
+export function deleteBacktestPreset(name) {
+  return deleteBacktestPresetStmt.run(name);
 }
 
 export function cleanupOldData(daysToKeep = 7) {

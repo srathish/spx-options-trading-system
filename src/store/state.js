@@ -8,7 +8,7 @@ import { ALERT_DEDUP_MINUTES, MOMENTUM } from '../gex/constants.js';
 
 // In-memory GEX history for wall trend detection (keeps last 3 reads per ticker)
 const gexHistory = { SPXW: [], SPY: [], QQQ: [] };
-const MAX_HISTORY = 3;
+const MAX_HISTORY = 10;
 
 // Spot price ring buffer for momentum detection (keeps last N reads per ticker)
 const spotBuffer = { SPXW: [], SPY: [], QQQ: [] };
@@ -37,7 +37,11 @@ const SCORE_HISTORY_SIZE = 60; // 60 cycles = ~30 min
 
 // Node strength trending — rolling buffer of top 10 walls per cycle (~100s at 5s polling)
 const nodeHistory = { SPXW: [], SPY: [], QQQ: [] };
-const NODE_HISTORY_SIZE = 20;
+const NODE_HISTORY_SIZE = 120;
+
+// King node history — tracks king node strike + type per cycle
+const kingNodeHistory = { SPXW: [], SPY: [], QQQ: [] };
+const KING_HISTORY_SIZE = 60;
 
 // GEX regime persistence — tracks consecutive same-direction cycles
 const regimeState = {
@@ -109,9 +113,10 @@ export function saveNodeSnapshot(walls, ticker = 'SPXW') {
 }
 
 /**
- * Get node trends for a ticker by comparing current walls to 5 and 10 cycles ago.
- * Returns Map<strike, { trend, currentValue, prevValue5, prevValue10, changePct10 }>
+ * Get node trends for a ticker by comparing current walls to 5, 10, 30, and 60 cycles ago.
+ * Returns Map<strike, { trend, longTrend, currentValue, prevValue5, prevValue10, prevValue30, prevValue60, changePct10, changePct30, changePct60 }>
  * Trends: GROWING (≥20% increase), WEAKENING (≥20% decrease), STABLE, NEW, GONE
+ * longTrend: based on 30/60 cycle comparison — more stable, less noise
  */
 export function getNodeTrends(ticker = 'SPXW') {
   const history = nodeHistory[ticker] || [];
@@ -122,20 +127,30 @@ export function getNodeTrends(ticker = 'SPXW') {
   const current = history[history.length - 1];
   const ago5 = history.length >= 6 ? history[history.length - 6] : null;
   const ago10 = history.length >= 11 ? history[history.length - 11] : null;
+  const ago30 = history.length >= 31 ? history[history.length - 31] : null;  // ~15 min at 30s polling
+  const ago60 = history.length >= 61 ? history[history.length - 61] : null;  // ~30 min at 30s polling
 
   // Build lookup maps for past snapshots
   const map5 = new Map();
   const map10 = new Map();
+  const map30 = new Map();
+  const map60 = new Map();
   if (ago5) ago5.walls.forEach(w => map5.set(w.strike, w.value));
   if (ago10) ago10.walls.forEach(w => map10.set(w.strike, w.value));
+  if (ago30) ago30.walls.forEach(w => map30.set(w.strike, w.value));
+  if (ago60) ago60.walls.forEach(w => map60.set(w.strike, w.value));
 
   // Classify each current wall
   for (const wall of current.walls) {
     const prev5 = map5.get(wall.strike);
     const prev10 = map10.get(wall.strike);
+    const prev30 = map30.get(wall.strike);
+    const prev60 = map60.get(wall.strike);
 
     let trend;
     let changePct10 = 0;
+    let changePct30 = 0;
+    let changePct60 = 0;
 
     if (ago10 && prev10 === undefined) {
       // Didn't exist 10 cycles ago
@@ -158,12 +173,30 @@ export function getNodeTrends(ticker = 'SPXW') {
       trend = 'NEW'; // Not enough history
     }
 
+    // Compute long-term change percentages
+    if (prev30 && prev30 > 0) changePct30 = (wall.value - prev30) / prev30;
+    if (prev60 && prev60 > 0) changePct60 = (wall.value - prev60) / prev60;
+
+    // longTrend: based on best available long lookback (prefer 60, fallback 30)
+    let longTrend = null;
+    const longPct = prev60 !== undefined ? changePct60 : (prev30 !== undefined ? changePct30 : null);
+    if (longPct !== null) {
+      if (longPct >= 0.20) longTrend = 'GROWING';
+      else if (longPct <= -0.20) longTrend = 'WEAKENING';
+      else longTrend = 'STABLE';
+    }
+
     trends.set(wall.strike, {
       trend,
+      longTrend,
       currentValue: wall.value,
       prevValue5: prev5 ?? null,
       prevValue10: prev10 ?? null,
+      prevValue30: prev30 ?? null,
+      prevValue60: prev60 ?? null,
       changePct10: parseFloat(changePct10.toFixed(3)),
+      changePct30: parseFloat(changePct30.toFixed(3)),
+      changePct60: parseFloat(changePct60.toFixed(3)),
     });
   }
 
@@ -174,10 +207,15 @@ export function getNodeTrends(ticker = 'SPXW') {
       if (!currentStrikes.has(wall.strike)) {
         trends.set(wall.strike, {
           trend: 'GONE',
+          longTrend: 'GONE',
           currentValue: 0,
           prevValue5: map5.get(wall.strike) ?? null,
           prevValue10: wall.value,
+          prevValue30: map30.get(wall.strike) ?? null,
+          prevValue60: map60.get(wall.strike) ?? null,
           changePct10: -1,
+          changePct30: -1,
+          changePct60: -1,
         });
       }
     }
@@ -395,9 +433,9 @@ export function hadRecentDirectionFlip(ticker, lookback = 4) {
 /**
  * Record a GEX score for chop detection.
  */
-export function recordScore(ticker, score, direction) {
+export function recordScore(ticker, score, direction, spotPrice = null) {
   if (!scoreHistory[ticker]) scoreHistory[ticker] = [];
-  scoreHistory[ticker].push({ score, direction, timestamp: Date.now() });
+  scoreHistory[ticker].push({ score, direction, spotPrice, timestamp: Date.now() });
   while (scoreHistory[ticker].length > SCORE_HISTORY_SIZE) {
     scoreHistory[ticker].shift();
   }
@@ -407,7 +445,7 @@ export function recordScore(ticker, score, direction) {
  * Detect if the market is in chop mode based on score history.
  * Chop = frequent direction flips OR high score standard deviation.
  */
-export function detectChopMode(ticker = 'SPXW', lookback = 60) {
+export function detectChopMode(ticker = 'SPXW', lookback = 60, cfg = {}) {
   const history = scoreHistory[ticker] || [];
   if (history.length < 10) return { isChop: false, reason: 'insufficient data' };
 
@@ -419,22 +457,38 @@ export function detectChopMode(ticker = 'SPXW', lookback = 60) {
     if (recent[i].direction !== recent[i - 1].direction) flips++;
   }
 
+  // Flip rate: proportion of cycles that are flips
+  const flipRate = recent.length > 1 ? flips / (recent.length - 1) : 0;
+
   // Calculate score standard deviation
   const scores = recent.map(h => h.score);
   const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
   const variance = scores.reduce((sum, s) => sum + (s - mean) ** 2, 0) / scores.length;
   const stddev = Math.sqrt(variance);
 
-  const isChop = flips >= 6 || stddev > 20;
+  const flipThreshold = cfg.chop_flip_threshold ?? 4;
+  const stddevThreshold = cfg.chop_stddev_threshold ?? 15;
+  const flipRateThreshold = cfg.chop_flip_rate_threshold ?? 0.30;
+
+  // Compound condition: flips + stddev together, OR high flip rate alone
+  let isChop = (flips >= flipThreshold && stddev > stddevThreshold) || flipRate > flipRateThreshold;
+
+  let reason = 'trending';
+  if (isChop) {
+    if (flipRate > flipRateThreshold) {
+      reason = `flip rate ${(flipRate * 100).toFixed(0)}% > ${(flipRateThreshold * 100).toFixed(0)}%`;
+    } else {
+      reason = `${flips} flips + stddev ${stddev.toFixed(1)}`;
+    }
+  }
 
   return {
     isChop,
     flips,
+    flipRate: Math.round(flipRate * 100) / 100,
     stddev: Math.round(stddev * 10) / 10,
     readings: recent.length,
-    reason: isChop
-      ? (flips >= 6 ? `${flips} direction flips` : `score stddev ${stddev.toFixed(1)}`)
-      : 'trending',
+    reason,
   };
 }
 
@@ -485,6 +539,91 @@ export function getRegime(ticker = 'SPXW') {
 }
 
 /**
+ * Detect node sign changes — walls that flipped from positive to negative (or vice versa)
+ * or new walls that emerged as massively negative.
+ * Uses rawValue from nodeHistory to compare signed values across time windows.
+ * Returns array of { strike, from, to, magnitude, rawValue, prevRawValue? }
+ */
+export function getNodeSignChanges(ticker = 'SPXW') {
+  const history = nodeHistory[ticker] || [];
+  if (history.length < 6) return [];
+
+  const current = history[history.length - 1];
+  const ago10 = history.length >= 11 ? history[history.length - 11] : null;
+  const ago30 = history.length >= 31 ? history[history.length - 31] : null;
+
+  const changes = [];
+  const pastRef = ago30 || ago10;
+  if (!pastRef) return changes;
+
+  const pastMap = new Map();
+  pastRef.walls.forEach(w => pastMap.set(w.strike, w.rawValue));
+
+  for (const wall of current.walls) {
+    const pastRaw = pastMap.get(wall.strike);
+    const currentRaw = wall.rawValue;
+    const currentSign = currentRaw >= 0 ? 'positive' : 'negative';
+
+    if (pastRaw === undefined) {
+      // New wall — only flag if large negative (negative emergence)
+      if (currentRaw < -5_000_000) {
+        changes.push({ strike: wall.strike, from: 'absent', to: currentSign, magnitude: Math.abs(currentRaw), rawValue: currentRaw });
+      }
+    } else {
+      const pastSign = pastRaw >= 0 ? 'positive' : 'negative';
+      if (pastSign !== currentSign) {
+        changes.push({ strike: wall.strike, from: pastSign, to: currentSign, magnitude: Math.abs(currentRaw), rawValue: currentRaw, prevRawValue: pastRaw });
+      }
+    }
+  }
+
+  return changes;
+}
+
+/**
+ * Save the king node for a ticker each cycle.
+ * Tracks strike, type, and value for king node type flip detection.
+ */
+export function saveKingNode(kingNode, ticker = 'SPXW') {
+  if (!kingNode) return;
+  if (!kingNodeHistory[ticker]) kingNodeHistory[ticker] = [];
+  kingNodeHistory[ticker].push({
+    strike: kingNode.strike,
+    type: kingNode.type,
+    value: kingNode.absGexValue || Math.abs(kingNode.gexValue || 0),
+    timestamp: Date.now(),
+  });
+  while (kingNodeHistory[ticker].length > KING_HISTORY_SIZE) {
+    kingNodeHistory[ticker].shift();
+  }
+}
+
+/**
+ * Detect if the king node at the same strike flipped type (positive↔negative).
+ * Returns { strike, fromType, toType, currentValue, cyclesAgo } or null.
+ */
+export function getKingNodeFlip(ticker = 'SPXW') {
+  const history = kingNodeHistory[ticker] || [];
+  if (history.length < 10) return null;
+
+  const current = history[history.length - 1];
+  // Look back 10-30 cycles to find if same strike had different type
+  for (let i = Math.max(0, history.length - 31); i < history.length - 5; i++) {
+    const past = history[i];
+    if (past.strike === current.strike && past.type !== current.type) {
+      return {
+        strike: current.strike,
+        fromType: past.type,
+        toType: current.type,
+        currentValue: current.value,
+        cyclesAgo: history.length - 1 - i,
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Reset daily state (call at 9:25 AM ET before warm-up).
  */
 export function resetDailyState() {
@@ -503,6 +642,9 @@ export function resetDailyState() {
   regimeState.SPXW = { direction: null, startedAt: 0, cycles: 0 };
   regimeState.SPY = { direction: null, startedAt: 0, cycles: 0 };
   regimeState.QQQ = { direction: null, startedAt: 0, cycles: 0 };
+  kingNodeHistory.SPXW = [];
+  kingNodeHistory.SPY = [];
+  kingNodeHistory.QQQ = [];
 }
 
 /**

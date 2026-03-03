@@ -28,6 +28,7 @@
 import { SCORE, CONFIDENCE, MIDPOINT, AIR_POCKET, NEUTRAL_THRESHOLD, MOMENTUM } from './constants.js';
 import { getGexAtSpot, formatDollar } from './gex-parser.js';
 import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection } from '../store/state.js';
+import { getActiveConfig } from '../review/strategy-store.js';
 
 /**
  * Score the SPX GEX environment.
@@ -88,34 +89,25 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
     }
   }
 
-  // Check for chop
-  const chop = checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes);
+  // Check for chop — flag only, don't override direction
+  const chop = checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes, getActiveConfig());
 
-  // Determine best direction
+  // Determine best direction (always directional — CHOP is a separate flag)
   let result;
-  if (chop.isChop) {
-    result = {
-      score: Math.max(bullish.score, bearish.score),
-      direction: 'CHOP',
-      breakdown: chop.reasons,
-      targetWall: null,
-      floorWall: null,
-      distanceToTarget: 'N/A',
-    };
-  } else if (bullish.score >= bearish.score) {
+  if (bullish.score >= bearish.score) {
     result = bullish;
   } else {
     result = bearish;
   }
 
   // Low scores → NEUTRAL (not enough evidence for a directional call)
-  if (result.direction !== 'CHOP' && result.score < NEUTRAL_THRESHOLD) {
+  if (result.score < NEUTRAL_THRESHOLD) {
     result.breakdown.push(`Score ${result.score} < ${NEUTRAL_THRESHOLD} threshold → NEUTRAL`);
     result.direction = 'NEUTRAL';
   }
 
   // Apply Trinity cross-market confirmation bonus (only for directional setups)
-  if (trinityBonus > 0 && result.direction !== 'CHOP' && result.direction !== 'NEUTRAL') {
+  if (trinityBonus > 0 && result.direction !== 'NEUTRAL') {
     result.score = Math.min(100, result.score + trinityBonus);
     result.breakdown.push(`+${trinityBonus}: Trinity confirmation (cross-market alignment)`);
   }
@@ -149,6 +141,8 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
     rawScore,
     score: result.score,
     direction: result.direction,
+    isChop: chop.isChop,
+    chopReasons: chop.isChop ? chop.reasons : [],
     confidence,
     breakdown: result.breakdown,
     targetWall: result.targetWall,
@@ -376,26 +370,50 @@ function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTr
   };
 }
 
-function checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes) {
+function checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes, cfg) {
   const reasons = [];
 
-  if (wallsAbove.length > 0 && wallsBelow.length > 0) {
-    const topAbs = wallsAbove[0].absGexValue;
-    const botAbs = wallsBelow[0].absGexValue;
+  // Find nearest positive walls on each side (pin zone = positive gamma trapping price)
+  const posAbove = wallsAbove.filter(w => w.type === 'positive');
+  const posBelow = wallsBelow.filter(w => w.type === 'positive');
+
+  // Condition 1: Pinned between POSITIVE walls of similar size
+  // Positive walls on both sides = dealers long gamma both directions = price dampened
+  // On trend days, one side typically has negative walls (magnets), so this doesn't fire
+  if (posAbove.length > 0 && posBelow.length > 0) {
+    const topAbs = posAbove[0].absGexValue;
+    const botAbs = posBelow[0].absGexValue;
     const ratio = Math.min(topAbs, botAbs) / Math.max(topAbs, botAbs);
-    if (ratio > 0.70) {
-      reasons.push(`Pinned between walls of similar size (${(ratio * 100).toFixed(0)}% ratio): ${wallsBelow[0].strike} vs ${wallsAbove[0].strike}`);
+    if (ratio > 0.50) {
+      reasons.push(`Pinned between positive walls (${(ratio * 100).toFixed(0)}% ratio): ${posBelow[0].strike} vs ${posAbove[0].strike}`);
     }
   }
 
+  // Condition 2: Highly positive GEX environment (pinned)
   const allValues = [...aggregatedGex.values()];
   const positiveCount = allValues.filter(v => v > 0).length;
   if (positiveCount / allValues.length > 0.85) {
     reasons.push(`${(positiveCount / allValues.length * 100).toFixed(0)}% of strikes have positive GEX — highly pinned`);
   }
 
+  // Condition 3: Tight range — positive walls within 30 SPX pts on both sides
+  if (posAbove.length > 0 && posBelow.length > 0) {
+    const range = posAbove[0].strike - posBelow[0].strike;
+    if (range > 0 && range <= 30) {
+      reasons.push(`Tight positive wall range: ${posBelow[0].strike} to ${posAbove[0].strike} (${range} pts)`);
+    }
+  }
+
+  // Condition 4: No significant walls anywhere
   if (wallsAbove.length === 0 && wallsBelow.length === 0) {
     reasons.push('No significant walls identified anywhere');
+  }
+
+  // Condition 5: Extreme pin zone — very high positive GEX at spot + positive walls on both sides
+  // Late-day pin: dealers massively long gamma at spot, all moves immediately dampened
+  const pinThreshold = cfg?.pin_gex_at_spot_threshold ?? 20_000_000;
+  if (gexAtSpot > pinThreshold && posAbove.length > 0 && posBelow.length > 0) {
+    reasons.push(`Extreme pin: GEX@spot ${(gexAtSpot / 1e6).toFixed(0)}M > ${(pinThreshold / 1e6).toFixed(0)}M with pos walls on both sides`);
   }
 
   return {
@@ -500,7 +518,6 @@ function checkOpenAir(spotPrice, targetStrike, direction, aggregatedGex, strikes
 }
 
 function getRecommendation(direction, confidence, environment) {
-  if (direction === 'CHOP') return 'WAIT — choppy environment, no clear setup';
   if (direction === 'NEUTRAL') return 'WAIT — insufficient directional evidence';
   if (confidence === 'LOW') return 'WAIT — low confidence, avoid forcing trades';
 

@@ -201,6 +201,142 @@ function formatStateForChat(state) {
   return lines.join('\n');
 }
 
+// ---- Backtest Chat ----
+
+const BACKTEST_SYSTEM_PROMPT = `You are a quantitative strategy advisor for GexClaw, an SPX 0DTE options trading system.
+The user is backtesting strategy parameters against historical GEX data.
+
+RULES:
+1. Be specific. Reference the actual numbers from their backtest results and current config.
+2. When suggesting parameter changes, ALWAYS wrap them in a JSON code block like:
+\`\`\`json
+{ "profit_target_pct": 0.18, "stop_loss_pct": 0.15 }
+\`\`\`
+Only include params you want to change. The user can apply these directly to their config editor.
+
+3. Focus on the biggest impact changes first. If MOMENTUM_TIMEOUT is 79% of exits, that's the #1 priority.
+4. Explain your reasoning in 2-3 sentences. Don't write essays.
+5. Consider trade-offs — tighter stops mean fewer losses but also fewer winners that need time to develop.
+6. Reference specific patterns (TRIPLE_FLOOR, RUG_PULL, etc.) and exit reasons by name.`;
+
+/**
+ * Call Kimi K2.5 for backtest parameter tuning advice.
+ * @param {string} message - User's question
+ * @param {object} currentConfig - Current strategy config being tested
+ * @param {object} lastRunResults - Report from the most recent backtest run
+ * @param {Array} history - Recent chat history [{sender, text}]
+ * @returns {{ reply: string, suggestedConfig: object|null, tokens_used: number, response_time_ms: number }}
+ */
+export async function callBacktestChat(message, currentConfig, lastRunResults, history = []) {
+  if (!client) {
+    return {
+      reply: 'Chat agent is not available — KIMI_API_KEY not configured.',
+      suggestedConfig: null,
+      tokens_used: 0,
+      response_time_ms: 0,
+    };
+  }
+
+  const start = Date.now();
+
+  // Build context with config and results
+  const contextLines = ['[BACKTEST CONTEXT]'];
+
+  if (currentConfig) {
+    const keyParams = [
+      'profit_target_pct', 'stop_loss_pct', 'trailing_stop_activate_pts', 'trailing_stop_distance_pts',
+      'gex_only_min_score', 'alignment_min_for_entry', 'gex_strong_score',
+      'momentum_phase0_seconds', 'momentum_phase0_min_pts', 'momentum_phase1_minutes', 'momentum_phase1_min_pts',
+      'momentum_phase2_minutes', 'momentum_phase2_target_pct', 'momentum_phase3_minutes',
+      'entry_min_spacing_ms', 'no_entry_after', 'consecutive_loss_limit', 'consecutive_loss_cooldown_ms',
+      'chop_lookback_cycles', 'chop_flip_threshold', 'chop_stddev_threshold',
+    ];
+    contextLines.push('\nCurrent Config:');
+    for (const p of keyParams) {
+      if (currentConfig[p] !== undefined) contextLines.push(`  ${p}: ${currentConfig[p]}`);
+    }
+  }
+
+  if (lastRunResults) {
+    contextLines.push(`\nLast Backtest Results (${lastRunResults.date || 'N/A'}):`);
+    contextLines.push(`  Trades: ${lastRunResults.totalTrades} (${lastRunResults.wins}W / ${lastRunResults.losses}L)`);
+    contextLines.push(`  Win Rate: ${lastRunResults.winRate}%`);
+    contextLines.push(`  Total P&L: ${lastRunResults.totalPnlPts} SPX pts`);
+    contextLines.push(`  Avg Win: ${lastRunResults.avgWinPts} pts | Avg Loss: ${lastRunResults.avgLossPts} pts`);
+
+    if (lastRunResults.exitReasons) {
+      contextLines.push(`  Exit Reasons:`);
+      for (const [reason, count] of Object.entries(lastRunResults.exitReasons).sort((a, b) => b[1] - a[1])) {
+        contextLines.push(`    ${reason}: ${count}`);
+      }
+    }
+
+    if (lastRunResults.patternPerformance) {
+      contextLines.push(`  Pattern Performance:`);
+      for (const [pattern, perf] of Object.entries(lastRunResults.patternPerformance)) {
+        const total = perf.wins + perf.losses;
+        const wr = total > 0 ? ((perf.wins / total) * 100).toFixed(0) : 'N/A';
+        contextLines.push(`    ${pattern}: ${perf.wins}W/${perf.losses}L (${wr}%) | ${perf.totalPnl > 0 ? '+' : ''}${perf.totalPnl.toFixed(2)} pts`);
+      }
+    }
+  }
+
+  const messages = [
+    { role: 'system', content: BACKTEST_SYSTEM_PROMPT },
+    { role: 'system', content: contextLines.join('\n') },
+  ];
+
+  const recentHistory = history.slice(-10);
+  for (const msg of recentHistory) {
+    messages.push({
+      role: msg.sender === 'user' ? 'user' : 'assistant',
+      content: msg.text,
+    });
+  }
+
+  messages.push({ role: 'user', content: message });
+
+  try {
+    const response = await client.chat.completions.create({
+      model: config.agentModel,
+      messages,
+      temperature: 0.3,
+      max_tokens: 1000,
+    });
+
+    const reply = response.choices[0]?.message?.content || 'No response generated.';
+    const tokensUsed = (response.usage?.prompt_tokens || 0) + (response.usage?.completion_tokens || 0);
+
+    // Parse suggested config from ```json blocks
+    let suggestedConfig = null;
+    const jsonMatch = reply.match(/```json\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      try {
+        suggestedConfig = JSON.parse(jsonMatch[1]);
+      } catch (_) {
+        log.debug('Failed to parse suggested config JSON from chat response');
+      }
+    }
+
+    log.debug(`Backtest chat response: ${tokensUsed} tokens, ${Date.now() - start}ms`);
+
+    return {
+      reply,
+      suggestedConfig,
+      tokens_used: tokensUsed,
+      response_time_ms: Date.now() - start,
+    };
+  } catch (err) {
+    log.error(`Backtest chat error: ${err.message}`);
+    return {
+      reply: `Error: ${err.message}`,
+      suggestedConfig: null,
+      tokens_used: 0,
+      response_time_ms: Date.now() - start,
+    };
+  }
+}
+
 function formatWallVal(val) {
   if (val == null) return '?';
   const abs = Math.abs(val);

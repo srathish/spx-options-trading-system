@@ -78,7 +78,7 @@ export function enterPosition({
   contract, direction, strike, entryPrice, entrySpx,
   targetPrice, stopPrice, targetSpx, stopSpx,
   greeks, gexState, tvState, agentReasoning,
-  strategyLane, entryTrigger, entryContext,
+  strategyLane, entryTrigger, entryContext, entryConfidence,
 }) {
   if (currentPosition) {
     log.warn('Already in a position — cannot enter another');
@@ -105,6 +105,7 @@ export function enterPosition({
     currentPnlPct: 0,
     bestSpxChange: 0,
     entryContext: entryContext || null,
+    entryConfidence: entryConfidence || 'MEDIUM',
   };
 
   lastUpdateSentAt = Date.now();
@@ -154,6 +155,13 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   // 3. Check exit triggers (priority order)
   const cfg = getActiveConfig() || {};
   const isBullish = currentPosition.direction === 'BULLISH';
+  const trendState = context.trendState;
+  const isTrendAligned =
+    // Real-time trend is CONFIRMED/STRONG and direction matches
+    (trendState?.isTrend && trendState.direction === currentPosition.direction
+      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG'))
+    // OR sticky exit trend direction matches (persists through oscillations)
+    || (trendState?.dayExitTrendDirection === currentPosition.direction);
 
   // 3a. Target hit — SPX reached target wall
   if (currentPosition.targetSpx) {
@@ -209,6 +217,28 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
+  // 3a3. TREND_FLOOR_BREAK — during trend, exit if price breaks below the trend's support floor
+  if (isTrendAligned && trendState.supportFloor?.strike) {
+    const floorBuffer = cfg.trend_floor_break_buffer_pts ?? 3;
+
+    if (isBullish) {
+      if (currentSpot < trendState.supportFloor.strike - floorBuffer) {
+        result.exitTriggered = true;
+        result.exitReason = 'TREND_FLOOR_BREAK';
+        log.warn(`Trend floor break: spot ${currentSpot} < floor ${trendState.supportFloor.strike} - ${floorBuffer}pt buffer`);
+        return result;
+      }
+    } else {
+      if (trendState.resistanceCeiling?.strike &&
+          currentSpot > trendState.resistanceCeiling.strike + floorBuffer) {
+        result.exitTriggered = true;
+        result.exitReason = 'TREND_FLOOR_BREAK';
+        log.warn(`Trend ceiling break: spot ${currentSpot} > ceiling ${trendState.resistanceCeiling.strike} + ${floorBuffer}pt buffer`);
+        return result;
+      }
+    }
+  }
+
   // 3b. Stop hit — SPX broke through stop level
   if (currentPosition.stopSpx) {
     const stopHit = isBullish
@@ -227,7 +257,8 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     const spxChange = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
     const movePct = (spxChange / currentPosition.entrySpx) * 100;
 
-    const profitTargetPct = cfg.profit_target_pct || 0.15;
+    let profitTargetPct = cfg.profit_target_pct || 0.15;
+    if (isTrendAligned) profitTargetPct *= (cfg.trend_profit_target_multiplier ?? 2.5);
     if (movePct >= profitTargetPct) {
       result.exitTriggered = true;
       result.exitReason = 'PROFIT_TARGET';
@@ -235,7 +266,8 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
 
     // 3d. Stop loss — cut losses (immediate, no hold gate)
-    const stopLossPct = cfg.stop_loss_pct || 0.20;
+    let stopLossPct = cfg.stop_loss_pct || 0.20;
+    if (isTrendAligned) stopLossPct *= (cfg.trend_stop_loss_multiplier ?? 2.0);
     if (movePct <= -stopLossPct) {
       result.exitTriggered = true;
       result.exitReason = 'STOP_LOSS';
@@ -273,8 +305,9 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   }
 
   // 3e. Opposing wall — large positive wall materialized against our position
+  // Skip during confirmed trend days — walls shift naturally during trends
   const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
-  if (!holdTooShort && scored) {
+  if (!isTrendAligned && !holdTooShort && scored) {
     const opposingWalls = isBullish ? scored.wallsBelow : scored.wallsAbove;
     const bigOpposing = opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingWallValue && w.type === 'POSITIVE');
     if (bigOpposing) {
@@ -285,14 +318,21 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   }
 
   // 3e2. MOMENTUM_TIMEOUT — 4 progressive phases of stall detection
-  // Phase 0 fires at 60s (exempt from min hold) to catch dead entries early
+  // Phase 0 fires at 90s (exempt from min hold) to catch dead entries early
   if (currentPosition.entrySpx && currentSpot) {
     const holdSeconds = holdTimeMs / 1_000;
-    const phase0Seconds = cfg.momentum_phase0_seconds ?? 60;
-    const phase0MinPts = cfg.momentum_phase0_min_pts ?? 1;
-    const phase1MinSeconds = (cfg.momentum_phase1_minutes ?? 5) * 60;
+    const phase0Seconds = cfg.momentum_phase0_seconds ?? 90;
+    const phase0MinPts = cfg.momentum_phase0_min_pts ?? 0.5;
+    const isHighConf = currentPosition.entryConfidence === 'HIGH' || currentPosition.entryConfidence === 'VERY_HIGH';
+    const phase1MinSeconds = (isHighConf
+      ? (cfg.momentum_phase1_high_conf_minutes ?? 7)
+      : (cfg.momentum_phase1_minutes ?? 5)) * 60;
 
-    if (holdSeconds >= phase0Seconds && holdSeconds < phase1MinSeconds) {
+    // Skip Phase 0 entirely during confirmed trend days (not just breakouts)
+    const breakoutThreshold = cfg.breakout_score_threshold ?? 90;
+    const isBreakoutEntry = isTrendAligned && currentPosition.entryContext?.gex_score_at_entry >= breakoutThreshold;
+
+    if (!isTrendAligned && !isBreakoutEntry && holdSeconds >= phase0Seconds && holdSeconds < phase1MinSeconds) {
       const moveInDirection = isBullish
         ? currentSpot - currentPosition.entrySpx
         : currentPosition.entrySpx - currentSpot;
@@ -305,13 +345,18 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
+  // Skip momentum phases 1-3 entirely during confirmed trend days
+  // Rely on structural exits (TREND_FLOOR_BREAK, TRAILING_STOP, GEX_FLIP) instead
+  if (!isTrendAligned && !holdTooShort && currentPosition.entrySpx && currentSpot) {
     const holdMinutes = holdTimeMs / 60_000;
     const spxProgress = isBullish
       ? currentSpot - currentPosition.entrySpx
       : currentPosition.entrySpx - currentSpot;
 
-    const phase1Min = cfg.momentum_phase1_minutes ?? 5;
+    const isHighConf = currentPosition.entryConfidence === 'HIGH' || currentPosition.entryConfidence === 'VERY_HIGH';
+    const phase1Min = (isHighConf
+      ? (cfg.momentum_phase1_high_conf_minutes ?? 7)
+      : (cfg.momentum_phase1_minutes ?? 5));
     const phase1Pts = cfg.momentum_phase1_min_pts ?? 2;
     const phase2Min = cfg.momentum_phase2_minutes ?? 10;
     const phase2Pct = cfg.momentum_phase2_target_pct ?? 0.40;
@@ -366,9 +411,13 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     log.info('Map reshuffle detected — flagged for agent review (no auto-exit)');
   }
 
-  // 3h. Trailing stop — activated after threshold, trails behind best price
-  const trailActivate = cfg.trailing_stop_activate_pts || 8;
-  const trailDistance = cfg.trailing_stop_distance_pts || 5;
+  // 3h. Trailing stop — activated after threshold, trails behind best price (trend-aware)
+  const trailActivate = isTrendAligned
+    ? (cfg.trend_trail_activate_pts ?? 5)
+    : (cfg.trailing_stop_activate_pts || 8);
+  const trailDistance = isTrendAligned
+    ? (cfg.trend_trail_distance_pts ?? 8)
+    : (cfg.trailing_stop_distance_pts || 5);
   if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
     const spxChangeForTrail = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
 
@@ -458,6 +507,7 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   }
 
   // 3k. GEX flip — direction flipped against position — requires minimum hold time
+  // During trend days, require consecutive opposing cycles before exiting
   const gexFlipThreshold = cfg.gex_exit_threshold || 60;
   if (scored && scored.score >= gexFlipThreshold) {
     const gexBullish = scored.direction === 'BULLISH';
@@ -465,11 +515,24 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     if (gexBullish !== positionBullish) {
       if (holdTooShort) {
         log.debug(`GEX flipped but holding — ${Math.round((MIN_HOLD_BEFORE_SOFT_EXIT_MS - holdTimeMs) / 1000)}s until min hold (noise filter)`);
+      } else if (isTrendAligned) {
+        // During trend: require N consecutive opposing GEX cycles
+        currentPosition._gexFlipCount = (currentPosition._gexFlipCount || 0) + 1;
+        const requiredFlips = cfg.trend_gex_flip_required_cycles ?? 3;
+        if (currentPosition._gexFlipCount >= requiredFlips) {
+          result.exitTriggered = true;
+          result.exitReason = 'GEX_FLIP';
+          return result;
+        }
+        log.debug(`Trend GEX flip ${currentPosition._gexFlipCount}/${requiredFlips} — holding`);
       } else {
         result.exitTriggered = true;
         result.exitReason = 'GEX_FLIP';
         return result;
       }
+    } else {
+      // GEX re-aligned — reset flip counter
+      if (currentPosition._gexFlipCount) currentPosition._gexFlipCount = 0;
     }
   }
 

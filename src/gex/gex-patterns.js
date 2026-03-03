@@ -31,11 +31,11 @@ const log = createLogger('Patterns');
  */
 export { allTickersShowSameSetup, detectNodePolarityFlips };
 
-export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, nodeTrends, currentDirection) {
+export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches, nodeTrends, currentDirection, nodeSignChanges, kingNodeFlip) {
   if (!scored || !parsedData || !multiAnalysis) return [];
 
   const cfg = getActiveConfig() || {};
-  const ctx = { scored, parsedData, multiAnalysis, nodeTouches: nodeTouches || {}, cfg, nodeTrends: nodeTrends || new Map() };
+  const ctx = { scored, parsedData, multiAnalysis, nodeTouches: nodeTouches || {}, cfg, nodeTrends: nodeTrends || new Map(), nodeSignChanges: nodeSignChanges || [], kingNodeFlip: kingNodeFlip || null };
 
   const patterns = [
     ...detectRugPull(ctx),
@@ -45,6 +45,7 @@ export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches
     ...detectTripleCeilingFloor(ctx),
     ...detectAirPocket(ctx),
     ...detectRangeEdgeFade(ctx),
+    ...detectWallFlip(ctx),
   ];
 
   // Validate: target and stop must be on correct side of spot
@@ -140,6 +141,59 @@ function adjustConfidence(confidence, direction) {
   return confidence;
 }
 
+// ---- Cross-Ticker Confirmation ----
+
+/**
+ * Check if SPY/QQQ king nodes and rug setups confirm a direction.
+ * Uses structural alignment (king node position relative to each ticker's spot)
+ * rather than just scored.direction alignment.
+ */
+function getCrossTickerConfirmation(multiAnalysis, direction) {
+  const kingNodes = multiAnalysis?.king_nodes || {};
+  const rugs = multiAnalysis?.rug_setups || [];
+  let confirmCount = 0;
+  const confirmedTickers = new Set();
+  const details = [];
+
+  // Check SPY/QQQ king nodes — structural position relative to their own spot
+  for (const ticker of ['SPY', 'QQQ']) {
+    const kn = kingNodes[ticker];
+    if (!kn || !kn.isNear) continue;
+
+    const isSupport = kn.relativeToSpot === 'below' || kn.relativeToSpot === 'at';
+    const isResistance = kn.relativeToSpot === 'above';
+
+    if (direction === 'BULLISH' && isSupport) {
+      confirmCount++;
+      confirmedTickers.add(ticker);
+      details.push(`${ticker} KN@${kn.strike} support`);
+    } else if (direction === 'BEARISH' && isResistance) {
+      confirmCount++;
+      confirmedTickers.add(ticker);
+      details.push(`${ticker} KN@${kn.strike} resistance`);
+    }
+  }
+
+  // Check SPY/QQQ rug setups as additional confirmation (don't double-count)
+  for (const rug of rugs) {
+    if (rug.ticker === 'SPXW') continue;
+    if (confirmedTickers.has(rug.ticker)) continue;
+
+    if (rug.direction === direction) {
+      confirmCount++;
+      confirmedTickers.add(rug.ticker);
+      details.push(`${rug.ticker} ${rug.type}`);
+    }
+  }
+
+  return {
+    confirmed: confirmCount >= 1,
+    strong: confirmCount >= 2,
+    count: confirmCount,
+    details,
+  };
+}
+
 // ---- Multi-Expiration Confirmation (Fix 5) ----
 
 function hasMultiExpConfirmation(strike, aggregatedGex, allExpGex) {
@@ -192,6 +246,10 @@ function detectRugPull(ctx) {
     if (posTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'upgrade');
     else if (posTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'downgrade');
 
+    // Cross-ticker boost: SPY/QQQ confirming bearish
+    const crossTicker = getCrossTickerConfirmation(multiAnalysis, 'BEARISH');
+    if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
+
     // Target must be BELOW spot for bearish — use negStrike only if below, else nearest wall below
     const targetStrike = rug.negStrike < scored.spotPrice
       ? rug.negStrike
@@ -239,6 +297,13 @@ function detectReverseRug(ctx) {
     if (posTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
     else if (posTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
 
+    // Rapid growth boost: floor doubled in 30 cycles = very strong structural support
+    if (posTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
+
+    // Cross-ticker boost: SPY/QQQ confirming bullish
+    const crossTicker = getCrossTickerConfirmation(multiAnalysis, 'BULLISH');
+    if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
+
     // Target must be ABOVE spot for bullish — use negStrike only if above, else nearest wall above
     const targetStrike = rug.negStrike > scored.spotPrice
       ? rug.negStrike
@@ -263,41 +328,88 @@ function detectReverseRug(ctx) {
 // ---- Pattern 3: King Node Bounce ----
 
 function detectKingNodeBounce(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends, kingNodeFlip } = ctx;
   const kingNodes = multiAnalysis.king_nodes || {};
   const results = [];
   const maxTouches = cfg.pattern_king_node_max_touches ?? 1;
 
-  // Only check SPXW king node for trade decisions
   const kn = kingNodes.SPXW;
   if (!kn) return results;
 
-  // Within 10pts of spot (2 strikes) — clearer than percentage-based
   const knDistPts = Math.abs(kn.strike - scored.spotPrice);
+
+  if (kn.type === 'negative') {
+    // --- NEGATIVE MAGNET BOUNCE ---
+    // When price arrives at a negative magnet, the pull is satisfied → reversal zone
+    const maxMagnetDist = cfg.negative_king_node_max_dist_pts ?? 5;
+    if (knDistPts > maxMagnetDist) return results;
+
+    const touches = nodeTouches[kn.strike]?.touches || 0;
+    if (touches > maxTouches) return results;
+
+    // Start at MEDIUM — magnets are less reliable bounce zones than positive walls
+    let confidence = 'MEDIUM';
+    if (kn.absGexValue < (scored.wallsAbove[0]?.absGexValue || 1) * 0.30) {
+      confidence = 'LOW';
+    }
+
+    const knTrend = nodeTrends.get(kn.strike);
+    if (knTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
+    else if (knTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
+    if (knTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
+
+    // Negative magnet below → price was pulled down, now reverses UP (BULLISH)
+    // Negative magnet above → price was pulled up, now reverses DOWN (BEARISH)
+    const direction = kn.relativeToSpot === 'above' ? 'BEARISH' : 'BULLISH';
+
+    // Cross-ticker boost: SPY/QQQ king nodes confirming same direction
+    const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
+    if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
+
+    const targetWall = direction === 'BEARISH'
+      ? scored.wallsBelow?.[0]
+      : scored.wallsAbove?.[0];
+
+    results.push({
+      pattern: 'KING_NODE_BOUNCE',
+      direction,
+      confidence,
+      entry_strike: Math.round(scored.spotPrice / 5) * 5,
+      target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
+      stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
+      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} reversal`,
+      source_ticker: 'SPXW',
+      walls: { king: kn.strike, king_value: kn.gexValue },
+    });
+    return results;
+  }
+
+  // --- POSITIVE KING NODE BOUNCE (existing logic) ---
   if (knDistPts > 10) return results;
 
-  // Skip negative king nodes (magnets pull, not bounce)
-  if (kn.type === 'negative') return results;
-
   const touches = nodeTouches[kn.strike]?.touches || 0;
-  if (touches > maxTouches) return results; // Node too tested, likely to break
+  if (touches > maxTouches) return results;
 
   let confidence = touches === 0 ? 'HIGH' : 'MEDIUM';
-  // Downgrade if node is small
   if (kn.absGexValue < (scored.wallsAbove[0]?.absGexValue || 1) * 0.30) {
     confidence = 'LOW';
   }
 
-  // Trend adjustment: GROWING king = stronger rejection, WEAKENING = less likely to hold
   const knTrend = nodeTrends.get(kn.strike);
   if (knTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
   else if (knTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
+  if (knTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
 
-  // Positive wall above → price bounces down (BEARISH)
-  // Positive wall below → price bounces up (BULLISH)
+  if (kingNodeFlip?.strike === kn.strike && kingNodeFlip.fromType === 'negative' && kingNodeFlip.toType === 'positive') {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+
   const direction = kn.relativeToSpot === 'above' ? 'BEARISH' : 'BULLISH';
 
-  // Target: nearest wall in bounce direction
+  // Cross-ticker boost: SPY/QQQ king nodes confirming same direction
+  const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
+  if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
+
   const targetWall = direction === 'BEARISH'
     ? scored.wallsBelow?.[0]
     : scored.wallsAbove?.[0];
@@ -308,10 +420,8 @@ function detectKingNodeBounce(ctx) {
     confidence,
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
-    stop_strike: direction === 'BEARISH'
-      ? kn.strike + 5 // Stop above the king node
-      : kn.strike - 5, // Stop below the king node
-    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches) — expect ${direction.toLowerCase()} bounce`,
+    stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
+    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} bounce`,
     source_ticker: 'SPXW',
     walls: { king: kn.strike, king_value: kn.gexValue },
   });
@@ -322,7 +432,7 @@ function detectKingNodeBounce(ctx) {
 // ---- Pattern 4: Pika Pillow (BULLISH) ----
 
 function detectPikaPillow(ctx) {
-  const { scored, cfg, nodeTrends } = ctx;
+  const { scored, multiAnalysis, cfg, nodeTrends } = ctx;
   const results = [];
 
   // Requires: positive floor below spot
@@ -350,6 +460,13 @@ function detectPikaPillow(ctx) {
   const floorTrend = nodeTrends.get(scored.floorWall.strike);
   if (floorTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
   else if (floorTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
+
+  // Rapid growth boost: pillow doubled in 30 cycles = very strong cushion
+  if (floorTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
+
+  // Cross-ticker boost: SPY/QQQ confirming bullish support
+  const crossTicker = getCrossTickerConfirmation(multiAnalysis, 'BULLISH');
+  if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
   const env = scored.gexAtSpot < 0 ? 'neg gamma' : 'pos gamma (reduced)';
 
@@ -415,6 +532,10 @@ function detectTripleCeilingFloor(ctx) {
 
     confidence = stack.count >= 4 ? 'HIGH' : 'MEDIUM';
     if (distPct > 0.5) confidence = confidence === 'HIGH' ? 'MEDIUM' : 'LOW';
+
+    // Cross-ticker boost: SPY/QQQ confirming same direction
+    const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
+    if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
     results.push({
       pattern: stack.type === 'ceiling' || stack.type === 'magnet_above' ? 'TRIPLE_CEILING' : 'TRIPLE_FLOOR',
@@ -540,6 +661,70 @@ function detectRangeEdgeFade(ctx) {
       reasoning: `Gatekeeper at ${gk.strike} (${(gk.size_pct * 100).toFixed(0)}% of largest, ${touches} touches, ${distPct.toFixed(2)}% away) — fade ${direction.toLowerCase()}`,
       source_ticker: 'SPXW',
       walls: { gatekeeper: gk.strike, size_pct: gk.size_pct },
+    });
+  }
+
+  return results;
+}
+
+// ---- Pattern 8: Wall Flip (sign change at a wall) ----
+
+function detectWallFlip(ctx) {
+  const { scored, cfg, nodeSignChanges } = ctx;
+  const results = [];
+  if (!nodeSignChanges || nodeSignChanges.length === 0) return results;
+
+  const minMagnitude = cfg.wall_flip_min_magnitude ?? 5_000_000;
+
+  for (const change of nodeSignChanges) {
+    if (change.magnitude < minMagnitude) continue;
+    if (change.from === 'absent') continue; // That's emergence, not a flip
+
+    const distPts = Math.abs(change.strike - scored.spotPrice);
+    if (distPts > 20) continue; // Too far from spot to matter
+
+    let direction = null;
+    let confidence;
+    let reasoning;
+
+    if (change.from === 'negative' && change.to === 'positive') {
+      // Former magnet/resistance became support → BULLISH (only if below spot)
+      if (change.strike <= scored.spotPrice) {
+        direction = 'BULLISH';
+        confidence = distPts <= 10 ? 'HIGH' : 'MEDIUM';
+        reasoning = `Wall at ${change.strike} flipped neg→pos (now ${(change.magnitude / 1e6).toFixed(0)}M support) — former resistance became support`;
+      }
+    } else if (change.from === 'positive' && change.to === 'negative') {
+      if (change.strike <= scored.spotPrice) {
+        // Former support became downside magnet → BEARISH
+        direction = 'BEARISH';
+        confidence = distPts <= 10 ? 'HIGH' : 'MEDIUM';
+        reasoning = `Wall at ${change.strike} flipped pos→neg (now ${(change.magnitude / 1e6).toFixed(0)}M magnet) — former support dissolved`;
+      } else {
+        // Wall above spot flipped pos→neg → magnet pulling up = BULLISH
+        direction = 'BULLISH';
+        confidence = 'MEDIUM';
+        reasoning = `Wall at ${change.strike} flipped pos→neg above spot (now magnet pulling up)`;
+      }
+    }
+
+    if (!direction) continue;
+
+    const targetWall = direction === 'BULLISH' ? scored.wallsAbove?.[0] : scored.wallsBelow?.[0];
+    const stopStrike = direction === 'BULLISH'
+      ? change.strike - 5
+      : change.strike + 5;
+
+    results.push({
+      pattern: 'WALL_FLIP',
+      direction,
+      confidence,
+      entry_strike: Math.round(scored.spotPrice / 5) * 5,
+      target_strike: targetWall?.strike || (direction === 'BULLISH' ? scored.spotPrice + 15 : scored.spotPrice - 15),
+      stop_strike: stopStrike,
+      reasoning,
+      source_ticker: 'SPXW',
+      walls: { flipped_strike: change.strike, from: change.from, to: change.to, magnitude: change.magnitude },
     });
   }
 

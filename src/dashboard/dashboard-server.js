@@ -7,6 +7,9 @@
  */
 
 import { createServer } from 'http';
+import { fork } from 'child_process';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { EventEmitter } from 'events';
@@ -14,14 +17,17 @@ import { config } from '../utils/config.js';
 import { createLogger } from '../utils/logger.js';
 import { getLoopStatus } from '../pipeline/loop-status.js';
 import { getSchedulePhase, nowET, formatET } from '../utils/market-hours.js';
-import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getPhantomTradesByDate, getTodaysDecisions, getCheckedPredictionsToday, getTodaysPredictions, getPredictionsByDate, getAllVersions, getRecentRollbacks, getLatestBriefing, getAlertsFeed } from '../store/db.js';
+import { getLatestSnapshot, getHealth, getTodaysTrades, getOpenPhantoms, getPhantomTradesByDate, getTodaysDecisions, getCheckedPredictionsToday, getTodaysPredictions, getPredictionsByDate, getAllVersions, getRecentRollbacks, getLatestBriefing, getAlertsFeed, getRawSnapshotDates, saveBacktestPreset, getBacktestPresets, deleteBacktestPreset } from '../store/db.js';
 import { getPositionState, getCurrentPosition } from '../trades/trade-manager.js';
 import { getCurrentDecision } from '../agent/decision-engine.js';
 import { getSignalSnapshot, getDetailedState, updateSignal } from '../tv/tv-signal-store.js';
 import { saveTvSignalLog } from '../store/db.js';
 import { getTrinityState } from '../gex/trinity.js';
 import { getActiveVersionNumber, getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
-import { callKimiChat, isAgentAvailable } from '../agent/chat-agent.js';
+import { callKimiChat, isAgentAvailable, callBacktestChat } from '../agent/chat-agent.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const log = createLogger('Dashboard');
 
@@ -106,7 +112,7 @@ function createApi() {
   app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', 'http://localhost:3000');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
@@ -385,6 +391,140 @@ function createApi() {
       res.json({ ok: true, ticker: tkr, indicator: ind, signal });
     } catch (err) {
       log.error('POST /api/signals/manual error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // ---- Backtest endpoints ----
+
+  // GET /api/backtest/dates — list available replay dates
+  app.get('/api/backtest/dates', (req, res) => {
+    try {
+      const dates = getRawSnapshotDates(30);
+      res.json(dates);
+    } catch (err) {
+      log.error('GET /api/backtest/dates error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // POST /api/backtest/run — run replay in forked child process
+  app.post('/api/backtest/run', (req, res) => {
+    try {
+      const { date, configOverride } = req.body;
+      if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return res.status(400).json({ error: 'Valid date (YYYY-MM-DD) is required' });
+      }
+
+      const replayScript = join(__dirname, '..', 'backtest', 'replay.js');
+      const child = fork(replayScript, [], { silent: true });
+      let responded = false;
+
+      child.send({ date, configOverride: configOverride || null });
+
+      child.on('message', (msg) => {
+        if (responded) return;
+        responded = true;
+        if (msg.type === 'result') {
+          res.json(msg.data);
+        } else {
+          res.status(500).json({ error: msg.message || 'Replay failed' });
+        }
+      });
+
+      child.on('error', (err) => {
+        if (responded) return;
+        responded = true;
+        log.error('Replay fork error:', err.message);
+        res.status(500).json({ error: err.message });
+      });
+
+      child.on('exit', (code) => {
+        if (responded) return;
+        responded = true;
+        if (code !== 0) {
+          res.status(500).json({ error: `Replay process exited with code ${code}` });
+        }
+      });
+
+      // Timeout after 120s
+      setTimeout(() => {
+        if (responded) return;
+        responded = true;
+        child.kill();
+        res.status(504).json({ error: 'Replay timeout (120s)' });
+      }, 120_000);
+
+    } catch (err) {
+      log.error('POST /api/backtest/run error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // POST /api/backtest/chat — backtest strategy advisor chat
+  app.post('/api/backtest/chat', async (req, res) => {
+    try {
+      const { message, currentConfig, lastRunResults, history } = req.body;
+      if (!message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      if (!isAgentAvailable()) {
+        return res.status(503).json({ error: 'Chat agent not available — KIMI_API_KEY not set' });
+      }
+
+      const result = await callBacktestChat(
+        message.trim(),
+        currentConfig || getActiveConfig(),
+        lastRunResults || null,
+        history || [],
+      );
+
+      res.json({
+        reply: result.reply,
+        suggestedConfig: result.suggestedConfig,
+        tokens_used: result.tokens_used,
+        response_time_ms: result.response_time_ms,
+      });
+    } catch (err) {
+      log.error('POST /api/backtest/chat error:', err.message);
+      res.status(500).json({ error: 'Chat request failed' });
+    }
+  });
+
+  // GET /api/backtest/presets — list all saved presets
+  app.get('/api/backtest/presets', (req, res) => {
+    try {
+      res.json(getBacktestPresets());
+    } catch (err) {
+      log.error('GET /api/backtest/presets error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // POST /api/backtest/presets — save a preset
+  app.post('/api/backtest/presets', (req, res) => {
+    try {
+      const { name, config: presetConfig, description } = req.body;
+      if (!name || !presetConfig) {
+        return res.status(400).json({ error: 'name and config are required' });
+      }
+      saveBacktestPreset(name, presetConfig, description || null);
+      res.json({ ok: true, name });
+    } catch (err) {
+      log.error('POST /api/backtest/presets error:', err.message);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // DELETE /api/backtest/presets/:name — delete a preset
+  app.delete('/api/backtest/presets/:name', (req, res) => {
+    try {
+      const { name } = req.params;
+      deleteBacktestPreset(decodeURIComponent(name));
+      res.json({ ok: true });
+    } catch (err) {
+      log.error('DELETE /api/backtest/presets error:', err.message);
       res.status(500).json({ error: 'Internal error' });
     }
   });

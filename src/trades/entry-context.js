@@ -103,6 +103,12 @@ export function buildEntryContext(trigger, scored, multiAnalysis) {
       context.ceiling_node = findWall(scored.wallsAbove, 'positive', spotPrice);
       break;
 
+    case 'TREND_PULLBACK':
+      // Support = nearest positive wall below (trend floor), ceiling = nearest positive above
+      context.support_node = findWall(scored.wallsBelow, 'positive', spotPrice);
+      context.ceiling_node = findWall(scored.wallsAbove, 'positive', spotPrice);
+      break;
+
     default:
       // Generic: use nearest positive walls above/below
       context.support_node = findWall(scored.wallsBelow, 'positive', spotPrice);

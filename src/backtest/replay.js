@@ -14,23 +14,24 @@ import { getRawSnapshotsByDate, getRawSnapshotDates, reconstructParsedData } fro
 import { identifyWalls } from '../gex/gex-parser.js';
 import { scoreSpxGex } from '../gex/gex-scorer.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
-import { checkGexOnlyEntry } from '../trades/entry-engine.js';
+import { checkGexOnlyEntry, checkTrendPullbackEntry } from '../trades/entry-engine.js';
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
 import {
   resetDailyState, saveGexRead, saveNodeSnapshot, recordScore,
   updateRegime, getNodeTrends, updateLatestSpot, getGexHistory,
-  detectWallTrends,
+  detectWallTrends, saveKingNode, getNodeSignChanges, getKingNodeFlip,
 } from '../store/state.js';
 import { updateNodeTouches, resetNodeTouches, getNodeTouches } from '../gex/node-tracker.js';
-import { initStrategyStore, getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
+import { initStrategyStore, getActiveConfig, getVersionLabel, setActiveConfigOverride } from '../review/strategy-store.js';
+import { updateTrendBuffer, detectTrendDay, getTrendState, resetTrendDetector } from '../store/trend-detector.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Replay');
 
 // ---- Core Replay Function ----
 
-function replayDate(dateStr) {
+export function replayDate(dateStr, configOverride = null) {
   // 1. LOAD
   const allRows = getRawSnapshotsByDate(dateStr);
   if (allRows.length === 0) {
@@ -38,11 +39,12 @@ function replayDate(dateStr) {
     return null;
   }
 
-  // Group by cycle_index
+  // Group by timestamp (cycle_index can repeat across sessions/restarts)
   const cycles = new Map();
   for (const row of allRows) {
-    if (!cycles.has(row.cycle_index)) cycles.set(row.cycle_index, {});
-    cycles.get(row.cycle_index)[row.ticker] = row;
+    const key = `${row.cycle_index}_${row.timestamp}`;
+    if (!cycles.has(key)) cycles.set(key, {});
+    cycles.get(key)[row.ticker] = row;
   }
 
   const spxwCount = allRows.filter(r => r.ticker === 'SPXW').length;
@@ -50,12 +52,20 @@ function replayDate(dateStr) {
 
   // 2. INITIALIZE
   initStrategyStore();
+
+  // Apply config override if provided (forked child process — dies with process)
+  if (configOverride && typeof configOverride === 'object') {
+    setActiveConfigOverride(configOverride);
+    log.info(`Config override applied: ${Object.keys(configOverride).length} params overridden`);
+  }
+
   const cfg = getActiveConfig();
   log.info(`Replaying with strategy ${getVersionLabel()} (${Object.keys(cfg).length} params)`);
 
   resetDailyState();
   resetNodeTouches();
   resetDailyGates();
+  resetTrendDetector();
 
   // 3. REPLAY STATE
   const state = {
@@ -65,11 +75,15 @@ function replayDate(dateStr) {
     cycleCount: 0,
   };
 
-  // 4. CYCLE LOOP
-  const sortedCycleIndices = [...cycles.keys()].sort((a, b) => a - b);
+  // 4. CYCLE LOOP — sort by SPXW timestamp to ensure chronological order
+  const sortedKeys = [...cycles.keys()].sort((a, b) => {
+    const tsA = cycles.get(a).SPXW?.timestamp || '';
+    const tsB = cycles.get(b).SPXW?.timestamp || '';
+    return tsA.localeCompare(tsB);
+  });
 
-  for (const cycleIdx of sortedCycleIndices) {
-    const cycleData = cycles.get(cycleIdx);
+  for (const key of sortedKeys) {
+    const cycleData = cycles.get(key);
     state.cycleCount++;
     replayCycle(cycleData, state, cfg);
   }
@@ -127,11 +141,19 @@ function replayCycle(cycleData, state, cfg) {
   const bonus = storedMultiAnalysis.bonus || 0;
   const scored = scoreSpxGex(spxwParsed, wallTrends, bonus, 'SPXW');
 
+  // Save king node for type flip detection
+  const spxwKingNode = storedMultiAnalysis.king_nodes?.SPXW;
+  if (spxwKingNode) saveKingNode(spxwKingNode, 'SPXW');
+
   // Track state
   updateNodeTouches(spxwParsed.spotPrice, spxwWalls);
-  recordScore('SPXW', scored.score, scored.direction);
+  recordScore('SPXW', scored.score, scored.direction, scored.spotPrice);
   updateRegime('SPXW', scored.direction);
   updateLatestSpot(spxwParsed.spotPrice);
+
+  // Trend day detection
+  updateTrendBuffer(scored, cfg);
+  detectTrendDay();
 
   // Parse replay time for time-based gates
   const replayTime = DateTime.fromFormat(
@@ -143,7 +165,7 @@ function replayCycle(cycleData, state, cfg) {
   if (state.position) {
     const exitResult = checkReplayExits(
       state.position, spxwParsed.spotPrice, scored,
-      storedMultiAnalysis, spxwRow, cfg, replayTime
+      storedMultiAnalysis, spxwRow, cfg, replayTime, getTrendState()
     );
     if (exitResult.exit) {
       closeReplayPosition(state, spxwParsed.spotPrice, exitResult.reason, spxwRow.timestamp);
@@ -155,20 +177,23 @@ function replayCycle(cycleData, state, cfg) {
     const nodeTouches = getNodeTouches();
     const nodeTrends = getNodeTrends('SPXW');
 
+    const nodeSignChanges = getNodeSignChanges('SPXW');
+    const kingNodeFlip = getKingNodeFlip('SPXW');
     const detectedPatterns = detectAllPatterns(
       scored, spxwParsed, storedMultiAnalysis,
-      nodeTouches, nodeTrends, null
+      nodeTouches, nodeTrends, null,
+      nodeSignChanges, kingNodeFlip
     );
 
     if (detectedPatterns.length > 0) {
-      const entryState = { patterns: detectedPatterns, scored, multiAnalysis: storedMultiAnalysis, nodeTouches };
+      const entryState = { patterns: detectedPatterns, scored, multiAnalysis: storedMultiAnalysis, nodeTouches, trendState: getTrendState() };
       const laneAResult = checkGexOnlyEntry(entryState);
 
       if (laneAResult?.shouldEnter) {
         const replayMs = replayTime.toMillis();
         const guardrail = checkEntryGates(
           laneAResult.action, scored, storedMultiAnalysis,
-          { lane: 'A', timeOverride: replayTime, nowMs: replayMs }
+          { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: laneAResult.trigger.pattern, trendState: getTrendState() }
         );
 
         if (guardrail.allowed) {
@@ -181,7 +206,7 @@ function replayCycle(cycleData, state, cfg) {
             entryContext,
             timestamp: spxwRow.timestamp,
           });
-          recordEntryForGates(replayMs);
+          recordEntryForGates(replayMs, laneAResult.trigger.pattern);
         } else {
           state.blockedEntries.push({
             timestamp: spxwRow.timestamp,
@@ -193,6 +218,44 @@ function replayCycle(cycleData, state, cfg) {
         }
       }
     }
+
+    // Trend pullback entry (only when Lane A didn't fire and still FLAT)
+    if (!state.position) {
+      const currentTrend = getTrendState();
+      if (currentTrend.isTrend) {
+        const pullbackResult = checkTrendPullbackEntry(
+          { scored, multiAnalysis: storedMultiAnalysis, nodeTouches },
+          currentTrend
+        );
+        if (pullbackResult?.shouldEnter) {
+          const replayMs = replayTime.toMillis();
+          const guardrail = checkEntryGates(
+            pullbackResult.action, scored, storedMultiAnalysis,
+            { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: 'TREND_PULLBACK', trendState: currentTrend }
+          );
+          if (guardrail.allowed) {
+            const entryContext = buildEntryContext(pullbackResult.trigger, scored, storedMultiAnalysis);
+            openReplayPosition(state, {
+              direction: pullbackResult.trigger.direction,
+              spotPrice: spxwParsed.spotPrice,
+              trigger: pullbackResult.trigger,
+              scored,
+              entryContext,
+              timestamp: spxwRow.timestamp,
+            });
+            recordEntryForGates(replayMs, 'TREND_PULLBACK');
+          } else {
+            state.blockedEntries.push({
+              timestamp: spxwRow.timestamp,
+              pattern: 'TREND_PULLBACK',
+              direction: pullbackResult.trigger.direction,
+              reason: guardrail.reason,
+              score: scored.score,
+            });
+          }
+        }
+      }
+    }
   }
 }
 
@@ -200,12 +263,32 @@ function replayCycle(cycleData, state, cfg) {
 
 function openReplayPosition(state, params) {
   const { direction, spotPrice, trigger, scored, entryContext, timestamp } = params;
+  const cfg = getActiveConfig() || {};
+
+  let stopSpx = trigger.stop_strike;
+
+  // Widen stop for trend days
+  const currentTrend = getTrendState();
+  const entryTrendAligned = currentTrend?.isTrend && currentTrend.direction === direction
+    && (currentTrend.strength === 'CONFIRMED' || currentTrend.strength === 'STRONG');
+  if (entryTrendAligned && stopSpx) {
+    const stopDist = Math.abs(stopSpx - spotPrice);
+    const trendMult = cfg.trend_stop_multiplier ?? 1.5;
+    stopSpx = direction === 'BULLISH' ? spotPrice - stopDist * trendMult : spotPrice + stopDist * trendMult;
+  }
+
+  // Widen stop for breakout entries
+  if (scored.score >= (cfg.breakout_score_threshold ?? 90) && stopSpx) {
+    const stopDist = Math.abs(stopSpx - spotPrice);
+    const breakoutMult = cfg.breakout_stop_multiplier ?? 1.3;
+    stopSpx = direction === 'BULLISH' ? spotPrice - stopDist * breakoutMult : spotPrice + stopDist * breakoutMult;
+  }
 
   state.position = {
     direction,
     entrySpx: spotPrice,
     targetSpx: trigger.target_strike,
-    stopSpx: trigger.stop_strike,
+    stopSpx,
     pattern: trigger.pattern,
     confidence: trigger.confidence,
     entryScore: scored.score,
@@ -213,9 +296,10 @@ function openReplayPosition(state, params) {
     openedAt: timestamp,
     entryTimestampMs: DateTime.fromFormat(timestamp, 'yyyy-MM-dd HH:mm:ss', { zone: 'America/New_York' }).toMillis(),
     bestSpxChange: 0,
+    _gexFlipCount: 0,
   };
 
-  log.info(`ENTRY ${timestamp} | ${direction} @ $${spotPrice.toFixed(2)} via ${trigger.pattern} (${trigger.confidence}) | target=${trigger.target_strike} stop=${trigger.stop_strike}`);
+  log.info(`ENTRY ${timestamp} | ${direction} @ $${spotPrice.toFixed(2)} via ${trigger.pattern} (${trigger.confidence}) | target=${trigger.target_strike} stop=${stopSpx?.toFixed(2) || '?'}`);
 }
 
 function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
@@ -248,13 +332,17 @@ function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
   log.info(`EXIT  ${timestamp} | ${pos.direction} ${exitReason} | ${pnlStr} | ${spxChange > 0 ? 'WIN' : 'LOSS'}`);
 
   state.position = null;
-  recordExitForGates(pos.direction, spxChange <= 0, exitMs);
+  recordExitForGates(pos.direction, spxChange <= 0, exitMs, pos.pattern);
 }
 
 // ---- Exit Trigger Checks (Pure, No DB Writes) ----
 
-function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow, cfg, replayTime) {
+function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow, cfg, replayTime, trendState) {
   const isBullish = position.direction === 'BULLISH';
+  const isTrendAligned =
+    (trendState?.isTrend && trendState.direction === position.direction
+      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG'))
+    || (trendState?.dayExitTrendDirection === position.direction);
 
   // Compute hold time from actual timestamps
   const currentMs = replayTime.toMillis();
@@ -306,6 +394,18 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     }
   }
 
+  // 2b. TREND_FLOOR_BREAK — structural exit during trend days
+  if (isTrendAligned && trendState.supportFloor?.strike) {
+    const floorBuffer = cfg.trend_floor_break_buffer_pts ?? 3;
+    if (isBullish && currentSpot < trendState.supportFloor.strike - floorBuffer) {
+      return { exit: true, reason: 'TREND_FLOOR_BREAK' };
+    }
+    if (!isBullish && trendState.resistanceCeiling?.strike &&
+        currentSpot > trendState.resistanceCeiling.strike + floorBuffer) {
+      return { exit: true, reason: 'TREND_FLOOR_BREAK' };
+    }
+  }
+
   // 3. STOP_HIT
   if (position.stopSpx) {
     const stopHit = isBullish
@@ -314,45 +414,61 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     if (stopHit) return { exit: true, reason: 'STOP_HIT' };
   }
 
-  // 4. PROFIT_TARGET
+  // 4. PROFIT_TARGET (trend-aware)
   const movePct = Math.abs(spxProgress / position.entrySpx) * 100;
-  if (spxProgress > 0 && movePct >= (cfg.profit_target_pct || 0.15)) {
+  let profitTargetPct = cfg.profit_target_pct || 0.15;
+  if (isTrendAligned) profitTargetPct *= (cfg.trend_profit_target_multiplier ?? 2.5);
+  if (spxProgress > 0 && movePct >= profitTargetPct) {
     return { exit: true, reason: 'PROFIT_TARGET' };
   }
 
-  // 5. STOP_LOSS
-  if (spxProgress < 0 && Math.abs(movePct) >= (cfg.stop_loss_pct || 0.20)) {
+  // 5. STOP_LOSS (trend-aware)
+  let stopLossPct = cfg.stop_loss_pct || 0.20;
+  if (isTrendAligned) stopLossPct *= (cfg.trend_stop_loss_multiplier ?? 2.0);
+  if (spxProgress < 0 && Math.abs(movePct) >= stopLossPct) {
     return { exit: true, reason: 'STOP_LOSS' };
   }
 
-  // 6. MOMENTUM_TIMEOUT (4 phases)
-  const phase0Seconds = cfg.momentum_phase0_seconds ?? 60;
-  const phase0MinPts = cfg.momentum_phase0_min_pts ?? 1;
-  const phase1Seconds = (cfg.momentum_phase1_minutes ?? 5) * 60;
+  // 6. MOMENTUM_TIMEOUT (4 phases — phases 1-3 skipped during trend days)
+  const phase0Seconds = cfg.momentum_phase0_seconds ?? 90;
+  const phase0MinPts = cfg.momentum_phase0_min_pts ?? 0.5;
+  const isHighConfEntry = position.confidence === 'HIGH' || position.confidence === 'VERY_HIGH';
+  const phase1Minutes = isHighConfEntry
+    ? (cfg.momentum_phase1_high_conf_minutes ?? 7)
+    : (cfg.momentum_phase1_minutes ?? 5);
+  const phase1Seconds = phase1Minutes * 60;
 
-  // Phase 0: exempt from min hold
-  if (holdSeconds >= phase0Seconds && holdSeconds < phase1Seconds) {
+  // Phase 0: exempt from min hold — skip entirely during confirmed trend days
+  const breakoutThreshold = cfg.breakout_score_threshold ?? 90;
+  const isBreakoutEntry = isTrendAligned && position.entryContext?.gex_score_at_entry >= breakoutThreshold;
+
+  if (!isTrendAligned && !isBreakoutEntry && holdSeconds >= phase0Seconds && holdSeconds < phase1Seconds) {
     if (spxProgress < phase0MinPts) {
       return { exit: true, reason: 'MOMENTUM_TIMEOUT' };
     }
   }
 
-  if (!holdTooShort) {
-    // Phase 1: 5 min, need +2pts
-    if (holdMinutes >= (cfg.momentum_phase1_minutes ?? 5) && spxProgress < (cfg.momentum_phase1_min_pts ?? 2)) {
+  // Skip momentum phases 1-3 entirely during confirmed trend days
+  // Rely on structural exits (TREND_FLOOR_BREAK, TRAILING_STOP, GEX_FLIP) instead
+  if (!isTrendAligned && !holdTooShort) {
+    // Phase 1: adaptive timeout
+    const phase1Pts = cfg.momentum_phase1_min_pts ?? 2;
+    if (holdMinutes >= phase1Minutes && spxProgress < phase1Pts) {
       return { exit: true, reason: 'MOMENTUM_TIMEOUT' };
     }
 
-    // Phase 2: 10 min, need 40% to target
-    if (holdMinutes >= (cfg.momentum_phase2_minutes ?? 10) && position.targetSpx) {
+    // Phase 2: need 40% to target
+    const phase2Min = cfg.momentum_phase2_minutes ?? 10;
+    if (holdMinutes >= phase2Min && position.targetSpx) {
       const totalTarget = Math.abs(position.targetSpx - position.entrySpx);
       if (totalTarget > 0 && spxProgress < totalTarget * (cfg.momentum_phase2_target_pct ?? 0.40)) {
         return { exit: true, reason: 'MOMENTUM_TIMEOUT' };
       }
     }
 
-    // Phase 3: 15 min, must be net positive
-    if (holdMinutes >= (cfg.momentum_phase3_minutes ?? 15) && spxProgress <= 0) {
+    // Phase 3: must be net positive
+    const phase3Min = cfg.momentum_phase3_minutes ?? 15;
+    if (holdMinutes >= phase3Min && spxProgress <= 0) {
       return { exit: true, reason: 'MOMENTUM_TIMEOUT' };
     }
   }
@@ -392,8 +508,8 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     } catch (_) {}
   }
 
-  // 8. OPPOSING_WALL
-  if (!holdTooShort) {
+  // 8. OPPOSING_WALL — skip during confirmed trend days (walls shift naturally)
+  if (!isTrendAligned && !holdTooShort) {
     const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
     const walls = isBullish ? scored.wallsAbove : scored.wallsBelow;
     const hasOpposing = walls?.some(w => Math.abs(w.gexValue || w.absGexValue || 0) >= opposingWallValue && w.type === 'positive');
@@ -402,10 +518,14 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     }
   }
 
-  // 9. TRAILING_STOP
+  // 9. TRAILING_STOP (trend-aware)
   if (!holdTooShort) {
-    const trailActivate = cfg.trailing_stop_activate_pts || 8;
-    const trailDistance = cfg.trailing_stop_distance_pts || 5;
+    const trailActivate = isTrendAligned
+      ? (cfg.trend_trail_activate_pts ?? 5)
+      : (cfg.trailing_stop_activate_pts || 8);
+    const trailDistance = isTrendAligned
+      ? (cfg.trend_trail_distance_pts ?? 8)
+      : (cfg.trailing_stop_distance_pts || 5);
     if (position.bestSpxChange >= trailActivate) {
       const drawdown = position.bestSpxChange - spxProgress;
       if (drawdown >= trailDistance) {
@@ -421,11 +541,21 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     return { exit: true, reason: 'THETA_DEATH' };
   }
 
-  // 11. GEX_FLIP
+  // 11. GEX_FLIP (trend-aware: require consecutive opposing cycles)
   if (!holdTooShort && scored.score >= (cfg.gex_exit_threshold || 40)) {
     const gexBullish = scored.direction === 'BULLISH';
     if (gexBullish !== isBullish) {
-      return { exit: true, reason: 'GEX_FLIP' };
+      if (isTrendAligned) {
+        position._gexFlipCount = (position._gexFlipCount || 0) + 1;
+        const requiredFlips = cfg.trend_gex_flip_required_cycles ?? 3;
+        if (position._gexFlipCount >= requiredFlips) {
+          return { exit: true, reason: 'GEX_FLIP' };
+        }
+      } else {
+        return { exit: true, reason: 'GEX_FLIP' };
+      }
+    } else {
+      if (position._gexFlipCount) position._gexFlipCount = 0;
     }
   }
 
@@ -481,82 +611,102 @@ function buildReplayReport(state, dateStr) {
   };
 }
 
-// ---- CLI Entry Point ----
+// ---- Child Process Handler (for dashboard backtest API) ----
 
-const args = process.argv.slice(2);
-const dateArg = args[0];
+if (process.send) {
+  process.on('message', (msg) => {
+    try {
+      const { date, configOverride } = msg;
+      const result = replayDate(date, configOverride);
+      process.send({ type: 'result', data: result }, () => {
+        process.disconnect();
+      });
+    } catch (err) {
+      process.send({ type: 'error', message: err.message }, () => {
+        process.disconnect();
+      });
+    }
+  });
+}
 
-if (!dateArg || !/^\d{4}-\d{2}-\d{2}$/.test(dateArg)) {
-  console.error('Usage: node src/backtest/replay.js <YYYY-MM-DD>');
-  console.error('Example: node src/backtest/replay.js 2026-02-27');
+// ---- CLI Entry Point (only when run directly, not as child process) ----
 
-  const dates = getRawSnapshotDates(10);
-  if (dates.length > 0) {
-    console.error('\nAvailable dates:');
-    dates.forEach(d => console.error(`  ${d.date} (${d.snapshots} snapshots, ${d.tickers} tickers)`));
-  } else {
-    console.error('\nNo snapshot data yet. Snapshots accumulate during live operation.');
+if (!process.send) {
+  const args = process.argv.slice(2);
+  const dateArg = args[0];
+
+  if (!dateArg || !/^\d{4}-\d{2}-\d{2}$/.test(dateArg)) {
+    console.error('Usage: node src/backtest/replay.js <YYYY-MM-DD>');
+    console.error('Example: node src/backtest/replay.js 2026-02-27');
+
+    const dates = getRawSnapshotDates(10);
+    if (dates.length > 0) {
+      console.error('\nAvailable dates:');
+      dates.forEach(d => console.error(`  ${d.date} (${d.snapshots} snapshots, ${d.tickers} tickers)`));
+    } else {
+      console.error('\nNo snapshot data yet. Snapshots accumulate during live operation.');
+    }
+    process.exit(1);
   }
-  process.exit(1);
-}
 
-console.log(`\n${'='.repeat(50)}`);
-console.log(`  GexClaw Replay Engine`);
-console.log(`${'='.repeat(50)}\n`);
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`  GexClaw Replay Engine`);
+  console.log(`${'='.repeat(50)}\n`);
 
-const report = replayDate(dateArg);
+  const report = replayDate(dateArg);
 
-if (!report) {
-  process.exit(1);
-}
-
-console.log(`\n${'='.repeat(50)}`);
-console.log(`  Results: ${report.date} | Strategy: ${report.strategy}`);
-console.log(`${'='.repeat(50)}\n`);
-
-console.log(`Cycles: ${report.cycles}`);
-console.log(`Trades: ${report.totalTrades} (${report.wins}W / ${report.losses}L)`);
-console.log(`Win Rate: ${report.winRate}%`);
-console.log(`Total P&L: ${report.totalPnlPts > 0 ? '+' : ''}${report.totalPnlPts} SPX pts`);
-if (report.wins > 0) console.log(`Avg Win: +${report.avgWinPts} pts`);
-if (report.losses > 0) console.log(`Avg Loss: ${report.avgLossPts} pts`);
-if (report.wins > 0 && report.losses > 0) {
-  const rr = Math.abs(report.avgWinPts / report.avgLossPts);
-  console.log(`Reward/Risk: ${rr.toFixed(2)}`);
-}
-
-if (Object.keys(report.exitReasons).length > 0) {
-  console.log(`\nExit Reasons:`);
-  for (const [reason, count] of Object.entries(report.exitReasons).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${reason}: ${count}`);
+  if (!report) {
+    process.exit(1);
   }
-}
 
-if (Object.keys(report.patternPerformance).length > 0) {
-  console.log(`\nPattern Performance:`);
-  for (const [pattern, perf] of Object.entries(report.patternPerformance)) {
-    const total = perf.wins + perf.losses;
-    const wr = total > 0 ? ((perf.wins / total) * 100).toFixed(0) : 'N/A';
-    const pnlStr = `${perf.totalPnl > 0 ? '+' : ''}${perf.totalPnl.toFixed(2)}`;
-    console.log(`  ${pattern}: ${perf.wins}W/${perf.losses}L (${wr}%) | ${pnlStr} pts`);
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`  Results: ${report.date} | Strategy: ${report.strategy}`);
+  console.log(`${'='.repeat(50)}\n`);
+
+  console.log(`Cycles: ${report.cycles}`);
+  console.log(`Trades: ${report.totalTrades} (${report.wins}W / ${report.losses}L)`);
+  console.log(`Win Rate: ${report.winRate}%`);
+  console.log(`Total P&L: ${report.totalPnlPts > 0 ? '+' : ''}${report.totalPnlPts} SPX pts`);
+  if (report.wins > 0) console.log(`Avg Win: +${report.avgWinPts} pts`);
+  if (report.losses > 0) console.log(`Avg Loss: ${report.avgLossPts} pts`);
+  if (report.wins > 0 && report.losses > 0) {
+    const rr = Math.abs(report.avgWinPts / report.avgLossPts);
+    console.log(`Reward/Risk: ${rr.toFixed(2)}`);
   }
-}
 
-if (report.blockedEntries > 0) {
-  console.log(`\nBlocked Entries: ${report.blockedEntries}`);
-  for (const [reason, count] of Object.entries(report.blockReasons).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${reason}: ${count}`);
+  if (Object.keys(report.exitReasons).length > 0) {
+    console.log(`\nExit Reasons:`);
+    for (const [reason, count] of Object.entries(report.exitReasons).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${reason}: ${count}`);
+    }
   }
-}
 
-if (report.trades.length > 0) {
-  console.log(`\nTrade Log:`);
-  for (const t of report.trades) {
-    const pnlStr = `${t.spxChange > 0 ? '+' : ''}${t.spxChange}`;
-    const tag = t.isWin ? 'WIN ' : 'LOSS';
-    console.log(`  ${t.openedAt} | ${t.direction.padEnd(7)} ${t.pattern.padEnd(20)} | $${t.entrySpx.toFixed(2)} -> $${t.exitSpx.toFixed(2)} | ${pnlStr.padStart(8)} pts | ${t.exitReason.padEnd(18)} | ${tag}`);
+  if (Object.keys(report.patternPerformance).length > 0) {
+    console.log(`\nPattern Performance:`);
+    for (const [pattern, perf] of Object.entries(report.patternPerformance)) {
+      const total = perf.wins + perf.losses;
+      const wr = total > 0 ? ((perf.wins / total) * 100).toFixed(0) : 'N/A';
+      const pnlStr = `${perf.totalPnl > 0 ? '+' : ''}${perf.totalPnl.toFixed(2)}`;
+      console.log(`  ${pattern}: ${perf.wins}W/${perf.losses}L (${wr}%) | ${pnlStr} pts`);
+    }
   }
-}
 
-console.log('');
-process.exit(0);
+  if (report.blockedEntries > 0) {
+    console.log(`\nBlocked Entries: ${report.blockedEntries}`);
+    for (const [reason, count] of Object.entries(report.blockReasons).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${reason}: ${count}`);
+    }
+  }
+
+  if (report.trades.length > 0) {
+    console.log(`\nTrade Log:`);
+    for (const t of report.trades) {
+      const pnlStr = `${t.spxChange > 0 ? '+' : ''}${t.spxChange}`;
+      const tag = t.isWin ? 'WIN ' : 'LOSS';
+      console.log(`  ${t.openedAt} | ${t.direction.padEnd(7)} ${t.pattern.padEnd(20)} | $${t.entrySpx.toFixed(2)} -> $${t.exitSpx.toFixed(2)} | ${pnlStr.padStart(8)} pts | ${t.exitReason.padEnd(18)} | ${tag}`);
+    }
+  }
+
+  console.log('');
+  process.exit(0);
+}

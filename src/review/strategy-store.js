@@ -51,8 +51,8 @@ const V1_BASELINE = {
   gex_wait_zone_high: 60,
 
   // Exit tuning
-  profit_target_pct: 0.15,           // +0.15% SPX move → lock profits
-  stop_loss_pct: 0.20,               // -0.20% adverse → cut losses
+  profit_target_pct: 0.20,           // +0.20% SPX move → lock profits (was 0.15)
+  stop_loss_pct: 0.15,               // -0.15% adverse → cut losses (was 0.20)
   tv_against_exit_count: 2,          // 2+ opposing 3m TV signals → exit
   trailing_stop_activate_pts: 8,     // Activate trailing after +8 SPX pts
   trailing_stop_distance_pts: 5,     // Trail 5 pts behind best
@@ -60,8 +60,11 @@ const V1_BASELINE = {
 
   // Chop detection
   chop_lookback_cycles: 60,          // 60 cycles = 30 min of history
-  chop_flip_threshold: 6,            // 6+ direction flips = chop
-  chop_stddev_threshold: 20,         // score stddev > 20 = chop
+  chop_flip_threshold: 4,            // 4+ direction flips = chop (was 6)
+  chop_stddev_threshold: 15,         // score stddev > 15 = chop (was 20)
+  chop_flip_rate_threshold: 0.30,    // flip rate > 30% of cycles = chop
+  chop_entry_spacing_ms: 120_000,    // 2min spacing in chop (vs 60s default)
+  chop_min_entry_score: 80,          // during CHOP, require score >= 80
 
   // Strike selection weights
   rr_weight: 0.40,
@@ -107,8 +110,8 @@ const V1_BASELINE = {
   node_break_buffer_pts: 2,
 
   // MOMENTUM_TIMEOUT exit (4 phases — phase 0 exempt from min hold)
-  momentum_phase0_seconds: 60,
-  momentum_phase0_min_pts: 1,
+  momentum_phase0_seconds: 90,       // was 60 — give entries more time
+  momentum_phase0_min_pts: 0.5,      // was 1 — less aggressive early exit
   momentum_min_hold_minutes: 3,
   momentum_phase1_minutes: 5,
   momentum_phase1_min_pts: 2,
@@ -134,6 +137,59 @@ const V1_BASELINE = {
   rug_pull_min_value: 3_000_000,
   pika_pillow_min_value: 5_000_000,
   king_node_min_value: 3_000_000,
+
+  // Pattern-level risk management
+  max_trades_per_pattern: 8,         // max trades per pattern per day
+  pattern_loss_limit: 3,             // consecutive losses on same pattern → cooldown
+  pattern_loss_cooldown_ms: 30 * 60_000, // 30min cooldown after pattern loss limit
+  pattern_win_rate_min: 0.30,        // auto-disable patterns below 30% win rate
+  pattern_win_rate_min_trades: 10,   // need 10+ trades before win rate gate activates
+
+  // Entry quality
+  min_entry_rr_ratio: 1.5,           // require target >= 1.5x stop distance
+  structural_min_score: 40,          // structural patterns still need GEX score >= 40
+  midpoint_danger_zone_pct: 0.08,    // widen midpoint buffer from 0.05% to 0.08%
+
+  // Adaptive momentum
+  momentum_phase1_high_conf_minutes: 7, // HIGH/VERY_HIGH entries get 7min Phase 1 (vs 5)
+
+  // Trend day detection
+  trend_min_floor_value: 5_000_000,           // $5M min for wall to count as support floor
+  trend_min_lookback_cycles: 60,              // 30 min minimum data before detection
+  trend_min_floor_rise_pts: 15,               // support floor must migrate ≥15 SPX pts
+  trend_min_directional_bias_pct: 0.60,       // ≥60% of cycles must read same direction
+  trend_min_spot_move_pts: 10,                // spot must move ≥10 pts in trend direction
+  trend_deactivate_floor_drop_pts: 10,        // deactivate if floor drops 10+ pts from peak
+  trend_deactivate_bias_threshold: 0.40,      // deactivate if bias drops below 40%
+
+  // Trend day exit adjustments
+  trend_profit_target_multiplier: 2.5,        // 2.5x wider profit target during trend
+  trend_stop_loss_multiplier: 2.0,            // 2x wider stop loss during trend
+  trend_stop_multiplier: 1.5,                 // 1.5x wider structural stop at entry
+  trend_trail_activate_pts: 5,                // activate trailing sooner (5 vs 8 pts)
+  trend_trail_distance_pts: 8,                // trail wider (8 vs 5 pts)
+  trend_momentum_time_multiplier: 2.5,        // 2.5x longer momentum timeouts during trend
+  trend_momentum_phase1_min_pts: 1,            // reduced phase 1 min progress during trend (normally 2)
+  trend_gex_flip_required_cycles: 3,          // require 3 consecutive opposing GEX cycles
+  trend_floor_break_buffer_pts: 3,            // structural exit: spot must break floor by 3+ pts
+  breakout_score_threshold: 90,               // score ≥90 = breakout entry
+  breakout_stop_multiplier: 1.3,              // 1.3x wider stop for breakout entries
+
+  // Trend pullback entry
+  trend_pullback_enabled: true,
+  trend_pullback_min_score: 40,               // lower than normal — trend provides context
+  trend_pullback_max_dist_pts: 8,             // within 8 pts of support floor
+  trend_pullback_stop_buffer_pts: 5,          // stop 5 pts below support floor
+
+  // Trend day re-entry
+  trend_reentry_spacing_ms: 30_000,           // 30s cooldown (vs 60s) after win in trend
+
+  // Wall intelligence (Gap detection)
+  pin_gex_at_spot_threshold: 20_000_000,      // $20M GEX@spot + pos walls on both sides = extreme pin
+  wall_flip_min_magnitude: 5_000_000,         // $5M min for wall sign flip to count as pattern
+
+  // Cross-ticker + magnet bounce
+  negative_king_node_max_dist_pts: 5,          // Must be within 5pts for magnet bounce (vs 10pts for positive)
 };
 
 // ---- In-memory cache ----
@@ -182,6 +238,15 @@ export function initStrategyStore() {
  */
 export function getActiveConfig() {
   return activeConfig;
+}
+
+/**
+ * Override the in-memory active config WITHOUT creating a DB version.
+ * Used by the replay engine in forked child processes for backtest config testing.
+ * The override dies with the process — no impact on live trading.
+ */
+export function setActiveConfigOverride(overrideConfig) {
+  activeConfig = { ...activeConfig, ...overrideConfig };
 }
 
 /**
