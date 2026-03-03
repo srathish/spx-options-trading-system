@@ -21,6 +21,7 @@ import {
   resetDailyState, saveGexRead, saveNodeSnapshot, recordScore,
   updateRegime, getNodeTrends, updateLatestSpot, getGexHistory,
   detectWallTrends, saveKingNode, getNodeSignChanges, getKingNodeFlip,
+  saveStackSnapshot, getStackPersistence,
 } from '../store/state.js';
 import { updateNodeTouches, resetNodeTouches, getNodeTouches } from '../gex/node-tracker.js';
 import { initStrategyStore, getActiveConfig, getVersionLabel, setActiveConfigOverride } from '../review/strategy-store.js';
@@ -144,6 +145,9 @@ function replayCycle(cycleData, state, cfg) {
   // Save king node for type flip detection
   const spxwKingNode = storedMultiAnalysis.king_nodes?.SPXW;
   if (spxwKingNode) saveKingNode(spxwKingNode, 'SPXW');
+
+  // Save stacked walls snapshot for persistence tracking
+  saveStackSnapshot(storedMultiAnalysis.stacked_walls || [], 'SPXW');
 
   // Track state
   updateNodeTouches(spxwParsed.spotPrice, spxwWalls);
@@ -361,12 +365,37 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     position.bestSpxChange = spxProgress;
   }
 
-  // 1. TARGET_HIT
+  // 1. TARGET_HIT (with magnet walk extension)
   if (position.targetSpx) {
     const targetHit = isBullish
       ? currentSpot >= position.targetSpx
       : currentSpot <= position.targetSpx;
-    if (targetHit) return { exit: true, reason: 'TARGET_HIT' };
+    if (targetHit) {
+      const walkEnabled = cfg.magnet_walk_enabled ?? true;
+      const maxWalks = cfg.magnet_walk_max_steps ?? 2;
+      const walkCount = position._walkCount || 0;
+      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+      const pattern = position.entryContext?.pattern;
+
+      if (walkEnabled && walkCount < maxWalks && walkPatterns.includes(pattern) && multiAnalysis) {
+        const nextMagnet = findNextMagnetReplay(multiAnalysis.stacked_walls || [], position.targetSpx, isBullish, cfg.magnet_walk_max_dist_pts ?? 25);
+        if (nextMagnet) {
+          const prevTarget = position.targetSpx;
+          position.targetSpx = nextMagnet.strike;
+          position._walkCount = walkCount + 1;
+          const ratchetPts = cfg.magnet_walk_stop_ratchet_pts ?? 3;
+          const newStop = isBullish ? prevTarget - ratchetPts : prevTarget + ratchetPts;
+          position.stopSpx = isBullish
+            ? Math.max(position.stopSpx, newStop)
+            : Math.min(position.stopSpx, newStop);
+          // Don't exit — continue with extended target
+        } else {
+          return { exit: true, reason: 'TARGET_HIT' };
+        }
+      } else {
+        return { exit: true, reason: 'TARGET_HIT' };
+      }
+    }
   }
 
   // 2. NODE_SUPPORT_BREAK (trend-aware)
@@ -518,14 +547,32 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     }
   }
 
+  // 8b. STACK_DISPERSED — overhead magnet stack that justified the trade has disappeared
+  if (!holdTooShort && position.entryContext?.initial_stack?.count > 0) {
+    const stackPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+    if (stackPatterns.includes(position.entryContext.pattern)) {
+      const stackPersistence = getStackPersistence('SPXW', position.direction);
+      if (stackPersistence.disappeared) return { exit: true, reason: 'STACK_DISPERSED' };
+      if (stackPersistence.trend === 'SHRINKING' && position.entryContext.initial_stack.totalNodes > 0) {
+        const shrinkRatio = stackPersistence.currentNodeCount / position.entryContext.initial_stack.totalNodes;
+        if (shrinkRatio < 0.5) position._stackShrinkTightened = true;
+      }
+    }
+  }
+
   // 9. TRAILING_STOP (trend-aware)
   if (!holdTooShort) {
-    const trailActivate = isTrendAligned
+    let trailActivate = isTrendAligned
       ? (cfg.trend_trail_activate_pts ?? 5)
       : (cfg.trailing_stop_activate_pts || 8);
-    const trailDistance = isTrendAligned
+    let trailDistance = isTrendAligned
       ? (cfg.trend_trail_distance_pts ?? 8)
       : (cfg.trailing_stop_distance_pts || 5);
+    // Tighten if stack is shrinking (>50% lost)
+    if (position._stackShrinkTightened) {
+      trailActivate = Math.max(3, Math.round(trailActivate * 0.6));
+      trailDistance = Math.max(3, Math.round(trailDistance * 0.7));
+    }
     if (position.bestSpxChange >= trailActivate) {
       const drawdown = position.bestSpxChange - spxProgress;
       if (drawdown >= trailDistance) {
@@ -560,6 +607,23 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
   }
 
   return { exit: false };
+}
+
+/**
+ * Find the next magnet target in stacked walls beyond the current target (replay version).
+ */
+function findNextMagnetReplay(stackedWalls, currentTarget, isBullish, maxDist) {
+  const relevantTypes = isBullish ? ['magnet_above'] : ['magnet_below'];
+  let best = null, bestDist = Infinity;
+  for (const stack of stackedWalls) {
+    if (stack.ticker !== 'SPXW' || !relevantTypes.includes(stack.type)) continue;
+    const magnetStrike = isBullish ? stack.startStrike : stack.endStrike;
+    const beyond = isBullish ? magnetStrike > currentTarget : magnetStrike < currentTarget;
+    if (!beyond) continue;
+    const dist = Math.abs(magnetStrike - currentTarget);
+    if (dist <= maxDist && dist < bestDist) { best = { strike: magnetStrike, type: stack.type }; bestDist = dist; }
+  }
+  return best;
 }
 
 // ---- Report Builder ----

@@ -6,11 +6,11 @@
 
 import {
   openTrade, closeTrade, updateTradePnlDb, confirmTrade,
-  getOpenTrade, getTradeById,
+  getOpenTrade, getTradeById, updateTradeTargetDb,
 } from '../store/db.js';
 import { nowET } from '../utils/market-hours.js';
 import { getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
-import { getNodeTrends } from '../store/state.js';
+import { getNodeTrends, getStackPersistence } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('TradeManager');
@@ -163,16 +163,47 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     // OR sticky exit trend direction matches (persists through oscillations)
     || (trendState?.dayExitTrendDirection === currentPosition.direction);
 
-  // 3a. Target hit — SPX reached target wall
+  // 3a. Target hit — SPX reached target wall (with magnet walk extension)
   if (currentPosition.targetSpx) {
     const targetHit = isBullish
       ? currentSpot >= currentPosition.targetSpx
       : currentSpot <= currentPosition.targetSpx;
 
     if (targetHit) {
-      result.exitTriggered = true;
-      result.exitReason = 'TARGET_HIT';
-      return result;
+      const walkEnabled = cfg.magnet_walk_enabled ?? true;
+      const maxWalks = cfg.magnet_walk_max_steps ?? 2;
+      const walkCount = currentPosition._walkCount || 0;
+      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+      const pattern = currentPosition.entryContext?.pattern;
+
+      if (walkEnabled && walkCount < maxWalks && walkPatterns.includes(pattern) && context.multiAnalysis) {
+        const nextMagnet = findNextMagnet(
+          context.multiAnalysis.stacked_walls || [],
+          currentPosition.targetSpx, isBullish,
+          cfg.magnet_walk_max_dist_pts ?? 25
+        );
+        if (nextMagnet) {
+          const prevTarget = currentPosition.targetSpx;
+          currentPosition.targetSpx = nextMagnet.strike;
+          currentPosition._walkCount = walkCount + 1;
+          const ratchetPts = cfg.magnet_walk_stop_ratchet_pts ?? 3;
+          const newStop = isBullish ? prevTarget - ratchetPts : prevTarget + ratchetPts;
+          currentPosition.stopSpx = isBullish
+            ? Math.max(currentPosition.stopSpx, newStop)
+            : Math.min(currentPosition.stopSpx, newStop);
+          try { updateTradeTargetDb(currentPosition.id, currentPosition.targetSpx); } catch (_) {}
+          log.info(`MAGNET_WALK ${currentPosition._walkCount}/${maxWalks}: target ${prevTarget}→${nextMagnet.strike} (${nextMagnet.type}), stop→${currentPosition.stopSpx}`);
+          // Don't exit — fall through to remaining exit checks
+        } else {
+          result.exitTriggered = true;
+          result.exitReason = 'TARGET_HIT';
+          return result;
+        }
+      } else {
+        result.exitTriggered = true;
+        result.exitReason = 'TARGET_HIT';
+        return result;
+      }
     }
   }
 
@@ -317,7 +348,28 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  // 3e2. MOMENTUM_TIMEOUT — 4 progressive phases of stall detection
+  // 3e2. STACK_DISPERSED — overhead/underfoot magnet stack that justified the trade has disappeared
+  if (!holdTooShort && currentPosition.entryContext?.initial_stack?.count > 0) {
+    const stackPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+    if (stackPatterns.includes(currentPosition.entryContext.pattern)) {
+      const stackPersistence = getStackPersistence('SPXW', currentPosition.direction);
+      if (stackPersistence.disappeared) {
+        result.exitTriggered = true;
+        result.exitReason = 'STACK_DISPERSED';
+        log.warn(`Stack dispersed: initial ${currentPosition.entryContext.initial_stack.totalNodes} nodes, now 0`);
+        return result;
+      }
+      if (stackPersistence.trend === 'SHRINKING' && currentPosition.entryContext.initial_stack.totalNodes > 0) {
+        const shrinkRatio = stackPersistence.currentNodeCount / currentPosition.entryContext.initial_stack.totalNodes;
+        if (shrinkRatio < 0.5 && !currentPosition._stackShrinkTightened) {
+          currentPosition._stackShrinkTightened = true;
+          log.info(`Stack shrinking (${(shrinkRatio * 100).toFixed(0)}% remaining) — tightening trailing stop`);
+        }
+      }
+    }
+  }
+
+  // 3e3. MOMENTUM_TIMEOUT — 4 progressive phases of stall detection
   // Phase 0 fires at 90s (exempt from min hold) to catch dead entries early
   if (currentPosition.entrySpx && currentSpot) {
     const holdSeconds = holdTimeMs / 1_000;
@@ -412,12 +464,17 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   }
 
   // 3h. Trailing stop — activated after threshold, trails behind best price (trend-aware)
-  const trailActivate = isTrendAligned
+  let trailActivate = isTrendAligned
     ? (cfg.trend_trail_activate_pts ?? 5)
     : (cfg.trailing_stop_activate_pts || 8);
-  const trailDistance = isTrendAligned
+  let trailDistance = isTrendAligned
     ? (cfg.trend_trail_distance_pts ?? 8)
     : (cfg.trailing_stop_distance_pts || 5);
+  // Tighten if stack is shrinking (>50% lost)
+  if (currentPosition._stackShrinkTightened) {
+    trailActivate = Math.max(3, Math.round(trailActivate * 0.6));
+    trailDistance = Math.max(3, Math.round(trailDistance * 0.7));
+  }
   if (!holdTooShort && currentPosition.entrySpx && currentSpot) {
     const spxChangeForTrail = isBullish ? currentSpot - currentPosition.entrySpx : currentPosition.entrySpx - currentSpot;
 
@@ -597,4 +654,22 @@ export function exitPosition(exitReason, exitSpx) {
  */
 export function shouldBePhantom() {
   return currentPosition !== null;
+}
+
+/**
+ * Find the next magnet target in stacked walls beyond the current target.
+ * Used for magnet walk — extending targets node-to-node.
+ */
+function findNextMagnet(stackedWalls, currentTarget, isBullish, maxDist) {
+  const relevantTypes = isBullish ? ['magnet_above'] : ['magnet_below'];
+  let best = null, bestDist = Infinity;
+  for (const stack of stackedWalls) {
+    if (stack.ticker !== 'SPXW' || !relevantTypes.includes(stack.type)) continue;
+    const magnetStrike = isBullish ? stack.startStrike : stack.endStrike;
+    const beyond = isBullish ? magnetStrike > currentTarget : magnetStrike < currentTarget;
+    if (!beyond) continue;
+    const dist = Math.abs(magnetStrike - currentTarget);
+    if (dist <= maxDist && dist < bestDist) { best = { strike: magnetStrike, type: stack.type }; bestDist = dist; }
+  }
+  return best;
 }

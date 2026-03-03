@@ -500,6 +500,10 @@ const updateTradeState = db.prepare(`
   UPDATE trades SET state = ?, last_update_at = ? WHERE id = ?
 `);
 
+const updateTradeTargetStmt = db.prepare(`
+  UPDATE trades SET target_spx = ?, last_update_at = ? WHERE id = ?
+`);
+
 const selectOpenTrade = db.prepare(`
   SELECT * FROM trades WHERE state IN ('PENDING', 'IN_CALLS', 'IN_PUTS') AND is_phantom = 0 LIMIT 1
 `);
@@ -763,6 +767,11 @@ export function updateTradePnlDb(id, currentPnlPct) {
 export function confirmTrade(id, state) {
   const ts = formatET(nowET());
   updateTradeState.run(state, ts, id);
+}
+
+export function updateTradeTargetDb(id, newTargetSpx) {
+  const ts = formatET(nowET());
+  updateTradeTargetStmt.run(newTargetSpx, ts, id);
 }
 
 export function getOpenTrade() {

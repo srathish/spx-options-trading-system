@@ -50,6 +50,10 @@ const regimeState = {
   QQQ: { direction: null, startedAt: 0, cycles: 0 },
 };
 
+// Stack persistence tracking — rolling snapshots of stacked_walls per cycle
+const stackSnapshots = { SPXW: [], SPY: [], QQQ: [] };
+const STACK_SNAPSHOT_SIZE = 30;  // ~2.5 min at 5s polling
+
 /**
  * Save a GEX read for trend detection (keeps last 3 in memory per ticker).
  * Also tracks spot price in ring buffer for momentum detection.
@@ -310,6 +314,77 @@ export function getSpotMomentum(ticker = 'SPXW') {
     newestSpot: newest.spot,
     drift,
   };
+}
+
+/**
+ * Analyze price behavior near a GEX node — dwell time, oscillation, rejection/acceptance.
+ * Uses spotBuffer to classify whether price rejected or accepted a king node.
+ * - Rejection: 3+ cycles within ±5pts, oscillation < 8pts, momentum reversed
+ * - Acceptance: broke through by >5pts, momentum continues original direction
+ * - Inconclusive: not enough data or mixed signals → no change to existing behavior
+ */
+export function getNodeDwellAnalysis(strike, ticker = 'SPXW') {
+  const buffer = spotBuffer[ticker] || [];
+  const zonePts = 5;
+  const minDwellCycles = 3;
+  const maxOscillation = 8;
+
+  if (buffer.length < 5) {
+    return { dwellCycles: 0, rejected: false, accepted: false, inconclusive: true };
+  }
+
+  // Find readings within ±zonePts of strike
+  const inZone = [];
+  for (const reading of buffer) {
+    if (Math.abs(reading.spot - strike) <= zonePts) inZone.push(reading);
+  }
+  const dwellCycles = inZone.length;
+  const dwellMs = inZone.length >= 2 ? inZone[inZone.length - 1].timestamp - inZone[0].timestamp : 0;
+
+  // Oscillation range within zone
+  let oscillationPts = 0;
+  if (inZone.length >= 2) {
+    const spots = inZone.map(r => r.spot);
+    oscillationPts = Math.max(...spots) - Math.min(...spots);
+  }
+
+  // Arrival direction: what was momentum doing before reaching the node?
+  const firstZoneIdx = inZone.length > 0 ? buffer.indexOf(inZone[0]) : -1;
+  let arrivalDirection = null;
+  if (firstZoneIdx >= 3) {
+    const pre = buffer.slice(Math.max(0, firstZoneIdx - 5), firstZoneIdx);
+    if (pre.length >= 2) {
+      const preChange = pre[pre.length - 1].spot - pre[0].spot;
+      arrivalDirection = preChange > 1 ? 'UP' : (preChange < -1 ? 'DOWN' : 'FLAT');
+    }
+  }
+
+  // Current momentum (last 3 readings)
+  const recent = buffer.slice(-3);
+  const recentChange = recent.length >= 2 ? recent[recent.length - 1].spot - recent[0].spot : 0;
+  const currentDirection = recentChange > 1 ? 'UP' : (recentChange < -1 ? 'DOWN' : 'FLAT');
+
+  const latestSpot = buffer[buffer.length - 1].spot;
+  const broke = Math.abs(latestSpot - strike) > zonePts;
+
+  // Classify
+  let rejected = false, accepted = false;
+
+  if (dwellCycles >= minDwellCycles && oscillationPts <= maxOscillation) {
+    const arrivedFromBelow = arrivalDirection === 'UP' && strike >= buffer[firstZoneIdx].spot;
+    const arrivedFromAbove = arrivalDirection === 'DOWN' && strike <= buffer[firstZoneIdx].spot;
+    const nowMovingAway = (arrivedFromBelow && currentDirection === 'DOWN')
+                       || (arrivedFromAbove && currentDirection === 'UP');
+    if (nowMovingAway) rejected = true;
+  }
+
+  if (broke && !rejected) {
+    const continuedMomentum = (arrivalDirection === 'UP' && currentDirection === 'UP')
+                           || (arrivalDirection === 'DOWN' && currentDirection === 'DOWN');
+    if (continuedMomentum || dwellCycles < minDwellCycles) accepted = true;
+  }
+
+  return { dwellCycles, dwellMs, oscillationPts, rejected, accepted, inconclusive: !rejected && !accepted };
 }
 
 /**
@@ -626,6 +701,76 @@ export function getKingNodeFlip(ticker = 'SPXW') {
 /**
  * Reset daily state (call at 9:25 AM ET before warm-up).
  */
+/**
+ * Save a snapshot of current stacked_walls for persistence tracking.
+ * Called each cycle from main-loop after analyzeMultiTicker().
+ */
+export function saveStackSnapshot(stackedWalls, ticker = 'SPXW') {
+  if (!stackSnapshots[ticker]) stackSnapshots[ticker] = [];
+  const relevantStacks = (stackedWalls || []).filter(sw => sw.ticker === ticker);
+  stackSnapshots[ticker].push({
+    timestamp: Date.now(),
+    stacks: relevantStacks.map(sw => ({
+      type: sw.type,
+      sign: sw.sign,
+      startStrike: sw.startStrike,
+      endStrike: sw.endStrike,
+      count: sw.count,
+    })),
+  });
+  while (stackSnapshots[ticker].length > STACK_SNAPSHOT_SIZE) {
+    stackSnapshots[ticker].shift();
+  }
+}
+
+/**
+ * Get stack persistence metrics for a given direction.
+ * Determines if overhead/underfoot magnet stacks are persistent, growing, shrinking, or gone.
+ * @param {string} ticker
+ * @param {string} direction - 'BULLISH' or 'BEARISH'
+ */
+export function getStackPersistence(ticker = 'SPXW', direction = 'BULLISH') {
+  const history = stackSnapshots[ticker] || [];
+  if (history.length < 2) {
+    return { presentCycles: 0, totalCycles: history.length, isPresent: false, trend: 'UNKNOWN', disappeared: false, currentNodeCount: 0 };
+  }
+
+  const relevantTypes = direction === 'BULLISH'
+    ? ['magnet_above', 'ceiling']
+    : ['magnet_below', 'floor'];
+
+  let presentCycles = 0;
+  let currentNodeCount = 0;
+  let firstNodeCount = 0;
+
+  for (let i = 0; i < history.length; i++) {
+    const snap = history[i];
+    const relevantNodes = snap.stacks.filter(s => relevantTypes.includes(s.type));
+    const nodeCount = relevantNodes.reduce((sum, s) => sum + s.count, 0);
+    if (relevantNodes.length > 0) presentCycles++;
+    if (i === 0) firstNodeCount = nodeCount;
+    if (i === history.length - 1) currentNodeCount = nodeCount;
+  }
+
+  const isPresent = presentCycles > 0 && currentNodeCount > 0;
+  const lastSnap = history[history.length - 1];
+  const hasRelevantNow = lastSnap.stacks.some(s => relevantTypes.includes(s.type));
+  const disappeared = !hasRelevantNow && presentCycles > history.length * 0.5;
+
+  let trend = 'STABLE';
+  if (disappeared) {
+    trend = 'GONE';
+  } else if (firstNodeCount > 0 && currentNodeCount > 0) {
+    const changePct = (currentNodeCount - firstNodeCount) / firstNodeCount;
+    if (changePct >= 0.30) trend = 'GROWING';
+    else if (changePct <= -0.30) trend = 'SHRINKING';
+  } else if (firstNodeCount === 0 && currentNodeCount > 0) {
+    trend = 'GROWING';
+  }
+
+  return { presentCycles, totalCycles: history.length, isPresent, trend, disappeared, currentNodeCount };
+}
+
 export function resetDailyState() {
   smoothedScores.SPXW = null;
   smoothedScores.SPY = null;
@@ -645,6 +790,9 @@ export function resetDailyState() {
   kingNodeHistory.SPXW = [];
   kingNodeHistory.SPY = [];
   kingNodeHistory.QQQ = [];
+  stackSnapshots.SPXW = [];
+  stackSnapshots.SPY = [];
+  stackSnapshots.QQQ = [];
 }
 
 /**

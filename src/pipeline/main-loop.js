@@ -19,7 +19,7 @@ import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, saveRawSnapshot, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
-import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime, saveKingNode, getNodeSignChanges, getKingNodeFlip } from '../store/state.js';
+import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime, saveKingNode, getNodeSignChanges, getKingNodeFlip, saveStackSnapshot } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
@@ -186,6 +186,9 @@ async function runCycle(phase) {
 
     // Run multi-ticker analysis (driver, alignment, stacked, rug, slides)
     const multiAnalysis = analyzeMultiTicker(trinityState?.spxw, trinityState?.spy, trinityState?.qqq);
+
+    // Save stacked walls snapshot for persistence tracking
+    saveStackSnapshot(multiAnalysis.stacked_walls || [], 'SPXW');
 
     // Re-score SPXW with multi-ticker bonus if applicable
     const baseScored = spxwData.scored;

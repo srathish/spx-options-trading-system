@@ -17,6 +17,7 @@
 
 import { characterizeAirPocket } from './gex-scorer.js';
 import { getActiveConfig } from '../review/strategy-store.js';
+import { getNodeDwellAnalysis, getStackPersistence } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Patterns');
@@ -344,6 +345,10 @@ function detectKingNodeBounce(ctx) {
     const maxMagnetDist = cfg.negative_king_node_max_dist_pts ?? 5;
     if (knDistPts > maxMagnetDist) return results;
 
+    // Dwell analysis: reject accepted levels (price sliced through)
+    const dwellAnalysis = getNodeDwellAnalysis(kn.strike);
+    if (dwellAnalysis.accepted) return results;
+
     const touches = nodeTouches[kn.strike]?.touches || 0;
     if (touches > maxTouches) return results;
 
@@ -366,6 +371,18 @@ function detectKingNodeBounce(ctx) {
     const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
     if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
+    // Dwell rejection boost: price dwelled and reversed → higher quality bounce
+    if (dwellAnalysis.rejected) confidence = adjustConfidence(confidence, 'upgrade');
+
+    // Stack persistence: overhead/underfoot magnet stack still present?
+    const stackPersistence = getStackPersistence('SPXW', direction);
+    if (stackPersistence.isPresent && stackPersistence.presentCycles >= 5) {
+      confidence = adjustConfidence(confidence, 'upgrade');
+    }
+    if (stackPersistence.trend === 'GONE' || stackPersistence.presentCycles < 3) {
+      confidence = adjustConfidence(confidence, 'downgrade');
+    }
+
     const targetWall = direction === 'BEARISH'
       ? scored.wallsBelow?.[0]
       : scored.wallsAbove?.[0];
@@ -377,7 +394,7 @@ function detectKingNodeBounce(ctx) {
       entry_strike: Math.round(scored.spotPrice / 5) * 5,
       target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
       stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} reversal`,
+      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} reversal`,
       source_ticker: 'SPXW',
       walls: { king: kn.strike, king_value: kn.gexValue },
     });
@@ -386,6 +403,10 @@ function detectKingNodeBounce(ctx) {
 
   // --- POSITIVE KING NODE BOUNCE (existing logic) ---
   if (knDistPts > 10) return results;
+
+  // Dwell analysis: reject accepted levels (price sliced through)
+  const dwellAnalysis = getNodeDwellAnalysis(kn.strike);
+  if (dwellAnalysis.accepted) return results;
 
   const touches = nodeTouches[kn.strike]?.touches || 0;
   if (touches > maxTouches) return results;
@@ -410,6 +431,18 @@ function detectKingNodeBounce(ctx) {
   const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
   if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
+  // Dwell rejection boost: price dwelled and reversed → higher quality bounce
+  if (dwellAnalysis.rejected) confidence = adjustConfidence(confidence, 'upgrade');
+
+  // Stack persistence: overhead/underfoot magnet stack still present?
+  const stackPersistence = getStackPersistence('SPXW', direction);
+  if (stackPersistence.isPresent && stackPersistence.presentCycles >= 5) {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+  if (stackPersistence.trend === 'GONE' || stackPersistence.presentCycles < 3) {
+    confidence = adjustConfidence(confidence, 'downgrade');
+  }
+
   const targetWall = direction === 'BEARISH'
     ? scored.wallsBelow?.[0]
     : scored.wallsAbove?.[0];
@@ -421,7 +454,7 @@ function detectKingNodeBounce(ctx) {
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
     stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} bounce`,
+    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} bounce`,
     source_ticker: 'SPXW',
     walls: { king: kn.strike, king_value: kn.gexValue },
   });

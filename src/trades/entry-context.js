@@ -34,12 +34,22 @@ export function buildEntryContext(trigger, scored, multiAnalysis) {
   };
 
   switch (trigger.pattern) {
-    case 'REVERSE_RUG':
+    case 'REVERSE_RUG': {
       // Support = nearest positive wall below (launch pad floor)
       // Ceiling = nearest positive wall above (target area)
       context.support_node = findWall(scored.wallsBelow, 'positive', spotPrice);
       context.ceiling_node = findWall(scored.wallsAbove, 'positive', spotPrice);
+      // Capture stack for magnet walk + persistence exit
+      const rrTypes = isBullish ? ['magnet_above', 'ceiling'] : ['magnet_below', 'floor'];
+      const rrStacks = (multiAnalysis?.stacked_walls || [])
+        .filter(sw => sw.ticker === 'SPXW' && rrTypes.includes(sw.type));
+      context.initial_stack = {
+        count: rrStacks.length,
+        totalNodes: rrStacks.reduce((sum, s) => sum + s.count, 0),
+        stacks: rrStacks.map(s => ({ type: s.type, startStrike: s.startStrike, endStrike: s.endStrike, count: s.count })),
+      };
       break;
+    }
 
     case 'RUG_PULL':
       // Ceiling = positive wall at/above spot (the rug)
@@ -68,6 +78,15 @@ export function buildEntryContext(trigger, scored, multiAnalysis) {
           context.support_node = findWall(scored.wallsBelow, 'positive', spotPrice);
         }
       }
+      // Capture stack for magnet walk + persistence exit
+      const knbTypes = isBullish ? ['magnet_above', 'ceiling'] : ['magnet_below', 'floor'];
+      const knbStacks = (multiAnalysis?.stacked_walls || [])
+        .filter(sw => sw.ticker === 'SPXW' && knbTypes.includes(sw.type));
+      context.initial_stack = {
+        count: knbStacks.length,
+        totalNodes: knbStacks.reduce((sum, s) => sum + s.count, 0),
+        stacks: knbStacks.map(s => ({ type: s.type, startStrike: s.startStrike, endStrike: s.endStrike, count: s.count })),
+      };
       break;
     }
 

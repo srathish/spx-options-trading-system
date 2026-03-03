@@ -190,6 +190,12 @@ const V1_BASELINE = {
 
   // Cross-ticker + magnet bounce
   negative_king_node_max_dist_pts: 5,          // Must be within 5pts for magnet bounce (vs 10pts for positive)
+
+  // Magnet walk (continuation through stacked targets)
+  magnet_walk_enabled: true,
+  magnet_walk_max_steps: 2,                    // max target extensions per trade
+  magnet_walk_max_dist_pts: 25,                // next magnet must be within 25pts
+  magnet_walk_stop_ratchet_pts: 3,             // move stop to previous_target - 3pts on walk
 };
 
 // ---- In-memory cache ----
