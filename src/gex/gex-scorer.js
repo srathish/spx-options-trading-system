@@ -27,8 +27,9 @@
 
 import { SCORE, CONFIDENCE, MIDPOINT, AIR_POCKET, NEUTRAL_THRESHOLD, MOMENTUM } from './constants.js';
 import { getGexAtSpot, formatDollar } from './gex-parser.js';
-import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection } from '../store/state.js';
+import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection, saveNetGex, getNetGexRoC } from '../store/state.js';
 import { getActiveConfig } from '../review/strategy-store.js';
+import { nowET } from '../utils/market-hours.js';
 
 /**
  * Score the SPX GEX environment.
@@ -50,12 +51,89 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   const wallsAbove = walls.filter(w => w.relativeToSpot === 'above');
   const wallsBelow = walls.filter(w => w.relativeToSpot === 'below');
 
+  // --- Feature 1: Zero Gamma Level (Gamma Flip) ---
+  const sortedStrikes = [...aggregatedGex.keys()].sort((a, b) => a - b);
+  let zeroGammaLevel = null;
+  for (let i = 1; i < sortedStrikes.length; i++) {
+    const prev = aggregatedGex.get(sortedStrikes[i - 1]);
+    const curr = aggregatedGex.get(sortedStrikes[i]);
+    if (prev !== undefined && curr !== undefined && prev < 0 && curr >= 0) {
+      const range = curr - prev;
+      const ratio = range !== 0 ? Math.abs(prev) / range : 0.5;
+      zeroGammaLevel = Math.round(sortedStrikes[i - 1] + (sortedStrikes[i] - sortedStrikes[i - 1]) * ratio);
+      if (zeroGammaLevel > spotPrice - 50 && zeroGammaLevel < spotPrice + 50) break;
+    }
+  }
+
+  // --- Feature 3: Gamma Ratio (call/put balance) ---
+  let totalPositiveGex = 0, totalNegativeGex = 0;
+  for (const [, value] of aggregatedGex) {
+    if (value > 0) totalPositiveGex += value;
+    else totalNegativeGex += Math.abs(value);
+  }
+  const gammaRatio = totalNegativeGex > 0 ? totalPositiveGex / totalNegativeGex : 1.0;
+
+  // --- Feature 4: Wall Distance Asymmetry ---
+  const callWallDist = wallsAbove[0] ? Math.abs(wallsAbove[0].strike - spotPrice) : 999;
+  const putWallDist = wallsBelow[0] ? Math.abs(wallsBelow[0].strike - spotPrice) : 999;
+  const wallAsymmetry = putWallDist > 0 ? callWallDist / putWallDist : 1.0;
+
+  // --- Feature 5: Net GEX Rate of Change ---
+  let totalNetGex = 0;
+  for (const [, value] of aggregatedGex) totalNetGex += value;
+  saveNetGex(totalNetGex, ticker);
+  const netGexRoC = getNetGexRoC(ticker);
+
+  // --- Feature 7: Transition Zones (PTrans/NTrans) ---
+  // Find first SIGNIFICANT GEX sign change above/below spot (ignore noise)
+  const transMinMagnitude = largestWallAbs * 0.05; // must be ≥5% of largest wall
+  let pTrans = null, nTrans = null;
+  const spotIdx = sortedStrikes.findIndex(s => s >= spotPrice);
+  for (let i = Math.max(0, spotIdx); i < sortedStrikes.length - 1; i++) {
+    const curr = aggregatedGex.get(sortedStrikes[i]) || 0;
+    const next = aggregatedGex.get(sortedStrikes[i + 1]) || 0;
+    if ((curr < 0 && next >= 0) || (curr >= 0 && next < 0)) {
+      if (Math.abs(curr) >= transMinMagnitude || Math.abs(next) >= transMinMagnitude) {
+        pTrans = sortedStrikes[i + 1];
+        break;
+      }
+    }
+  }
+  for (let i = Math.min(sortedStrikes.length - 1, spotIdx) - 1; i > 0; i--) {
+    const curr = aggregatedGex.get(sortedStrikes[i]) || 0;
+    const prev = aggregatedGex.get(sortedStrikes[i - 1]) || 0;
+    if ((curr < 0 && prev >= 0) || (curr >= 0 && prev < 0)) {
+      if (Math.abs(curr) >= transMinMagnitude || Math.abs(prev) >= transMinMagnitude) {
+        nTrans = sortedStrikes[i - 1];
+        break;
+      }
+    }
+  }
+  const transitionZones = { pTrans, nTrans };
+  const inTransitionChop = pTrans && nTrans
+    && Math.abs(spotPrice - pTrans) < 10
+    && Math.abs(spotPrice - nTrans) < 10;
+
+  // --- Feature 9: Charm Pressure Direction ---
+  const charmPressure = estimateCharmPressure(aggregatedGex, spotPrice, sortedStrikes);
+
+  // --- Feature 10: Call Wall / Put Wall identification ---
+  const callWall = wallsAbove.find(w => w.type === 'positive') || null;
+  const putWall = wallsBelow.find(w => w.type === 'negative') || null;
+
+  // --- Feature 2: Time-of-Day Wall Reliability ---
+  const etNow = nowET();
+  const hourDecimal = etNow.hour + etNow.minute / 60;
+  const wallReliability = hourDecimal >= 14 ? Math.max(0.4, 1.0 - (hourDecimal - 14) * 0.3) : 1.0;
+
   // Check momentum BEFORE scoring — used to gate negative GEX at spot
   const momentum = getSpotMomentum(ticker);
 
   // Score both directions — use smoothed gexAtSpot for sign determination
-  const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot, wallTrends);
-  const bearish = scoreBearish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs, momentum, gexAtSpot);
+  // Pass new metrics to scoring functions
+  const scoringCtx = { gammaRatio, wallAsymmetry, charmPressure, wallReliability };
+  const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot, wallTrends, scoringCtx);
+  const bearish = scoreBearish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs, momentum, gexAtSpot, scoringCtx);
 
   // Apply momentum — direction-conflict penalty with CHOP override
   if (momentum.strength !== 'WEAK') {
@@ -93,6 +171,7 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   const chop = checkChop(gexAtSpot, wallsAbove, wallsBelow, aggregatedGex, strikes, getActiveConfig());
 
   // Determine best direction (always directional — CHOP is a separate flag)
+  // Hysteresis is handled downstream by EMA smoothing + direction stability checks
   let result;
   if (bullish.score >= bearish.score) {
     result = bullish;
@@ -128,9 +207,10 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   else if (result.score >= CONFIDENCE.MEDIUM) confidence = 'MEDIUM';
   else confidence = 'LOW';
 
-  // Overall environment label — use smoothed value to prevent oscillation
-  const environment = smoothedGexAtSpot < 0 ? 'NEGATIVE GAMMA' : 'POSITIVE GAMMA';
-  const envDetail = smoothedGexAtSpot < 0
+  // Overall environment label — use zero gamma level (structural) with smoothed fallback
+  const inNegativeGamma = zeroGammaLevel ? spotPrice < zeroGammaLevel : smoothedGexAtSpot < 0;
+  const environment = inNegativeGamma ? 'NEGATIVE GAMMA' : 'POSITIVE GAMMA';
+  const envDetail = inNegativeGamma
     ? 'Volatile — dealers short gamma, moves amplified'
     : 'Pinned — dealers long gamma, moves dampened';
 
@@ -159,13 +239,24 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
       readings: momentum.readings,
     },
     recommendation: getRecommendation(result.direction, confidence, environment),
+    // New GEX analysis features
+    zeroGammaLevel,
+    gammaRatio: parseFloat(gammaRatio.toFixed(2)),
+    wallAsymmetry: parseFloat(wallAsymmetry.toFixed(2)),
+    netGexRoC,
+    transitionZones,
+    inTransitionChop,
+    charmPressure,
+    callWall,
+    putWall,
   };
 }
 
-function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs, momentum, rawGexAtSpot, wallTrends) {
+function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, largestWallAbs, momentum, rawGexAtSpot, wallTrends, ctx = {}) {
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
+  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0 } = ctx;
 
   // +30: Negative GEX at spot — volatile, dealers amplify moves
   // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
@@ -258,6 +349,35 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
     }
   }
 
+  // --- Feature 2: Wall reliability decay (afternoon) ---
+  if (wallReliability < 1.0) {
+    const negGexAwarded = gexAtSpot < 0 && (momentum.direction !== 'DOWN' || momentum.strength === 'WEAK');
+    const wallPortion = score - (negGexAwarded ? SCORE.NEGATIVE_GEX_AT_SPOT : 0);
+    if (wallPortion > 0) {
+      const reduction = Math.round(wallPortion * (1 - wallReliability));
+      score -= reduction;
+      breakdown.push(`-${reduction}: Afternoon wall decay (${(wallReliability * 100).toFixed(0)}% reliability)`);
+    }
+  }
+
+  // --- Feature 3: Gamma ratio bias ---
+  if (gammaRatio > 1.5) {
+    score += 5;
+    breakdown.push(`+5: Call-heavy gamma ratio (${gammaRatio.toFixed(2)}) — bullish support`);
+  }
+
+  // --- Feature 4: Wall asymmetry bonus ---
+  if (wallAsymmetry > 1.5) {
+    score += 5;
+    breakdown.push(`+5: More room upward (asymmetry ${wallAsymmetry.toFixed(2)})`);
+  }
+
+  // --- Feature 9: Charm pressure bonus ---
+  if (charmPressure.active && charmPressure.strength > 0.3 && charmPressure.direction === 'BULLISH') {
+    score += 5;
+    breakdown.push(`+5: Bullish charm pressure (${(charmPressure.strength * 100).toFixed(0)}% strength)`);
+  }
+
   score = Math.max(0, Math.min(100, score));
 
   return {
@@ -272,10 +392,11 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
   };
 }
 
-function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTrends, largestWallAbs, momentum, rawGexAtSpot) {
+function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTrends, largestWallAbs, momentum, rawGexAtSpot, ctx = {}) {
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
+  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0 } = ctx;
 
   // +30: Negative GEX at spot — volatile, dealers amplify moves
   // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
@@ -354,6 +475,35 @@ function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTr
       score += SCORE.CONFLICTING_WALL_PENALTY;
       breakdown.push(`-20: Pos floor below (${significantPosBelow[0].strike}) could block downside`);
     }
+  }
+
+  // --- Feature 2: Wall reliability decay (afternoon) ---
+  if (wallReliability < 1.0) {
+    const negGexAwarded = gexAtSpot < 0 && (momentum.direction !== 'UP' || momentum.strength === 'WEAK');
+    const wallPortion = score - (negGexAwarded ? SCORE.NEGATIVE_GEX_AT_SPOT : 0);
+    if (wallPortion > 0) {
+      const reduction = Math.round(wallPortion * (1 - wallReliability));
+      score -= reduction;
+      breakdown.push(`-${reduction}: Afternoon wall decay (${(wallReliability * 100).toFixed(0)}% reliability)`);
+    }
+  }
+
+  // --- Feature 3: Gamma ratio bias ---
+  if (gammaRatio < 0.67) {
+    score += 5;
+    breakdown.push(`+5: Put-heavy gamma ratio (${gammaRatio.toFixed(2)}) — bearish support`);
+  }
+
+  // --- Feature 4: Wall asymmetry bonus ---
+  if (wallAsymmetry < 0.67) {
+    score += 5;
+    breakdown.push(`+5: More room downward (asymmetry ${wallAsymmetry.toFixed(2)})`);
+  }
+
+  // --- Feature 9: Charm pressure bonus ---
+  if (charmPressure.active && charmPressure.strength > 0.3 && charmPressure.direction === 'BEARISH') {
+    score += 5;
+    breakdown.push(`+5: Bearish charm pressure (${(charmPressure.strength * 100).toFixed(0)}% strength)`);
   }
 
   score = Math.max(0, Math.min(100, score));
@@ -530,4 +680,35 @@ function getRecommendation(direction, confidence, environment) {
     return 'PUTS with caution — medium confidence';
   }
   return 'WAIT';
+}
+
+/**
+ * Feature 9: Estimate charm (time decay) pressure direction.
+ * After 1:30 PM ET, OTM options decay accelerates → net hedging flow.
+ * More OTM put decay = bullish (MMs unwind short hedges).
+ * More OTM call decay = bearish (MMs unwind long hedges).
+ */
+function estimateCharmPressure(aggregatedGex, spotPrice, sortedStrikes) {
+  const now = nowET();
+  const hour = now.hour + now.minute / 60;
+  if (hour < 13.5) return { direction: null, strength: 0, active: false };
+
+  let putGammaBelow = 0, callGammaAbove = 0;
+  for (const strike of sortedStrikes) {
+    const gex = aggregatedGex.get(strike) || 0;
+    if (strike < spotPrice && gex < 0) putGammaBelow += Math.abs(gex);
+    if (strike > spotPrice && gex > 0) callGammaAbove += gex;
+  }
+
+  const charmBias = putGammaBelow - callGammaAbove;
+  const strength = Math.min(1.0, Math.abs(charmBias) / 50_000_000);
+  const timeFactor = Math.min(1.0, (hour - 13.5) / 2.5);
+
+  return {
+    direction: charmBias > 0 ? 'BULLISH' : charmBias < 0 ? 'BEARISH' : null,
+    strength: parseFloat((strength * timeFactor).toFixed(3)),
+    active: true,
+    putGammaBelow,
+    callGammaAbove,
+  };
 }

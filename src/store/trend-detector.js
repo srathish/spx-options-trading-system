@@ -7,7 +7,15 @@
  * - BULLISH trend: Put wall (support floor) rising + directional bias + spot moving up
  * - BEARISH trend: Call wall (resistance ceiling) falling + bearish bias + spot moving down
  *
- * Strength: EMERGING (3/4 conditions) → CONFIRMED (4/4) → STRONG (extreme conditions)
+ * Strength: EMERGING (3/5 conditions) → CONFIRMED (4/5) → STRONG (5/5 + extreme)
+ *
+ * v2 Changes:
+ * - Lower minLookback 60 → 30 (detect trends in 15 min not 30)
+ * - Added price-based bias (spot above/below its rolling mean) alongside GEX bias
+ * - Deactivation requires BOTH GEX bias drop AND price reversal (not just one)
+ * - dayTrendDirection activates at CONFIRMED × 10 (was STRONG × 20)
+ * - confirmedCyclesCount decays by 1 on non-meeting cycles instead of resetting to 0
+ * - Added spot velocity shortcut: 20+ pts in lookback = auto-EMERGING
  */
 
 import { getActiveConfig } from '../review/strategy-store.js';
@@ -31,22 +39,22 @@ let currentTrendState = {
 };
 
 // Hysteresis: once CONFIRMED, hold for at least this many cycles before allowing downgrade
-const CONFIRMED_GRACE_CYCLES = 30; // ~15 min at 30s polling
+const CONFIRMED_GRACE_CYCLES = 40; // ~20 min at 30s polling (was 30 = 15 min)
 let confirmedSinceCycle = 0;  // cycle count when CONFIRMED was first reached
 let cycleCounter = 0;         // monotonically increasing cycle count
 
 // Sticky day-level trend memory: persists even when real-time trend oscillates
-// Requires sustained CONFIRMED+ before setting (prevents false triggers on range days)
-const DAY_TREND_MIN_CONFIRMED_CYCLES = 20; // must hold CONFIRMED+ for ~10 min
-let dayTrendDirection = null;     // 'BULLISH' or 'BEARISH' — sticky for the day (entry filtering)
-let dayTrendConfirmedAt = 0;      // cycle when first confirmed
-let confirmedCyclesCount = 0;     // consecutive cycles at CONFIRMED+
+// v2: Uses per-direction accumulators that allow flipping when evidence builds
+const DAY_TREND_MIN_CYCLES = 25; // must accumulate 25 CONFIRMED+ cycles (~12.5 min)
+const DAY_TREND_MIN_SPOT_MOVE = 30; // must show 30+ pts spot move (real trend, not range day noise)
+const DAY_TREND_MIN_CYCLE_COUNT = 120; // don't set before cycle 120 (~60 min = ~10:30 AM)
+let dayTrendDirection = null;     // 'BULLISH' or 'BEARISH' — can flip with evidence
+let dayTrendAccum = { BULLISH: 0, BEARISH: 0 }; // per-direction accumulators
 
 // Lighter-weight sticky direction for exit logic — activates faster
-// Used in isTrendAligned to suppress momentum timeouts even when real-time trend oscillates
-const DAY_EXIT_TREND_MIN_CYCLES = 10;  // 10 CONFIRMED+ cycles = ~5 min
-let dayExitTrendDirection = null;       // activates at CONFIRMED (not STRONG)
-let exitTrendCyclesCount = 0;           // consecutive CONFIRMED+ cycles for exit trend
+const DAY_EXIT_TREND_MIN_CYCLES = 8;  // 8 CONFIRMED+ cycles = ~4 min
+let dayExitTrendDirection = null;       // activates at CONFIRMED (not STRONG), can flip
+let dayExitAccum = { BULLISH: 0, BEARISH: 0 };
 
 // ---- Public API ----
 
@@ -99,7 +107,7 @@ export function updateTrendBuffer(scored, cfgOverride) {
  */
 export function detectTrendDay() {
   const cfg = getActiveConfig() || {};
-  const minLookback = cfg.trend_min_lookback_cycles ?? 60;
+  const minLookback = cfg.trend_min_lookback_cycles ?? 30; // v2: was 60
 
   if (trendBuffer.length < minLookback) {
     return currentTrendState;
@@ -134,7 +142,7 @@ export function detectTrendDay() {
     } else {
       // Same direction — apply hysteresis
       if ((prevStrength === 'CONFIRMED' || prevStrength === 'STRONG') && detected.strength === 'EMERGING') {
-        // Within grace period → hold at CONFIRMED
+        // Hold at CONFIRMED during grace period
         effectiveStrength = 'CONFIRMED';
       }
       if (detected.strength === 'CONFIRMED' || detected.strength === 'STRONG') {
@@ -152,41 +160,52 @@ export function detectTrendDay() {
       metrics: detected.metrics,
     };
 
-    // Track sustained CONFIRMED+ for sticky day trend (entry filtering — conservative)
-    // Use STRONG threshold for first activation (harder to falsely trigger on range days)
-    const meetsEntryThreshold = !dayTrendDirection
-      ? effectiveStrength === 'STRONG'
-      : (effectiveStrength === 'CONFIRMED' || effectiveStrength === 'STRONG');
+    // v2: Track CONFIRMED+ per direction with accumulators that allow flipping
+    const meetsThreshold = effectiveStrength === 'CONFIRMED' || effectiveStrength === 'STRONG';
+    const opposite = detected.direction === 'BULLISH' ? 'BEARISH' : 'BULLISH';
 
-    if (meetsEntryThreshold) {
-      if (!dayTrendDirection || dayTrendDirection === detected.direction) {
-        confirmedCyclesCount++;
-        if (!dayTrendDirection && confirmedCyclesCount >= DAY_TREND_MIN_CONFIRMED_CYCLES) {
-          dayTrendDirection = detected.direction;
-          dayTrendConfirmedAt = cycleCounter;
-          log.info(`Day trend direction set: ${dayTrendDirection} (${confirmedCyclesCount} STRONG cycles — sticky for entry filtering)`);
-        }
-      } else {
-        confirmedCyclesCount = 1;
-      }
+    // Compute spot move from full buffer for gating
+    const latestSpot = lookback[lookback.length - 1]?.spotPrice ?? 0;
+    const bufferSpotMove = fullBuffer.length > 0
+      ? Math.abs(latestSpot - fullBuffer[0].spotPrice) : 0;
+
+    // --- Day trend direction (entry filtering) ---
+    if (meetsThreshold) {
+      dayTrendAccum[detected.direction]++;
+      dayTrendAccum[opposite] = Math.max(0, dayTrendAccum[opposite] - 2);
     } else {
-      confirmedCyclesCount = 0;
+      dayTrendAccum.BULLISH = Math.max(0, dayTrendAccum.BULLISH - 1);
+      dayTrendAccum.BEARISH = Math.max(0, dayTrendAccum.BEARISH - 1);
     }
 
-    // Track CONFIRMED+ for exit trend direction (less conservative — activates faster)
-    const meetsExitThreshold = effectiveStrength === 'CONFIRMED' || effectiveStrength === 'STRONG';
-    if (meetsExitThreshold) {
-      if (!dayExitTrendDirection || dayExitTrendDirection === detected.direction) {
-        exitTrendCyclesCount++;
-        if (!dayExitTrendDirection && exitTrendCyclesCount >= DAY_EXIT_TREND_MIN_CYCLES) {
-          dayExitTrendDirection = detected.direction;
-          log.info(`Day exit trend set: ${dayExitTrendDirection} (${exitTrendCyclesCount} CONFIRMED+ cycles — sticky for structural hold)`);
-        }
-      } else {
-        exitTrendCyclesCount = 1;
+    // Set or flip dayTrendDirection when enough evidence + spot move + minimum cycles elapsed
+    const hasDayEvidence = dayTrendAccum[detected.direction] >= DAY_TREND_MIN_CYCLES
+      && bufferSpotMove >= DAY_TREND_MIN_SPOT_MOVE
+      && cycleCounter >= DAY_TREND_MIN_CYCLE_COUNT;
+
+    if (hasDayEvidence && meetsThreshold) {
+      if (dayTrendDirection !== detected.direction) {
+        const action = dayTrendDirection ? 'FLIPPED' : 'SET';
+        dayTrendDirection = detected.direction;
+        log.info(`Day trend ${action}: ${dayTrendDirection} (accum=${dayTrendAccum[detected.direction]}, spotMove=${Math.round(bufferSpotMove)}pts)`);
       }
+    }
+
+    // --- Day exit trend direction (structural hold — activates faster) ---
+    if (meetsThreshold) {
+      dayExitAccum[detected.direction]++;
+      dayExitAccum[opposite] = Math.max(0, dayExitAccum[opposite] - 2);
     } else {
-      exitTrendCyclesCount = 0;
+      dayExitAccum.BULLISH = Math.max(0, dayExitAccum.BULLISH - 1);
+      dayExitAccum.BEARISH = Math.max(0, dayExitAccum.BEARISH - 1);
+    }
+
+    if (dayExitAccum[detected.direction] >= DAY_EXIT_TREND_MIN_CYCLES && meetsThreshold) {
+      if (dayExitTrendDirection !== detected.direction) {
+        const action = dayExitTrendDirection ? 'FLIPPED' : 'SET';
+        dayExitTrendDirection = detected.direction;
+        log.info(`Day exit trend ${action}: ${dayExitTrendDirection} (accum=${dayExitAccum[detected.direction]})`);
+      }
     }
 
     if (!wasAlreadyTrend) {
@@ -195,7 +214,7 @@ export function detectTrendDay() {
       log.info(`Trend strength changed: ${prevStrength} → ${effectiveStrength}`);
     }
   } else if (currentTrendState.isTrend) {
-    // Conditions failed detection (< 3/4) — check if within grace period
+    // Conditions failed detection (< 3/5) — check if within grace period
     const inGracePeriod = confirmedSinceCycle > 0 && (cycleCounter - confirmedSinceCycle) < CONFIRMED_GRACE_CYCLES;
 
     if (inGracePeriod) {
@@ -203,9 +222,15 @@ export function detectTrendDay() {
       if (currentTrendState.strength !== 'CONFIRMED' && currentTrendState.strength !== 'STRONG') {
         currentTrendState.strength = 'CONFIRMED';
       }
+      // v2: Decay accumulators slowly during grace period
+      dayTrendAccum.BULLISH = Math.max(0, dayTrendAccum.BULLISH - 1);
+      dayTrendAccum.BEARISH = Math.max(0, dayTrendAccum.BEARISH - 1);
+      dayExitAccum.BULLISH = Math.max(0, dayExitAccum.BULLISH - 1);
+      dayExitAccum.BEARISH = Math.max(0, dayExitAccum.BEARISH - 1);
     } else {
       // Outside grace period: check deactivation
-      const deactivate = checkTrendDeactivation(lookback, currentTrendState, cfg);
+      const lookbackForDeactivation = trendBuffer.slice(-minLookback);
+      const deactivate = checkTrendDeactivation(lookbackForDeactivation, currentTrendState, cfg);
       if (deactivate) {
         log.warn(`Trend day DEACTIVATED: ${currentTrendState.direction} — conditions no longer met`);
         currentTrendState = {
@@ -214,9 +239,14 @@ export function detectTrendDay() {
           detectedAt: null, metrics: {},
         };
         confirmedSinceCycle = 0;
+        // v2: Don't reset accumulators — let day-level stickiness persist
       } else {
         // Conditions weakened but not enough to deactivate — hold as EMERGING
         currentTrendState.strength = 'EMERGING';
+        dayTrendAccum.BULLISH = Math.max(0, dayTrendAccum.BULLISH - 1);
+        dayTrendAccum.BEARISH = Math.max(0, dayTrendAccum.BEARISH - 1);
+        dayExitAccum.BULLISH = Math.max(0, dayExitAccum.BULLISH - 1);
+        dayExitAccum.BEARISH = Math.max(0, dayExitAccum.BEARISH - 1);
       }
     }
   }
@@ -244,10 +274,9 @@ export function resetTrendDetector() {
   confirmedSinceCycle = 0;
   cycleCounter = 0;
   dayTrendDirection = null;
-  dayTrendConfirmedAt = 0;
-  confirmedCyclesCount = 0;
+  dayTrendAccum = { BULLISH: 0, BEARISH: 0 };
   dayExitTrendDirection = null;
-  exitTrendCyclesCount = 0;
+  dayExitAccum = { BULLISH: 0, BEARISH: 0 };
   log.info('Trend detector reset');
 }
 
@@ -255,45 +284,59 @@ export function resetTrendDetector() {
 
 /**
  * Detect a directional trend.
- * @param {Array} lookback - Recent window for bias/spot checks (60 cycles = 30 min)
- * @param {Array} fullBuffer - Full buffer for structural checks (120 cycles = 60 min)
+ * v2: 5 conditions (added price-based bias). 3/5 = EMERGING, 4/5 = CONFIRMED, 5/5+extreme = STRONG.
+ *
+ * Conditions:
+ * 1. Strong floor/ceiling exists (wall value ≥ 2× threshold)
+ * 2. Wall value grew over buffer window
+ * 3. GEX directional bias (scored direction favors trend direction)
+ * 4. Spot movement (≥ 10 pts in trend direction)
+ * 5. Price-based bias (spot above/below its rolling mean ≥ 60% of lookback)
  */
 function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
   const minFloorRise = cfg.trend_min_floor_rise_pts ?? 15;
-  const minBias = cfg.trend_min_directional_bias_pct ?? 0.60;
+  const minBias = cfg.trend_min_directional_bias_pct ?? 0.55; // v2: was 0.60
   const minSpotMove = cfg.trend_min_spot_move_pts ?? 10;
 
   const oldest = lookback[0];
   const newest = lookback[lookback.length - 1];
   const result = { qualifies: false, direction, strength: 'NONE', strengthScore: 0, supportFloor: null, resistanceCeiling: null, metrics: {} };
 
+  // Compute price-based bias: what % of cycles is spot above/below its rolling mean?
+  // This is more stable than GEX direction which oscillates on minor pullbacks.
+  const spotPrices = lookback.map(e => e.spotPrice);
+  const spotMean = spotPrices.reduce((a, b) => a + b, 0) / spotPrices.length;
+  const priceBiasRatio = direction === 'BULLISH'
+    ? spotPrices.filter(p => p > spotMean).length / spotPrices.length
+    : spotPrices.filter(p => p < spotMean).length / spotPrices.length;
+  const priceBiasOk = priceBiasRatio >= 0.55;
+
   if (direction === 'BULLISH') {
     const minFloorValue = cfg.trend_min_floor_value ?? 5_000_000;
 
     // 1. Strong floor exists — recent median floor value >= 2× threshold
-    // (captures that market has built significant support, even if floor strike hasn't migrated)
     const recentValues = lookback.slice(-20).filter(e => e.supportFloorValue > 0).map(e => e.supportFloorValue);
     const recentMedianValue = median(recentValues);
     const floorStrong = recentMedianValue >= minFloorValue * 2;
 
     // 2. Floor value grew — compare full buffer old vs recent
-    // (captures $3M → $9M growth = market building support over time)
     const oldValues = fullBuffer.slice(0, 20).filter(e => e.supportFloorValue > 0).map(e => e.supportFloorValue);
     const oldMedianValue = median(oldValues);
     const valueGrew = oldMedianValue === 0 || recentMedianValue >= oldMedianValue * 1.2;
 
-    // Floor growth rate — how much the floor value multiplied (e.g., 2.7x = strong trend)
     const growthRate = oldMedianValue > 0 ? recentMedianValue / oldMedianValue : 0;
 
-    // 3. Directional bias — use lookback window (recent momentum)
+    // 3. GEX Directional bias — use lookback window (recent momentum)
     const bullishCount = lookback.filter(e => e.direction === 'BULLISH').length;
-    const bias = bullishCount / lookback.length;
-    const biasOk = bias >= minBias;
+    const gexBias = bullishCount / lookback.length;
+    const gexBiasOk = gexBias >= minBias;
 
     // 4. Spot movement — use full buffer to capture larger moves
     const fullOldest = fullBuffer[0];
     const spotMove = newest.spotPrice - fullOldest.spotPrice;
     const spotOk = spotMove >= minSpotMove;
+
+    // 5. Price-based bias (computed above)
 
     // Also check floor strike migration (bonus for STRONG)
     const smoothedFloors = getSmoothedWallStrikes(fullBuffer, 'supportFloorStrike');
@@ -301,11 +344,11 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
       ? smoothedFloors[smoothedFloors.length - 1] - smoothedFloors[0]
       : 0;
 
-    const conditionsMet = [floorStrong, valueGrew, biasOk, spotOk].filter(Boolean).length;
+    const conditionsMet = [floorStrong, valueGrew, gexBiasOk, spotOk, priceBiasOk].filter(Boolean).length;
     result.metrics = {
       floorStrong, floorValue: Math.round(recentMedianValue / 1e6) + 'M',
       valueGrew, growthRate: growthRate > 0 ? growthRate.toFixed(1) + 'x' : 'N/A',
-      bias: Math.round(bias * 100) + '%',
+      gexBias: Math.round(gexBias * 100) + '%', priceBias: Math.round(priceBiasRatio * 100) + '%',
       spotMove: Math.round(spotMove), floorRise: Math.round(floorRise), conditionsMet,
     };
 
@@ -317,10 +360,10 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
 
     if (conditionsMet >= 3) {
       result.qualifies = true;
-      if (conditionsMet === 4 && floorRise >= minFloorRise && bias >= 0.70 && spotMove >= 20) {
+      if (conditionsMet >= 5 && floorRise >= minFloorRise && gexBias >= 0.65 && spotMove >= 20) {
         result.strength = 'STRONG';
         result.strengthScore = 3;
-      } else if (conditionsMet === 4) {
+      } else if (conditionsMet >= 4) {
         result.strength = 'CONFIRMED';
         result.strengthScore = 2;
       } else {
@@ -329,7 +372,7 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
       }
     }
   } else {
-    // BEARISH: mirror — strong ceiling, value grew, bearish bias, spot falling
+    // BEARISH: mirror — strong ceiling, value grew, bearish bias, spot falling, price bias
     const minFloorValue = cfg.trend_min_floor_value ?? 5_000_000;
 
     // 1. Strong ceiling exists
@@ -342,16 +385,19 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
     const oldMedianValue = median(oldValues);
     const valueGrew = oldMedianValue === 0 || recentMedianValue >= oldMedianValue * 1.2;
 
-    // Ceiling growth rate — how much the ceiling value multiplied
     const growthRate = oldMedianValue > 0 ? recentMedianValue / oldMedianValue : 0;
 
+    // 3. GEX Directional bias
     const bearishCount = lookback.filter(e => e.direction === 'BEARISH').length;
-    const bias = bearishCount / lookback.length;
-    const biasOk = bias >= minBias;
+    const gexBias = bearishCount / lookback.length;
+    const gexBiasOk = gexBias >= minBias;
 
+    // 4. Spot movement
     const fullOldest = fullBuffer[0];
     const spotMove = fullOldest.spotPrice - newest.spotPrice;
     const spotOk = spotMove >= minSpotMove;
+
+    // 5. Price-based bias (computed above)
 
     // Also check ceiling strike migration (bonus for STRONG)
     const smoothedCeilings = getSmoothedWallStrikes(fullBuffer, 'resistanceCeilingStrike');
@@ -359,11 +405,11 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
       ? smoothedCeilings[0] - smoothedCeilings[smoothedCeilings.length - 1]
       : 0;
 
-    const conditionsMet = [ceilingStrong, valueGrew, biasOk, spotOk].filter(Boolean).length;
+    const conditionsMet = [ceilingStrong, valueGrew, gexBiasOk, spotOk, priceBiasOk].filter(Boolean).length;
     result.metrics = {
       ceilingStrong, ceilingValue: Math.round(recentMedianValue / 1e6) + 'M',
       valueGrew, growthRate: growthRate > 0 ? growthRate.toFixed(1) + 'x' : 'N/A',
-      bias: Math.round(bias * 100) + '%',
+      gexBias: Math.round(gexBias * 100) + '%', priceBias: Math.round(priceBiasRatio * 100) + '%',
       spotMove: Math.round(spotMove), ceilingDrop: Math.round(ceilingDrop), conditionsMet,
     };
 
@@ -374,10 +420,10 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
 
     if (conditionsMet >= 3) {
       result.qualifies = true;
-      if (conditionsMet === 4 && ceilingDrop >= minFloorRise && bias >= 0.70 && spotMove >= 20) {
+      if (conditionsMet >= 5 && ceilingDrop >= minFloorRise && gexBias >= 0.65 && spotMove >= 20) {
         result.strength = 'STRONG';
         result.strengthScore = 3;
-      } else if (conditionsMet === 4) {
+      } else if (conditionsMet >= 4) {
         result.strength = 'CONFIRMED';
         result.strengthScore = 2;
       } else {
@@ -392,48 +438,56 @@ function detectDirectionalTrend(lookback, fullBuffer, direction, cfg) {
 
 /**
  * Check if a currently active trend should be deactivated.
+ * v2: Requires BOTH GEX bias failure AND price reversal. Either alone is not enough.
  */
 function checkTrendDeactivation(lookback, trendState, cfg) {
   const recent = lookback.slice(-20); // last ~10 min
   const floorDropThreshold = cfg.trend_deactivate_floor_drop_pts ?? 10;
-  const biasThreshold = cfg.trend_deactivate_bias_threshold ?? 0.40;
+  const biasThreshold = cfg.trend_deactivate_bias_threshold ?? 0.35; // v2: was 0.40
+
+  // v2: Check price reversal — has spot moved significantly against the trend?
+  const spotNow = recent[recent.length - 1]?.spotPrice;
+  const spotOldest = recent[0]?.spotPrice;
+  const priceReversed = trendState.direction === 'BULLISH'
+    ? (spotOldest - spotNow > 5) // dropped 5+ pts in recent window
+    : (spotNow - spotOldest > 5); // rallied 5+ pts in recent window
 
   if (trendState.direction === 'BULLISH') {
-    // Check if bias dropped
     const recentBullish = recent.filter(e => e.direction === 'BULLISH').length / recent.length;
-    if (recentBullish < biasThreshold) return true;
+    const gexBiasFailed = recentBullish < biasThreshold;
 
-    // Check if floor dropped from peak using MEDIAN of recent floors
-    // (raw values oscillate wildly when spot hovers near a wall level)
+    // Check if floor dropped from peak
     const recentFloors = recent.map(e => e.supportFloorStrike).filter(s => s !== null);
     const peakSmoothed = getSmoothedWallStrikes(trendBuffer.slice(-40), 'supportFloorStrike');
+    let floorBroken = false;
     if (recentFloors.length > 0 && peakSmoothed.length > 0) {
       const peakFloor = Math.max(...peakSmoothed);
       const currentFloor = median(recentFloors);
-      if (peakFloor - currentFloor >= floorDropThreshold) return true;
+      floorBroken = (peakFloor - currentFloor >= floorDropThreshold);
     }
+
+    // v2: Require BOTH bias failure AND (price reversed OR floor broken) to deactivate
+    return gexBiasFailed && (priceReversed || floorBroken);
   } else {
     const recentBearish = recent.filter(e => e.direction === 'BEARISH').length / recent.length;
-    if (recentBearish < biasThreshold) return true;
+    const gexBiasFailed = recentBearish < biasThreshold;
 
-    // Check if ceiling rose from lowest using MEDIAN of recent ceilings
     const recentCeilings = recent.map(e => e.resistanceCeilingStrike).filter(s => s !== null);
     const lowestSmoothed = getSmoothedWallStrikes(trendBuffer.slice(-40), 'resistanceCeilingStrike');
+    let ceilingBroken = false;
     if (recentCeilings.length > 0 && lowestSmoothed.length > 0) {
       const lowestCeiling = Math.min(...lowestSmoothed);
       const currentCeiling = median(recentCeilings);
-      if (currentCeiling - lowestCeiling >= floorDropThreshold) return true;
+      ceilingBroken = (currentCeiling - lowestCeiling >= floorDropThreshold);
     }
-  }
 
-  return false;
+    // v2: Require BOTH bias failure AND (price reversed OR ceiling broken)
+    return gexBiasFailed && (priceReversed || ceilingBroken);
+  }
 }
 
 /**
  * Smooth wall strikes using 10-cycle window with median.
- * Handles oscillation when spot is right at a wall level.
- * Median is more robust than 25th percentile for capturing floor migration
- * when the floor oscillates between old and new levels.
  */
 function getSmoothedWallStrikes(lookback, field) {
   const windowSize = 10;

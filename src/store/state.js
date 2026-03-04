@@ -54,6 +54,10 @@ const regimeState = {
 const stackSnapshots = { SPXW: [], SPY: [], QQQ: [] };
 const STACK_SNAPSHOT_SIZE = 30;  // ~2.5 min at 5s polling
 
+// Net GEX rate of change — tracks total net GEX per cycle for regime transition detection
+const netGexBuffer = { SPXW: [], SPY: [], QQQ: [] };
+const NET_GEX_BUFFER_SIZE = 30; // ~2.5 min at 5s polling
+
 /**
  * Save a GEX read for trend detection (keeps last 3 in memory per ticker).
  * Also tracks spot price in ring buffer for momentum detection.
@@ -483,6 +487,14 @@ export function recordDirection(ticker, direction) {
 }
 
 /**
+ * Get the last recorded GEX direction for a ticker.
+ */
+export function getLastDirection(ticker = 'SPXW') {
+  const history = directionHistory[ticker] || [];
+  return history.length > 0 ? history[history.length - 1].direction : null;
+}
+
+/**
  * Check if the GEX direction has been stable for N consecutive cycles.
  */
 export function isDirectionStable(ticker, minCycles = 3) {
@@ -771,6 +783,33 @@ export function getStackPersistence(ticker = 'SPXW', direction = 'BULLISH') {
   return { presentCycles, totalCycles: history.length, isPresent, trend, disappeared, currentNodeCount };
 }
 
+/**
+ * Save total net GEX for rate-of-change tracking.
+ * Called each cycle from scoreSpxGex() after computing totalNetGex.
+ */
+export function saveNetGex(totalNetGex, ticker = 'SPXW') {
+  if (!netGexBuffer[ticker]) netGexBuffer[ticker] = [];
+  netGexBuffer[ticker].push({ value: totalNetGex, timestamp: Date.now() });
+  if (netGexBuffer[ticker].length > NET_GEX_BUFFER_SIZE) netGexBuffer[ticker].shift();
+}
+
+/**
+ * Get net GEX rate of change — delta and slope over the buffer window.
+ * RISING = net GEX increasing (stabilizing), FALLING = decreasing (destabilizing).
+ */
+export function getNetGexRoC(ticker = 'SPXW') {
+  const buf = netGexBuffer[ticker] || [];
+  if (buf.length < 5) return { delta: 0, slope: 0, trend: 'UNKNOWN', current: 0 };
+  const recent = buf[buf.length - 1].value;
+  const past5 = buf[buf.length - 5].value;
+  const past = buf[0].value;
+  const delta5 = recent - past5;
+  const deltaFull = recent - past;
+  const slope = deltaFull / buf.length;
+  const trend = slope > 500_000 ? 'RISING' : slope < -500_000 ? 'FALLING' : 'FLAT';
+  return { delta: delta5, slope: Math.round(slope), trend, current: recent };
+}
+
 export function resetDailyState() {
   smoothedScores.SPXW = null;
   smoothedScores.SPY = null;
@@ -793,6 +832,9 @@ export function resetDailyState() {
   stackSnapshots.SPXW = [];
   stackSnapshots.SPY = [];
   stackSnapshots.QQQ = [];
+  netGexBuffer.SPXW = [];
+  netGexBuffer.SPY = [];
+  netGexBuffer.QQQ = [];
 }
 
 /**

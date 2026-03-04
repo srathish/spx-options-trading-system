@@ -343,10 +343,9 @@ function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
 
 function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow, cfg, replayTime, trendState) {
   const isBullish = position.direction === 'BULLISH';
-  const isTrendAligned =
-    (trendState?.isTrend && trendState.direction === position.direction
-      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG'))
-    || (trendState?.dayExitTrendDirection === position.direction);
+  // v2: Only use real-time CONFIRMED/STRONG for isTrendAligned
+  const isTrendAligned = trendState?.isTrend && trendState.direction === position.direction
+    && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
 
   // Compute hold time from actual timestamps
   const currentMs = replayTime.toMillis();
@@ -374,7 +373,7 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
       const walkEnabled = cfg.magnet_walk_enabled ?? true;
       const maxWalks = cfg.magnet_walk_max_steps ?? 2;
       const walkCount = position._walkCount || 0;
-      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG', 'AIR_POCKET', 'MAGNET_PULL'];
       const pattern = position.entryContext?.pattern;
 
       if (walkEnabled && walkCount < maxWalks && walkPatterns.includes(pattern) && multiAnalysis) {
@@ -399,9 +398,12 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
   }
 
   // 2. NODE_SUPPORT_BREAK (trend-aware)
+  // v2: Wider buffer during confirmed trends — minor dips are normal on trend days
   if (position.entryContext) {
     const nodeTrends = getNodeTrends('SPXW');
-    let buffer = cfg.node_break_buffer_pts ?? 2;
+    const realtimeTrendAligned = trendState?.isTrend && trendState.direction === position.direction
+      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
+    let buffer = realtimeTrendAligned ? (cfg.node_break_trend_buffer_pts ?? 5) : (cfg.node_break_buffer_pts ?? 2);
 
     if (isBullish && position.entryContext.support_node?.strike) {
       const trend = nodeTrends.get(position.entryContext.support_node.strike);
@@ -467,19 +469,21 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     : (cfg.momentum_phase1_minutes ?? 5);
   const phase1Seconds = phase1Minutes * 60;
 
-  // Phase 0: exempt from min hold — skip entirely during confirmed trend days
+  // Phase 0: exempt from min hold — skip entirely during confirmed trend days and MAGNET_PULL
   const breakoutThreshold = cfg.breakout_score_threshold ?? 90;
   const isBreakoutEntry = isTrendAligned && position.entryContext?.gex_score_at_entry >= breakoutThreshold;
+  const isMagnetPull = position.entryContext?.pattern === 'MAGNET_PULL';
 
-  if (!isTrendAligned && !isBreakoutEntry && holdSeconds >= phase0Seconds && holdSeconds < phase1Seconds) {
+  // MAGNET_PULL: skip Phase 0 entirely — magnets need time to attract price
+  if (!isTrendAligned && !isBreakoutEntry && !isMagnetPull && holdSeconds >= phase0Seconds && holdSeconds < phase1Seconds) {
     if (spxProgress < phase0MinPts) {
       return { exit: true, reason: 'MOMENTUM_TIMEOUT' };
     }
   }
 
-  // Skip momentum phases 1-3 entirely during confirmed trend days
-  // Rely on structural exits (TREND_FLOOR_BREAK, TRAILING_STOP, GEX_FLIP) instead
-  if (!isTrendAligned && !holdTooShort) {
+  // Skip momentum phases 1-3 entirely during confirmed trend days and MAGNET_PULL trades
+  // MAGNET_PULL relies on structural exits (TARGET_HIT, TRAILING_STOP, OPPOSING_WALL) instead
+  if (!isTrendAligned && !isMagnetPull && !holdTooShort) {
     // Phase 1: adaptive timeout
     const phase1Pts = cfg.momentum_phase1_min_pts ?? 2;
     if (holdMinutes >= phase1Minutes && spxProgress < phase1Pts) {

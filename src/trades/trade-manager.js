@@ -8,7 +8,7 @@ import {
   openTrade, closeTrade, updateTradePnlDb, confirmTrade,
   getOpenTrade, getTradeById, updateTradeTargetDb,
 } from '../store/db.js';
-import { nowET } from '../utils/market-hours.js';
+import { nowET, formatET } from '../utils/market-hours.js';
 import { getActiveConfig, getVersionLabel } from '../review/strategy-store.js';
 import { getNodeTrends, getStackPersistence } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
@@ -29,6 +29,19 @@ let lastUpdateSentAt = 0;
 export function initTradeManager() {
   const open = getOpenTrade();
   if (open) {
+    // Expire cross-day 0DTE positions — these options expired at previous close
+    const today = formatET(nowET()).slice(0, 10).replace(/-/g, '');
+    const contractDate = extractContractDate(open.contract);
+    if (contractDate && contractDate !== today) {
+      log.warn(`Expiring cross-day 0DTE position: ${open.contract} (opened ${open.opened_at})`);
+      closeTrade(open.id, {
+        exitPrice: 0, exitSpx: open.entry_spx,
+        pnlDollars: 0, pnlPct: 0, exitReason: 'EXPIRED_0DTE',
+      });
+      log.info('No open position — starting FLAT (expired cross-day trade)');
+      return;
+    }
+
     let entryCtx = null;
     try { entryCtx = open.entry_context ? JSON.parse(open.entry_context) : null; } catch { /* ignore */ }
 
@@ -49,8 +62,11 @@ export function initTradeManager() {
       currentPnlPct: open.current_pnl_pct || 0,
       bestSpxChange: 0,
       entryContext: entryCtx,
+      strategyLane: open.strategy_lane || null,
+      entryTrigger: open.entry_trigger || null,
+      entryConfidence: entryCtx?.confidence || 'MEDIUM',
     };
-    log.info(`Resumed position: ${currentPosition.contract} (${currentPosition.state})`);
+    log.info(`Resumed position: ${currentPosition.contract} (${currentPosition.state}) [Lane ${currentPosition.strategyLane || '?'}]`);
   } else {
     log.info('No open position — starting FLAT');
   }
@@ -156,12 +172,10 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   const cfg = getActiveConfig() || {};
   const isBullish = currentPosition.direction === 'BULLISH';
   const trendState = context.trendState;
-  const isTrendAligned =
-    // Real-time trend is CONFIRMED/STRONG and direction matches
-    (trendState?.isTrend && trendState.direction === currentPosition.direction
-      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG'))
-    // OR sticky exit trend direction matches (persists through oscillations)
-    || (trendState?.dayExitTrendDirection === currentPosition.direction);
+  // v2: Only use real-time CONFIRMED/STRONG for isTrendAligned — sticky dayExitTrendDirection
+  // caused false positives on range days (trades held too long with doubled stops)
+  const isTrendAligned = trendState?.isTrend && trendState.direction === currentPosition.direction
+    && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
 
   // 3a. Target hit — SPX reached target wall (with magnet walk extension)
   if (currentPosition.targetSpx) {
@@ -173,7 +187,7 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
       const walkEnabled = cfg.magnet_walk_enabled ?? true;
       const maxWalks = cfg.magnet_walk_max_steps ?? 2;
       const walkCount = currentPosition._walkCount || 0;
-      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG'];
+      const walkPatterns = ['KING_NODE_BOUNCE', 'REVERSE_RUG', 'AIR_POCKET', 'MAGNET_PULL'];
       const pattern = currentPosition.entryContext?.pattern;
 
       if (walkEnabled && walkCount < maxWalks && walkPatterns.includes(pattern) && context.multiAnalysis) {
@@ -209,10 +223,14 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
 
   // 3a2. NODE_SUPPORT_BREAK — price broke past the structural node that defined the trade thesis
   // Trend-aware: WEAKENING node → tighter buffer, GONE → immediate exit, GROWING → wider buffer
+  // v2: Wider buffer (5 pts) when real-time trend CONFIRMED/STRONG in trade's direction
   if (currentPosition.entryContext) {
     const ctx = currentPosition.entryContext;
     const nodeTrends = getNodeTrends('SPXW');
-    let buffer = cfg.node_break_buffer_pts ?? 2;
+    // v2: Wider buffer during confirmed trends — minor dips are normal on trend days
+    const realtimeTrendAligned = trendState?.isTrend && trendState.direction === currentPosition.direction
+      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
+    let buffer = realtimeTrendAligned ? (cfg.node_break_trend_buffer_pts ?? 5) : (cfg.node_break_buffer_pts ?? 2);
 
     if (isBullish && ctx.support_node?.strike) {
       const trend = nodeTrends.get(ctx.support_node.strike);
@@ -339,8 +357,8 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
   // Skip during confirmed trend days — walls shift naturally during trends
   const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
   if (!isTrendAligned && !holdTooShort && scored) {
-    const opposingWalls = isBullish ? scored.wallsBelow : scored.wallsAbove;
-    const bigOpposing = opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingWallValue && w.type === 'POSITIVE');
+    const opposingWalls = isBullish ? scored.wallsAbove : scored.wallsBelow;
+    const bigOpposing = opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingWallValue && w.type === 'positive');
     if (bigOpposing) {
       result.exitTriggered = true;
       result.exitReason = 'OPPOSING_WALL';
@@ -371,6 +389,7 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
 
   // 3e3. MOMENTUM_TIMEOUT — 4 progressive phases of stall detection
   // Phase 0 fires at 90s (exempt from min hold) to catch dead entries early
+  const isMagnetPull = currentPosition.entryContext?.pattern === 'MAGNET_PULL';
   if (currentPosition.entrySpx && currentSpot) {
     const holdSeconds = holdTimeMs / 1_000;
     const phase0Seconds = cfg.momentum_phase0_seconds ?? 90;
@@ -380,11 +399,11 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
       ? (cfg.momentum_phase1_high_conf_minutes ?? 7)
       : (cfg.momentum_phase1_minutes ?? 5)) * 60;
 
-    // Skip Phase 0 entirely during confirmed trend days (not just breakouts)
+    // Skip Phase 0 entirely during confirmed trend days, breakouts, and MAGNET_PULL
     const breakoutThreshold = cfg.breakout_score_threshold ?? 90;
     const isBreakoutEntry = isTrendAligned && currentPosition.entryContext?.gex_score_at_entry >= breakoutThreshold;
 
-    if (!isTrendAligned && !isBreakoutEntry && holdSeconds >= phase0Seconds && holdSeconds < phase1MinSeconds) {
+    if (!isTrendAligned && !isBreakoutEntry && !isMagnetPull && holdSeconds >= phase0Seconds && holdSeconds < phase1MinSeconds) {
       const moveInDirection = isBullish
         ? currentSpot - currentPosition.entrySpx
         : currentPosition.entrySpx - currentSpot;
@@ -397,9 +416,9 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
     }
   }
 
-  // Skip momentum phases 1-3 entirely during confirmed trend days
+  // Skip momentum phases 1-3 entirely during confirmed trend days and MAGNET_PULL trades
   // Rely on structural exits (TREND_FLOOR_BREAK, TRAILING_STOP, GEX_FLIP) instead
-  if (!isTrendAligned && !holdTooShort && currentPosition.entrySpx && currentSpot) {
+  if (!isTrendAligned && !isMagnetPull && !holdTooShort && currentPosition.entrySpx && currentSpot) {
     const holdMinutes = holdTimeMs / 60_000;
     const spxProgress = isBullish
       ? currentSpot - currentPosition.entrySpx
@@ -654,6 +673,35 @@ export function exitPosition(exitReason, exitSpx) {
  */
 export function shouldBePhantom() {
   return currentPosition !== null;
+}
+
+/**
+ * Expire cross-day 0DTE position (called at daily reset).
+ */
+export function expireCrossDayTrade() {
+  if (!currentPosition) return 0;
+  const today = formatET(nowET()).slice(0, 10).replace(/-/g, '');
+  const contractDate = extractContractDate(currentPosition.contract);
+  if (contractDate && contractDate !== today) {
+    log.warn(`Daily reset: expiring cross-day 0DTE trade: ${currentPosition.contract}`);
+    closeTrade(currentPosition.id, {
+      exitPrice: 0, exitSpx: currentPosition.entrySpx,
+      pnlDollars: 0, pnlPct: 0, exitReason: 'EXPIRED_0DTE',
+    });
+    currentPosition = null;
+    lastUpdateSentAt = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Extract the date portion from a contract symbol (e.g., SPX20260303C6725 → 20260303).
+ */
+function extractContractDate(contract) {
+  if (!contract) return null;
+  const match = contract.match(/(\d{8})/);
+  return match ? match[1] : null;
 }
 
 /**

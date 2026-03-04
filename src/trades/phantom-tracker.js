@@ -6,7 +6,7 @@
  */
 
 import { openTrade, closeTrade, getOpenPhantoms } from '../store/db.js';
-import { nowET } from '../utils/market-hours.js';
+import { nowET, formatET } from '../utils/market-hours.js';
 import { getActiveConfig } from '../review/strategy-store.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -22,11 +22,26 @@ let phantoms = [];
  */
 export function initPhantomTracker() {
   const rows = getOpenPhantoms();
-  phantoms = rows.map(row => {
+  const today = formatET(nowET()).slice(0, 10).replace(/-/g, '');
+  let expiredCount = 0;
+
+  phantoms = [];
+  for (const row of rows) {
+    // Expire cross-day 0DTE phantoms — these options expired at previous close
+    const contractDate = extractContractDate(row.contract);
+    if (contractDate && contractDate !== today) {
+      closeTrade(row.id, {
+        exitPrice: 0, exitSpx: row.entry_spx,
+        pnlDollars: 0, pnlPct: 0, exitReason: 'EXPIRED_0DTE',
+      });
+      expiredCount++;
+      continue;
+    }
+
     let entryCtx = null;
     try { entryCtx = row.entry_context ? JSON.parse(row.entry_context) : null; } catch { /* ignore */ }
 
-    return {
+    phantoms.push({
       id: row.id,
       contract: row.contract,
       direction: row.direction,
@@ -42,9 +57,12 @@ export function initPhantomTracker() {
       entryTrigger: row.entry_trigger || null,
       entryContext: entryCtx,
       bestSpxChange: 0,
-    };
-  });
+    });
+  }
 
+  if (expiredCount > 0) {
+    log.info(`Expired ${expiredCount} cross-day 0DTE phantom(s)`);
+  }
   if (phantoms.length > 0) {
     log.info(`Loaded ${phantoms.length} open phantom(s) from DB`);
   }
@@ -287,6 +305,43 @@ function checkPhantomExit(phantom, currentSpot, scored, context, cfg, etNow) {
   }
 
   return null; // No exit
+}
+
+/**
+ * Expire any cross-day 0DTE phantoms (called at daily reset).
+ */
+export function expireCrossDayPhantoms() {
+  const today = formatET(nowET()).slice(0, 10).replace(/-/g, '');
+  const expired = [];
+  const remaining = [];
+
+  for (const phantom of phantoms) {
+    const contractDate = extractContractDate(phantom.contract);
+    if (contractDate && contractDate !== today) {
+      closeTrade(phantom.id, {
+        exitPrice: 0, exitSpx: phantom.entrySpx,
+        pnlDollars: 0, pnlPct: 0, exitReason: 'EXPIRED_0DTE',
+      });
+      expired.push(phantom.contract);
+    } else {
+      remaining.push(phantom);
+    }
+  }
+
+  if (expired.length > 0) {
+    log.info(`Daily reset: expired ${expired.length} cross-day phantom(s): ${expired.join(', ')}`);
+  }
+  phantoms = remaining;
+  return expired.length;
+}
+
+/**
+ * Extract the date portion from a contract symbol (e.g., SPX20260303C6725 → 20260303).
+ */
+function extractContractDate(contract) {
+  if (!contract) return null;
+  const match = contract.match(/(\d{8})/);
+  return match ? match[1] : null;
 }
 
 /**

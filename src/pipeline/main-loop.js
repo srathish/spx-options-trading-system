@@ -23,8 +23,8 @@ import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateR
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
-import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom } from '../trades/trade-manager.js';
-import { initPhantomTracker, recordPhantom, updatePhantoms } from '../trades/phantom-tracker.js';
+import { initTradeManager, getPositionState, getCurrentPosition, enterPosition, manageCycle as managePosition, exitPosition, shouldBePhantom, expireCrossDayTrade } from '../trades/trade-manager.js';
+import { initPhantomTracker, recordPhantom, updatePhantoms, expireCrossDayPhantoms } from '../trades/phantom-tracker.js';
 import { checkGexOnlyEntry, checkLaneBEntry, checkTrendPullbackEntry } from '../trades/entry-engine.js';
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
@@ -483,10 +483,23 @@ async function runCycle(phase) {
     }
 
     // ---- PHASE 3: TRADE EXECUTION ----
-    // Update Heatseeker spot cache for price feed
-    updateLatestSpot(parsed.spotPrice);
+    // Spot price sanity check: reject absurd jumps within a single cycle
+    // (e.g., stale pre-market data returning $6881 when actual spot is $6725)
+    let spotSane = true;
+    if (lastSpot && Math.abs(parsed.spotPrice - lastSpot) > 50) {
+      const gapPts = Math.abs(parsed.spotPrice - lastSpot).toFixed(1);
+      log.warn(`STALE SPOT DETECTED: $${parsed.spotPrice} vs last $${lastSpot} (gap: ${gapPts} pts) — skipping trade execution`);
+      spotSane = false;
+      // Don't update lastSpot — keep the valid one until API returns sane data
+    }
+
+    // Update Heatseeker spot cache for price feed (only if sane)
+    if (spotSane) updateLatestSpot(parsed.spotPrice);
 
     try {
+      if (!spotSane) {
+        log.warn('Skipping trade execution due to stale spot price');
+      } else {
       const posState = getPositionState();
 
       // A. If position OPEN → manage cycle (exit triggers, P&L updates)
@@ -734,6 +747,7 @@ async function runCycle(phase) {
       if (closedPhantoms.length > 0) {
         log.info(`${closedPhantoms.length} phantom(s) closed this cycle`);
       }
+      } // end spotSane gate
     } catch (tradeErr) {
       log.error('Trade execution error:', tradeErr.message);
     }
@@ -972,6 +986,18 @@ async function handleTradeEntry(agentAction, parsed, scored, wallTrends, laneOpt
 let dailyResetTimer = null;
 
 /**
+ * Expire cross-day 0DTE positions (trades + phantoms) at daily reset.
+ * 0DTE options expire at close — any surviving from previous day are invalid.
+ */
+function expireCrossDayPositions() {
+  const expiredTrades = expireCrossDayTrade();
+  const expiredPhantoms = expireCrossDayPhantoms();
+  if (expiredTrades > 0 || expiredPhantoms > 0) {
+    log.info(`Cross-day cleanup: ${expiredTrades} trade(s), ${expiredPhantoms} phantom(s) expired`);
+  }
+}
+
+/**
  * Schedule daily reset of node touch tracker at 9:25 AM ET (before warm-up).
  */
 function scheduleDailyReset() {
@@ -996,7 +1022,12 @@ function scheduleDailyReset() {
     resetDailyGates();
     resetTrendDetector();
     dailyCycleIndex = 0;
-    log.info('Daily reset: node tracker, smoothing, entry gates, trend detector, cycle index');
+    lastSpot = null; // Clear stale spot from previous session
+
+    // Expire cross-day 0DTE phantoms and trades (options expired at previous close)
+    expireCrossDayPositions();
+
+    log.info('Daily reset: node tracker, smoothing, entry gates, trend detector, cycle index, stale spot cleared');
 
     // Reschedule for next day
     scheduleDailyReset();

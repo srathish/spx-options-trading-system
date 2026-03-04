@@ -50,13 +50,13 @@ const V1_BASELINE = {
   gex_wait_zone_low: 40,
   gex_wait_zone_high: 60,
 
-  // Exit tuning
-  profit_target_pct: 0.20,           // +0.20% SPX move → lock profits (was 0.15)
-  stop_loss_pct: 0.15,               // -0.15% adverse → cut losses (was 0.20)
+  // Exit tuning — v2: let winners run longer, tighter stop loss to cut losers faster
+  profit_target_pct: 0.35,           // +0.35% SPX move (~24 pts) → let winners run
+  stop_loss_pct: 0.12,              // -0.12% adverse (~8 pts) → cut losers faster
   tv_against_exit_count: 2,          // 2+ opposing 3m TV signals → exit
   trailing_stop_activate_pts: 8,     // Activate trailing after +8 SPX pts
   trailing_stop_distance_pts: 5,     // Trail 5 pts behind best
-  opposing_wall_exit_value: 5_000_000, // Exit if opposing wall > $5M appears
+  opposing_wall_exit_value: 15_000_000, // Exit if opposing wall > $15M appears (was $5M — too aggressive)
 
   // Chop detection
   chop_lookback_cycles: 60,          // 60 cycles = 30 min of history
@@ -95,29 +95,30 @@ const V1_BASELINE = {
   lane_b_min_tv_indicators: 1,
 
   // Algorithmic entry engine
+  midday_min_gex_score: 65,          // 11:30-14:00 requires higher score (midday lull)
   gex_only_min_score: 50,
   alignment_override_gex_score: 85,
   power_hour_min_gex_score: 80,
 
-  // Entry quality gates
-  entry_min_spacing_ms: 60_000,
+  // Entry quality gates — v2: wider spacing to prevent churn
+  entry_min_spacing_ms: 300_000,     // 5 min between entries — target 5-8 trades/day, not 15+
   entry_blackout_start: '09:30',
-  entry_blackout_end: '09:33',
+  entry_blackout_end: '09:45',
   consecutive_loss_limit: 2,
   consecutive_loss_cooldown_ms: 15 * 60_000,
 
-  // NODE_SUPPORT_BREAK exit
-  node_break_buffer_pts: 2,
+  // NODE_SUPPORT_BREAK exit — v2: wider buffer
+  node_break_buffer_pts: 4,          // 4 pts buffer (was 2) — 2-3pt dips are normal noise
 
   // MOMENTUM_TIMEOUT exit (4 phases — phase 0 exempt from min hold)
-  momentum_phase0_seconds: 90,       // was 60 — give entries more time
-  momentum_phase0_min_pts: 0.5,      // was 1 — less aggressive early exit
+  momentum_phase0_seconds: 120,      // 2 min (was 90) — give entries more time
+  momentum_phase0_min_pts: 0.5,
   momentum_min_hold_minutes: 3,
-  momentum_phase1_minutes: 5,
-  momentum_phase1_min_pts: 2,
-  momentum_phase2_minutes: 10,
-  momentum_phase2_target_pct: 0.40,
-  momentum_phase3_minutes: 15,
+  momentum_phase1_minutes: 7,        // 7 min (was 5) — more patience before timeout
+  momentum_phase1_min_pts: 1,        // 1 pt (was 2) — less demanding early progress
+  momentum_phase2_minutes: 12,       // 12 min (was 10) — more patience
+  momentum_phase2_target_pct: 0.30,  // 30% of target (was 40%) — less demanding
+  momentum_phase3_minutes: 18,       // 18 min (was 15) — more patience
 
   // TV_COUNTER_FLIP exit
   tv_counter_flip_enabled: true,
@@ -132,11 +133,18 @@ const V1_BASELINE = {
   trigger_weight_triple_floor: 0.9,
   trigger_weight_air_pocket: 1.1,
   trigger_weight_range_edge_fade: 0.8,
+  trigger_weight_magnet_pull: 1.3,
 
   // Pattern-specific minimum wall values
   rug_pull_min_value: 3_000_000,
   pika_pillow_min_value: 5_000_000,
   king_node_min_value: 3_000_000,
+
+  // Magnet Pull config
+  magnet_pull_min_value: 5_000_000,      // $5M min wall size to count as magnet
+  magnet_pull_min_dist_pts: 15,          // must be 15+ pts from spot (not already at it)
+  magnet_pull_max_dist_pts: 80,          // max 80 pts away (beyond = too weak)
+  magnet_pull_min_growth_pct: 0.15,      // must grow 15%+ over tracking window
 
   // Pattern-level risk management
   max_trades_per_pattern: 8,         // max trades per pattern per day
@@ -177,7 +185,7 @@ const V1_BASELINE = {
 
   // Trend pullback entry
   trend_pullback_enabled: true,
-  trend_pullback_min_score: 40,               // lower than normal — trend provides context
+  trend_pullback_min_score: 55,               // requires decent GEX confirmation + momentum check
   trend_pullback_max_dist_pts: 8,             // within 8 pts of support floor
   trend_pullback_stop_buffer_pts: 5,          // stop 5 pts below support floor
 

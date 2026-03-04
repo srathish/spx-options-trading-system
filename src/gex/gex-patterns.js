@@ -18,6 +18,7 @@
 import { characterizeAirPocket } from './gex-scorer.js';
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getNodeDwellAnalysis, getStackPersistence } from '../store/state.js';
+import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Patterns');
@@ -47,6 +48,7 @@ export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches
     ...detectAirPocket(ctx),
     ...detectRangeEdgeFade(ctx),
     ...detectWallFlip(ctx),
+    ...detectMagnetPull(ctx),
   ];
 
   // Validate: target and stop must be on correct side of spot
@@ -262,7 +264,7 @@ function detectRugPull(ctx) {
       confidence,
       entry_strike: Math.round(scored.spotPrice / 5) * 5,
       target_strike: targetStrike,
-      stop_strike: rug.posStrike + (cfg.stop_buffer_pct || 0.05) / 100 * scored.spotPrice,
+      stop_strike: rug.posStrike + 5,
       reasoning: `Neg wall at ${rug.negStrike} below pos wall at ${rug.posStrike} — rug setup (${touches} touches on support)`,
       source_ticker: rug.ticker,
       walls: { pos: rug.posStrike, neg: rug.negStrike },
@@ -316,7 +318,7 @@ function detectReverseRug(ctx) {
       confidence,
       entry_strike: Math.round(scored.spotPrice / 5) * 5,
       target_strike: targetStrike,
-      stop_strike: rug.posStrike - (cfg.stop_buffer_pct || 0.05) / 100 * scored.spotPrice,
+      stop_strike: rug.posStrike - 5,
       reasoning: `Pos floor at ${rug.posStrike} below neg magnet at ${rug.negStrike} — reverse rug (floor established, ${touches} touches)`,
       source_ticker: rug.ticker,
       walls: { pos: rug.posStrike, neg: rug.negStrike },
@@ -383,6 +385,29 @@ function detectKingNodeBounce(ctx) {
       confidence = adjustConfidence(confidence, 'downgrade');
     }
 
+    // Feature 8: KNB time-of-day behavior
+    const now1 = nowET();
+    const hour1 = now1.hour + now1.minute / 60;
+    let timeNote = '';
+    if (hour1 < 11) {
+      confidence = adjustConfidence(confidence, 'upgrade');
+      timeNote = ', MORNING_DRIVEOFF';
+    } else if (hour1 >= 14) {
+      confidence = adjustConfidence(confidence, 'downgrade');
+      timeNote = ', AFTERNOON_PIN';
+    }
+
+    // Feature 10: Call Wall 83% / Put Wall fade boost
+    let wallFadeNote = '';
+    if (scored.callWall && kn.strike === scored.callWall.strike && direction === 'BEARISH') {
+      confidence = adjustConfidence(confidence, 'upgrade');
+      wallFadeNote = ', CALL_WALL_83';
+    }
+    if (scored.putWall && kn.strike === scored.putWall.strike && direction === 'BULLISH') {
+      confidence = adjustConfidence(confidence, 'upgrade');
+      wallFadeNote = ', PUT_WALL_FADE';
+    }
+
     const targetWall = direction === 'BEARISH'
       ? scored.wallsBelow?.[0]
       : scored.wallsAbove?.[0];
@@ -394,7 +419,7 @@ function detectKingNodeBounce(ctx) {
       entry_strike: Math.round(scored.spotPrice / 5) * 5,
       target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
       stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} reversal`,
+      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}${timeNote}${wallFadeNote}) — expect ${direction.toLowerCase()} reversal`,
       source_ticker: 'SPXW',
       walls: { king: kn.strike, king_value: kn.gexValue },
     });
@@ -443,6 +468,29 @@ function detectKingNodeBounce(ctx) {
     confidence = adjustConfidence(confidence, 'downgrade');
   }
 
+  // Feature 8: KNB time-of-day behavior
+  const now2 = nowET();
+  const hour2 = now2.hour + now2.minute / 60;
+  let timeNote2 = '';
+  if (hour2 < 11) {
+    confidence = adjustConfidence(confidence, 'upgrade');
+    timeNote2 = ', MORNING_DRIVEOFF';
+  } else if (hour2 >= 14) {
+    confidence = adjustConfidence(confidence, 'downgrade');
+    timeNote2 = ', AFTERNOON_PIN';
+  }
+
+  // Feature 10: Call Wall 83% / Put Wall fade boost
+  let wallFadeNote2 = '';
+  if (scored.callWall && kn.strike === scored.callWall.strike && direction === 'BEARISH') {
+    confidence = adjustConfidence(confidence, 'upgrade');
+    wallFadeNote2 = ', CALL_WALL_83';
+  }
+  if (scored.putWall && kn.strike === scored.putWall.strike && direction === 'BULLISH') {
+    confidence = adjustConfidence(confidence, 'upgrade');
+    wallFadeNote2 = ', PUT_WALL_FADE';
+  }
+
   const targetWall = direction === 'BEARISH'
     ? scored.wallsBelow?.[0]
     : scored.wallsAbove?.[0];
@@ -454,7 +502,7 @@ function detectKingNodeBounce(ctx) {
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
     stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}) — expect ${direction.toLowerCase()} bounce`,
+    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}${timeNote2}${wallFadeNote2}) — expect ${direction.toLowerCase()} bounce`,
     source_ticker: 'SPXW',
     walls: { king: kn.strike, king_value: kn.gexValue },
   });
@@ -509,7 +557,7 @@ function detectPikaPillow(ctx) {
     confidence,
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: negAbove.strike,
-    stop_strike: scored.floorWall.strike - (cfg.stop_buffer_pct || 0.05) / 100 * scored.spotPrice,
+    stop_strike: scored.floorWall.strike - 5,
     reasoning: `Pos floor at ${scored.floorWall.strike} (${distPts.toFixed(0)}pts below) in ${env} — pika pillow, target ${negAbove.strike}`,
     source_ticker: 'SPXW',
     walls: { floor: scored.floorWall.strike, target: negAbove.strike },
@@ -799,6 +847,166 @@ function allTickersShowSameSetup(multiAnalysis, direction) {
     count: alignment.count || 0,
     tickers,
   };
+}
+
+// ---- Pattern 9: Magnet Pull ----
+
+/**
+ * Detect growing nodes that create gravitational pull on price.
+ *
+ * Professional GEX traders identify this as one of the highest-probability setups:
+ * a large node is BUILDING (growing over time), creating hedging flows that pull
+ * price toward it. The bigger the node grows, the stronger the magnetic pull.
+ *
+ * In positive gamma environments, this is especially powerful — walls hold and
+ * act as attractors. In negative gamma, walls break more easily so confidence
+ * is lower.
+ *
+ * Entry: when a wall is growing ≥15% over 10 cycles AND is within 15-80 pts
+ * Target: the magnet node itself
+ * Stop: 30% of the distance behind entry (asymmetric R:R)
+ */
+function detectMagnetPull(ctx) {
+  const { scored, multiAnalysis, cfg, nodeTrends } = ctx;
+  const results = [];
+
+  if (!scored || !nodeTrends || nodeTrends.size === 0) return results;
+
+  const spotPrice = scored.spotPrice;
+  const minValue = cfg.magnet_pull_min_value ?? 5_000_000;
+  const minDistPts = cfg.magnet_pull_min_dist_pts ?? 15;
+  const maxDistPts = cfg.magnet_pull_max_dist_pts ?? 80;
+  const minGrowthPct = cfg.magnet_pull_min_growth_pct ?? 0.15;
+
+  // --- Selectivity gate: node must be a top-ranked wall (king or #2) ---
+  // This ensures we only fire on the dominant nodes, not random growing walls
+  const allWalls = scored.wallsAbove.concat(scored.wallsBelow);
+  const rankedStrikes = allWalls
+    .sort((a, b) => b.absGexValue - a.absGexValue)
+    .slice(0, 3)
+    .map(w => w.strike);
+
+  // Scan tracked walls for growing magnets
+  const candidates = [];
+
+  for (const [strike, trend] of nodeTrends) {
+    if (trend.trend !== 'GROWING') continue; // GROWING only — not NEW (unproven)
+    if (trend.currentValue < minValue) continue;
+
+    const dist = Math.abs(strike - spotPrice);
+    if (dist < minDistPts || dist > maxDistPts) continue;
+
+    // Must be a top-ranked wall (king node or #2-3)
+    if (!rankedStrikes.includes(strike)) continue;
+
+    // Require meaningful sustained growth — prefer long-term (30/60 cycle) over short-term
+    const longGrowth = trend.changePct30 || 0;
+    const shortGrowth = trend.changePct10 || 0;
+    const growthPct = longGrowth > 0 ? longGrowth : shortGrowth;
+    if (growthPct < minGrowthPct) continue;
+
+    const direction = strike > spotPrice ? 'BULLISH' : 'BEARISH';
+
+    candidates.push({
+      strike,
+      trend,
+      direction,
+      distance: dist,
+      growthPct,
+      longGrowth,
+      value: trend.currentValue,
+      rank: rankedStrikes.indexOf(strike), // 0 = king node
+    });
+  }
+
+  if (candidates.length === 0) return results;
+
+  // Pick ONLY the single strongest magnet (not one per direction)
+  // This prevents firing contradictory signals
+  candidates.sort((a, b) => {
+    // Prefer king node (rank 0) over #2/#3
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    // Then by value * growth
+    return (b.value * (1 + b.growthPct)) - (a.value * (1 + a.growthPct));
+  });
+
+  const best = candidates[0];
+  const direction = best.direction;
+  const isAbove = direction === 'BULLISH';
+
+  // --- Directional conflict gate: don't fight a strong GEX score ---
+  // If GEX score reads opposite direction at 50+, skip entirely
+  if (direction === 'BULLISH' && scored.direction === 'BEARISH' && scored.score >= 50) return results;
+  if (direction === 'BEARISH' && scored.direction === 'BULLISH' && scored.score >= 50) return results;
+
+  // Check path is clear — no large positive wall blocking between spot and magnet
+  const wallsInPath = (isAbove ? scored.wallsAbove : scored.wallsBelow)
+    .filter(w => {
+      const between = isAbove
+        ? w.strike > spotPrice && w.strike < best.strike
+        : w.strike < spotPrice && w.strike > best.strike;
+      return between && w.type === 'positive' && w.absGexValue >= minValue;
+    });
+
+  // Start at MEDIUM — must earn upgrades through multiple confirmations
+  let confidence = 'MEDIUM';
+
+  // King node (rank 0) = upgrade
+  if (best.rank === 0) confidence = adjustConfidence(confidence, 'upgrade');
+
+  // Strong growth (50%+) = upgrade
+  if (best.growthPct >= 0.50) confidence = adjustConfidence(confidence, 'upgrade');
+
+  // Positive gamma boost (walls hold = magnets stronger as attractors)
+  if (scored.environment === 'POSITIVE GAMMA') {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+
+  // Path blocked = downgrade
+  if (wallsInPath.length > 0) {
+    confidence = adjustConfidence(confidence, 'downgrade');
+  }
+
+  // Stacked walls near magnet = stronger pull
+  const stacked = multiAnalysis?.stacked_walls || [];
+  const stackedNearMagnet = stacked.filter(sw =>
+    Math.abs(sw.startStrike - best.strike) < 15 || Math.abs(sw.endStrike - best.strike) < 15
+  );
+  if (stackedNearMagnet.length > 0) {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+
+  // Long-term growth bonus (30+ cycles of sustained growth)
+  if (best.longGrowth >= 0.50) {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+
+  // Require at least HIGH confidence to fire — MEDIUM is not enough for this pattern
+  if (confidence === 'LOW' || confidence === 'MEDIUM') return results;
+
+  // Stop: 30% of distance behind entry for asymmetric R:R
+  const stopDist = Math.max(5, best.distance * 0.30);
+  const stopStrike = isAbove
+    ? Math.round(spotPrice - stopDist)
+    : Math.round(spotPrice + stopDist);
+
+  const valueFmt = (best.value / 1_000_000).toFixed(1);
+  const growFmt = (best.growthPct * 100).toFixed(0);
+  const rankLabel = best.rank === 0 ? 'KING' : `#${best.rank + 1}`;
+
+  results.push({
+    pattern: 'MAGNET_PULL',
+    direction,
+    confidence,
+    entry_strike: Math.round(spotPrice / 5) * 5,
+    target_strike: best.strike,
+    stop_strike: stopStrike,
+    reasoning: `$${valueFmt}M ${rankLabel} node at ${best.strike} GROWING +${growFmt}%, ${best.distance.toFixed(0)}pts away${wallsInPath.length > 0 ? ', path blocked' : ', path clear'}${stackedNearMagnet.length > 0 ? ', stacked' : ''}`,
+    source_ticker: 'SPXW',
+    walls: { magnet: best.strike, value: best.value, growth: best.growthPct, pathClear: wallsInPath.length === 0 },
+  });
+
+  return results;
 }
 
 /**
