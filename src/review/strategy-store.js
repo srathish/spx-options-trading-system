@@ -111,8 +111,8 @@ const V1_BASELINE = {
   node_break_buffer_pts: 4,          // 4 pts buffer (was 2) — 2-3pt dips are normal noise
 
   // MOMENTUM_TIMEOUT exit (4 phases — phase 0 exempt from min hold)
-  momentum_phase0_seconds: 120,      // 2 min (was 90) — give entries more time
-  momentum_phase0_min_pts: 0.5,
+  momentum_phase0_seconds: 60,       // 60s — exit duds fast (was 120)
+  momentum_phase0_min_pts: 1.0,      // require +1pt in Phase 0 (was 0.5)
   momentum_min_hold_minutes: 3,
   momentum_phase1_minutes: 7,        // 7 min (was 5) — more patience before timeout
   momentum_phase1_min_pts: 1,        // 1 pt (was 2) — less demanding early progress

@@ -562,7 +562,7 @@ async function runCycle(phase) {
         const laneAResult = checkGexOnlyEntry(entryState);
 
         if (laneAResult?.shouldEnter) {
-          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis, { lane: 'A', pattern: laneAResult.trigger.pattern, trendState: currentTrendState });
+          const guardrail = checkEntryGates(laneAResult.action, scored, multiAnalysis, { lane: 'A', pattern: laneAResult.trigger.pattern, trigger: laneAResult.trigger, trendState: currentTrendState });
           if (guardrail.allowed) {
             const entryContext = buildEntryContext(laneAResult.trigger, scored, multiAnalysis);
             await handleTradeEntry(laneAResult.action, parsed, scored, wallTrends, {
@@ -620,7 +620,7 @@ async function runCycle(phase) {
           const pullbackResult = checkTrendPullbackEntry({ scored, multiAnalysis, nodeTouches: getNodeTouches() }, currentTrend);
           if (pullbackResult?.shouldEnter) {
             const guardrail = checkEntryGates(pullbackResult.action, scored, multiAnalysis,
-              { lane: 'A', pattern: 'TREND_PULLBACK', trendState: currentTrend });
+              { lane: 'A', pattern: 'TREND_PULLBACK', trigger: pullbackResult.trigger, trendState: currentTrend });
             if (guardrail.allowed) {
               const entryContext = buildEntryContext(pullbackResult.trigger, scored, multiAnalysis);
               await handleTradeEntry(pullbackResult.action, parsed, scored, wallTrends, {

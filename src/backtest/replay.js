@@ -197,7 +197,7 @@ function replayCycle(cycleData, state, cfg) {
         const replayMs = replayTime.toMillis();
         const guardrail = checkEntryGates(
           laneAResult.action, scored, storedMultiAnalysis,
-          { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: laneAResult.trigger.pattern, trendState: getTrendState() }
+          { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: laneAResult.trigger.pattern, trigger: laneAResult.trigger, trendState: getTrendState() }
         );
 
         if (guardrail.allowed) {
@@ -235,7 +235,7 @@ function replayCycle(cycleData, state, cfg) {
           const replayMs = replayTime.toMillis();
           const guardrail = checkEntryGates(
             pullbackResult.action, scored, storedMultiAnalysis,
-            { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: 'TREND_PULLBACK', trendState: currentTrend }
+            { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: 'TREND_PULLBACK', trigger: pullbackResult.trigger, trendState: currentTrend }
           );
           if (guardrail.allowed) {
             const entryContext = buildEntryContext(pullbackResult.trigger, scored, storedMultiAnalysis);

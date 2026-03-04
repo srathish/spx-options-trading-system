@@ -22,105 +22,126 @@ const DATES = ['2026-03-03', '2026-03-02'];
 // The base config comes from the active DB strategy.
 
 const STRATEGIES = [
+  // Baseline
   {
-    name: '1. Current simplified',
-    desc: 'Chop=HIGH, TP chop block, no score gate',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '1. Baseline (current)',
+    desc: 'Current config — no changes',
+    config: {},
+  },
+
+  // Fix 1: Faster Phase 0 exit
+  {
+    name: '2. Phase0 60s',
+    desc: 'Exit duds in 60s instead of 120s',
+    config: { momentum_phase0_seconds: 60 },
   },
   {
-    name: '2. No chop gate',
-    desc: 'No chop filtering anywhere',
-    config: { chop_min_confidence: 'NONE', trend_pullback_chop_block: false, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '3. Phase0 90s',
+    desc: 'Exit duds in 90s',
+    config: { momentum_phase0_seconds: 90 },
   },
   {
-    name: '3. Chop=MEDIUM',
-    desc: 'Require MEDIUM+ in chop (less strict)',
-    config: { chop_min_confidence: 'MEDIUM', trend_pullback_chop_block: true, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '4. Phase0 60s +1pt',
+    desc: '60s exit, need +1pt instead of +0.5',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: 1.0 },
+  },
+
+  // Fix 2: Pattern loss limit
+  {
+    name: '5. PatLoss 2/15m',
+    desc: '2 pattern losses → 15m cooldown',
+    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
   },
   {
-    name: '4. Chop=MEDIUM, TP free',
-    desc: 'MEDIUM chop for GEX, no TP chop block',
-    config: { chop_min_confidence: 'MEDIUM', trend_pullback_chop_block: false, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '6. PatLoss 2/10m',
+    desc: '2 pattern losses → 10m cooldown',
+    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 10 * 60_000 },
   },
   {
-    name: '5. TP disabled',
-    desc: 'No trend pullback entries at all',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_enabled: false, gex_min_entry_score: 0 },
+    name: '7. PatLoss 3/15m',
+    desc: '3 pattern losses → 15m cooldown (tighter than 30m)',
+    config: { pattern_loss_limit: 3, pattern_loss_cooldown_ms: 15 * 60_000 },
+  },
+
+  // Fix 3: Same-direction cap
+  {
+    name: '8. DirCap 3/VH',
+    desc: '3 same-dir losses → need VERY_HIGH',
+    config: { direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
   },
   {
-    name: '6. TP score>=50',
-    desc: 'TP needs GEX score 50+, chop block',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, trend_pullback_min_score: 50, gex_min_entry_score: 0 },
+    name: '9. DirCap 2/VH',
+    desc: '2 same-dir losses → need VERY_HIGH',
+    config: { direction_loss_cap: 2, direction_loss_cap_min_confidence: 'VERY_HIGH' },
   },
   {
-    name: '7. TP score>=55',
-    desc: 'TP needs GEX score 55+, chop block',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, trend_pullback_min_score: 55, gex_min_entry_score: 0 },
+    name: '10. DirCap 3/HIGH',
+    desc: '3 same-dir losses → need HIGH (softer)',
+    config: { direction_loss_cap: 3, direction_loss_cap_min_confidence: 'HIGH' },
+  },
+
+  // Combos: Fix 1 + Fix 2
+  {
+    name: '11. P0-60s + PL-2/15m',
+    desc: 'Fast exit + tight pattern cooldown',
+    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
   },
   {
-    name: '8. TP score>=40 + chop',
-    desc: 'TP needs 40+ AND chop block',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, trend_pullback_min_score: 40, gex_min_entry_score: 0 },
+    name: '12. P0-90s + PL-2/15m',
+    desc: '90s exit + tight pattern cooldown',
+    config: { momentum_phase0_seconds: 90, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
+  },
+
+  // Combos: Fix 1 + Fix 3
+  {
+    name: '13. P0-60s + DC-3/VH',
+    desc: 'Fast exit + direction cap',
+    config: { momentum_phase0_seconds: 60, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+  },
+
+  // Combos: Fix 2 + Fix 3
+  {
+    name: '14. PL-2/15m + DC-3/VH',
+    desc: 'Tight pattern cooldown + direction cap',
+    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+  },
+
+  // All 3 fixes combined
+  {
+    name: '15. ALL: P0-60 PL-2 DC-3',
+    desc: 'All 3 fixes: 60s exit, 2-loss pattern, 3-dir cap',
+    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
   },
   {
-    name: '9. GEX score>=50 all',
-    desc: 'All entries need GEX score 50+',
-    config: { chop_min_confidence: 'HIGH', gex_min_entry_score: 50, trend_pullback_chop_block: true, trend_pullback_min_score: 50 },
+    name: '16. ALL: P0-90 PL-2 DC-3',
+    desc: 'All 3 fixes: 90s exit, 2-loss pattern, 3-dir cap',
+    config: { momentum_phase0_seconds: 90, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
   },
   {
-    name: '10. GEX score>=40 all',
-    desc: 'All entries need GEX score 40+',
-    config: { chop_min_confidence: 'HIGH', gex_min_entry_score: 40, trend_pullback_chop_block: true, trend_pullback_min_score: 40 },
+    name: '17. ALL: P0-60 PL-2 DC-2',
+    desc: 'All 3 fixes aggressive: 60s, 2-pat, 2-dir',
+    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 2, direction_loss_cap_min_confidence: 'VERY_HIGH' },
   },
+
+  // Wider entry spacing combos
   {
-    name: '11. Fast spacing (60s)',
-    desc: '60s between entries, current gates',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, entry_min_spacing_ms: 60_000, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '18. ALL + 120s spacing',
+    desc: 'All 3 fixes + 120s between entries',
+    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH', entry_min_spacing_ms: 120_000 },
   },
+
+  // Phase 1 tighter too
   {
-    name: '12. Medium spacing (120s)',
-    desc: '120s between entries',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, entry_min_spacing_ms: 120_000, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
+    name: '19. P0-60 + P1-5min',
+    desc: 'Fast Phase 0 + tighter Phase 1 (5min instead of 7)',
+    config: { momentum_phase0_seconds: 60, momentum_phase1_minutes: 5 },
   },
+
+  // Kitchen sink: best guess
   {
-    name: '13. 3 loss cooldown',
-    desc: '3 consecutive losses before cooldown',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, consecutive_loss_limit: 3, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
-  },
-  {
-    name: '14. 4 loss cooldown',
-    desc: '4 consecutive losses before cooldown',
-    config: { chop_min_confidence: 'HIGH', trend_pullback_chop_block: true, consecutive_loss_limit: 4, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
-  },
-  {
-    name: '15. Aggressive',
-    desc: 'No chop, no score, 60s, 4 loss limit',
-    config: { chop_min_confidence: 'NONE', trend_pullback_chop_block: false, entry_min_spacing_ms: 60_000, consecutive_loss_limit: 4, gex_min_entry_score: 0, trend_pullback_min_score: 0 },
-  },
-  {
-    name: '16. Conservative',
-    desc: 'HIGH chop, score>=50, 300s, 2 loss limit',
-    config: { chop_min_confidence: 'HIGH', gex_min_entry_score: 50, trend_pullback_min_score: 55, trend_pullback_chop_block: true, entry_min_spacing_ms: 300_000, consecutive_loss_limit: 2 },
-  },
-  {
-    name: '17. GEX patterns only',
-    desc: 'No TP, no chop gate, confidence drives entries',
-    config: { trend_pullback_enabled: false, chop_min_confidence: 'NONE', gex_min_entry_score: 0 },
-  },
-  {
-    name: '18. MEDIUM chop + score>=40',
-    desc: 'Balanced: MEDIUM chop, low score floor',
-    config: { chop_min_confidence: 'MEDIUM', gex_min_entry_score: 40, trend_pullback_chop_block: true, trend_pullback_min_score: 40 },
-  },
-  {
-    name: '19. No chop + TP score>=50',
-    desc: 'Free GEX entries, TP needs score 50',
-    config: { chop_min_confidence: 'NONE', trend_pullback_chop_block: false, trend_pullback_min_score: 50, gex_min_entry_score: 0 },
-  },
-  {
-    name: '20. MEDIUM chop + TP score>=55',
-    desc: 'MEDIUM chop, TP needs score 55',
-    config: { chop_min_confidence: 'MEDIUM', trend_pullback_chop_block: true, trend_pullback_min_score: 55, gex_min_entry_score: 0 },
+    name: '20. Best guess',
+    desc: 'P0-60, PL-2/15m, DC-3/VH, P1-5min',
+    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH', momentum_phase1_minutes: 5 },
   },
 ];
 

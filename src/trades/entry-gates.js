@@ -75,6 +75,18 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     return { allowed: false, reason: `Loss cooldown: ${consecutiveLosses[direction]} consecutive ${direction} losses, ${remaining}m remaining` };
   }
 
+  // Gate 3b: Same-direction loss cap — after N losses in one direction, require higher confidence
+  const dirLossCap = cfg.direction_loss_cap ?? 3;
+  if (dirLossCap > 0 && consecutiveLosses[direction] >= dirLossCap) {
+    const trigger = opts.trigger;
+    const conf = trigger?.confidence || 'MEDIUM';
+    const requiredConf = cfg.direction_loss_cap_min_confidence ?? 'VERY_HIGH';
+    const confOrder = ['LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH'];
+    if (confOrder.indexOf(conf) < confOrder.indexOf(requiredConf)) {
+      return { allowed: false, reason: `Direction cap: ${consecutiveLosses[direction]} ${direction} losses — need ${requiredConf} confidence, got ${conf}` };
+    }
+  }
+
   // Gate 4: TV Regime gate (Pink Diamond = no calls, Blue Diamond = no puts)
   // Lane A is GEX-only — skip TV regime check
   const tvRegime = opts.lane === 'A' ? { direction: null } : getTvRegime();
