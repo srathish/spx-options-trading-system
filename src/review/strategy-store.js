@@ -186,8 +186,13 @@ const V1_BASELINE = {
   // Trend pullback entry
   trend_pullback_enabled: true,
   trend_pullback_min_score: 55,               // requires decent GEX confirmation + momentum check
+  trend_pullback_chop_block: true,            // block TP entries during chop
   trend_pullback_max_dist_pts: 8,             // within 8 pts of support floor
   trend_pullback_stop_buffer_pts: 5,          // stop 5 pts below support floor
+
+  // Entry engine — simplified (pattern confidence drives entries)
+  chop_min_confidence: 'HIGH',                // require HIGH+ confidence to enter during chop
+  gex_min_entry_score: 0,                     // 0 = disabled — no composite GEX score gate
 
   // Trend day re-entry
   trend_reentry_spacing_ms: 30_000,           // 30s cooldown (vs 60s) after win in trend

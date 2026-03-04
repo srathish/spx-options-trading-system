@@ -8,7 +8,6 @@
 
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
-import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('EntryEngine');
@@ -92,136 +91,51 @@ export function checkGexOnlyEntry(state) {
   return null;
 }
 
-// ---- Entry Validation (4 gates) ----
+// ---- Entry Validation ----
+// Simple: pattern confidence is the entry decision.
+// We only block for obvious structural reasons, not composite score gates.
 
 /**
- * Validate a pattern trigger against 4 structural gates.
- * Gate 1: Alignment ≥ 2/3 (or GEX override ≥ alignment_override_gex_score)
- * Gate 2: Not at midpoint danger zone (skip for AIR_POCKET, KING_NODE_BOUNCE)
- * Gate 3: GEX score ≥ gex_only_min_score
- * Gate 4: Power hour needs GEX ≥ power_hour_min_gex_score
+ * Validate a pattern trigger.
+ * Pattern confidence already encodes wall quality, regime, growth, etc.
+ * We just check: wall boundaries, chop, and no-entry-after timing.
  */
 export function validateGexOnlyEntry(trigger, state, config) {
-  const { scored, multiAnalysis } = state;
+  const { scored } = state;
   const cfg = config || getActiveConfig() || {};
 
-  const alignment = multiAnalysis?.alignment?.count || 0;
-  const minAlignment = cfg.alignment_min_for_entry ?? 2;
-  const overrideScore = cfg.alignment_override_gex_score ?? 85;
-
-  // Gate 0: Call/Put Wall hard boundaries (SpotGamma 83%/89% rule)
-  // Don't enter BULLISH when price is already ABOVE the Call Wall (resistance)
-  // Don't enter BEARISH when price is already BELOW the Put Wall (support)
-  // Use 0 pts threshold — block only when past the wall, not approaching it
+  // 1. Call/Put Wall boundaries — don't chase past the wall
   if (scored.callWall && trigger.direction === 'BULLISH') {
-    const distToCallWall = scored.callWall.strike - scored.spotPrice;
-    if (distToCallWall <= 0) { // past the call wall
-      return { valid: false, reason: `CALL_WALL_BOUNDARY: spot ${scored.spotPrice.toFixed(0)} above call wall ${scored.callWall.strike} (83% holds as resistance)` };
+    if (scored.spotPrice >= scored.callWall.strike) {
+      return { valid: false, reason: `Past call wall ${scored.callWall.strike} — 83% holds as resistance` };
     }
   }
   if (scored.putWall && trigger.direction === 'BEARISH') {
-    const distToPutWall = scored.spotPrice - scored.putWall.strike;
-    if (distToPutWall <= 0) { // past the put wall
-      return { valid: false, reason: `PUT_WALL_BOUNDARY: spot ${scored.spotPrice.toFixed(0)} below put wall ${scored.putWall.strike} (89% holds as support)` };
+    if (scored.spotPrice <= scored.putWall.strike) {
+      return { valid: false, reason: `Past put wall ${scored.putWall.strike} — 89% holds as support` };
     }
   }
 
-  // Gate 0.5: Chop environment — require HIGH confidence + higher score for non-breakout patterns
-  // Skip for trend-aligned entries (consolidation within a trend is not chop)
-  if (scored.isChop) {
-    const trendState = state.trendState;
-    const isTrendAligned = trendState?.isTrend && trendState.direction === trigger.direction
-      && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
-
-    if (!isTrendAligned) {
-      const CHOP_EXEMPT_PATTERNS = ['AIR_POCKET', 'KING_NODE_BOUNCE', 'MAGNET_PULL'];
-      if (!CHOP_EXEMPT_PATTERNS.includes(trigger.pattern)) {
-        if (trigger.confidence !== 'HIGH' && trigger.confidence !== 'VERY_HIGH') {
-          return { valid: false, reason: `CHOP environment — ${trigger.pattern} needs HIGH confidence, got ${trigger.confidence}` };
-        }
-        const chopMinScore = cfg.chop_min_entry_score ?? 80;
-        if (scored.score < chopMinScore) {
-          return { valid: false, reason: `CHOP environment — GEX ${scored.score} < ${chopMinScore} required` };
-        }
+  // 2. Chop — configurable minimum confidence (pattern must be clear to trade in chop)
+  const chopMinConf = cfg.chop_min_confidence ?? 'HIGH'; // HIGH, MEDIUM, or NONE
+  if (scored.isChop && chopMinConf !== 'NONE') {
+    const trendAligned = state.trendState?.isTrend && state.trendState.direction === trigger.direction;
+    if (!trendAligned) {
+      const confIdx = CONFIDENCE_ORDER.indexOf(trigger.confidence);
+      const minIdx = CONFIDENCE_ORDER.indexOf(chopMinConf);
+      if (confIdx < minIdx) {
+        return { valid: false, reason: `CHOP — need ${chopMinConf} confidence, got ${trigger.confidence}` };
       }
     }
   }
 
-  // Gate 1: Alignment check (bypass for structural single-ticker patterns)
-  const STRUCTURAL_PATTERNS_ALIGN = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW', 'MAGNET_PULL'];
-  if (alignment < minAlignment) {
-    if (STRUCTURAL_PATTERNS_ALIGN.includes(trigger.pattern) && trigger.confidence !== 'LOW') {
-      log.info(`Gate 1 bypass: ${trigger.pattern} (${trigger.confidence}) — structural setup, alignment ${alignment}/3 waived`);
-    } else if (alignment >= 1 && scored.score >= overrideScore) {
-      // Original override: 1/3 alignment + high score
-    } else {
-      return { valid: false, reason: `Alignment ${alignment}/3 < ${minAlignment} (GEX ${scored.score} < override ${overrideScore})` };
-    }
+  // 2b. GEX score minimum (optional — set to 0 to disable)
+  const gexMinScore = cfg.gex_min_entry_score ?? 0;
+  if (gexMinScore > 0 && scored.score < gexMinScore) {
+    return { valid: false, reason: `GEX score ${scored.score} < min ${gexMinScore}` };
   }
 
-  // Gate 2: Not at midpoint (skip for breakout patterns)
-  const breakoutPatterns = ['AIR_POCKET', 'KING_NODE_BOUNCE'];
-  if (!breakoutPatterns.includes(trigger.pattern)) {
-    if (scored.wallsAbove?.length > 0 && scored.wallsBelow?.length > 0) {
-      const nearestAbove = scored.wallsAbove[0];
-      const nearestBelow = scored.wallsBelow[0];
-      if (nearestAbove.type === 'positive' && nearestBelow.type === 'positive') {
-        const midpoint = (nearestAbove.strike + nearestBelow.strike) / 2;
-        const distFromMidPct = Math.abs(scored.spotPrice - midpoint) / scored.spotPrice * 100;
-        const midpointBuffer = cfg.midpoint_danger_zone_pct ?? 0.15;
-        if (distFromMidPct < midpointBuffer) {
-          return { valid: false, reason: `At midpoint between ${nearestBelow.strike} and ${nearestAbove.strike} — dist ${distFromMidPct.toFixed(2)}% < ${midpointBuffer}%` };
-        }
-      }
-    }
-  }
-
-  // Gate 3: Minimum GEX score (conditional bypass for structural patterns)
-  const STRUCTURAL_PATTERNS = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'PIKA_PILLOW', 'MAGNET_PULL'];
-  const minScore = cfg.gex_only_min_score ?? 50;
-  const structuralMinScore = cfg.structural_min_score ?? 60;
-  if (scored.score < minScore) {
-    if (STRUCTURAL_PATTERNS.includes(trigger.pattern) && trigger.confidence !== 'LOW') {
-      if (scored.score < structuralMinScore) {
-        return { valid: false, reason: `Structural ${trigger.pattern}: GEX ${scored.score} < structural min ${structuralMinScore}` };
-      }
-      log.info(`Gate 3 bypass: ${trigger.pattern} (${trigger.confidence}) overrides GEX score ${scored.score} < ${minScore} (above structural min ${structuralMinScore})`);
-    } else {
-      return { valid: false, reason: `GEX score ${scored.score} < min ${minScore}` };
-    }
-  }
-
-  // Gate 3.5: Feature 7 — Transition zone chop gate
-  if (scored.inTransitionChop && !['AIR_POCKET', 'KING_NODE_BOUNCE'].includes(trigger.pattern)) {
-    if (trigger.confidence === 'MEDIUM') {
-      return { valid: false, reason: 'TRANSITION_CHOP — price trapped between nearby GEX sign transitions' };
-    }
-  }
-
-  // Gate 4: Time-of-day framework
-  const etNow = nowET();
-  const mins = etNow.hour * 60 + etNow.minute;
-
-  // 11:30 - 14:00 midday lull — raise threshold (market lunch, low volume)
-  // Exempt structural patterns that have their own internal confidence gates
-  const MIDDAY_EXEMPT = ['RUG_PULL', 'REVERSE_RUG', 'KING_NODE_BOUNCE', 'AIR_POCKET', 'MAGNET_PULL'];
-  const middayStart = 11 * 60 + 30; // 11:30
-  const middayEnd = 14 * 60;        // 14:00
-  if (mins >= middayStart && mins < middayEnd && !MIDDAY_EXEMPT.includes(trigger.pattern)) {
-    const middayMin = cfg.midday_min_gex_score ?? 65;
-    if (scored.score < middayMin) {
-      return { valid: false, reason: `Midday lull: GEX ${scored.score} < ${middayMin} required (11:30-14:00)` };
-    }
-  }
-
-  // 15:30+ power hour — only high confidence setups
-  if (mins >= 930) { // 15:30
-    const powerMin = cfg.power_hour_min_gex_score ?? 80;
-    if (scored.score < powerMin) {
-      return { valid: false, reason: `Power hour: GEX ${scored.score} < ${powerMin} required` };
-    }
-  }
-
+  // Time gate handled by checkEntryGates (Gate 9) which uses replayTime correctly
   return { valid: true };
 }
 
@@ -330,19 +244,21 @@ export function checkTrendPullbackEntry(state, trendState) {
 
   if (cfg.trend_pullback_enabled === false) return null;
 
+  // Chop gate for trend pullbacks (configurable)
+  if ((cfg.trend_pullback_chop_block ?? true) && scored.isChop) return null;
+
+  // Min GEX score for trend pullbacks (0 = disabled)
+  const tpMinScore = cfg.trend_pullback_min_score ?? 0;
+  if (tpMinScore > 0 && scored.score < tpMinScore) return null;
+
   const direction = trendState.direction;
-  const minScore = cfg.trend_pullback_min_score ?? 55;
   const maxDist = cfg.trend_pullback_max_dist_pts ?? 8;
   const stopBuffer = cfg.trend_pullback_stop_buffer_pts ?? 5;
 
   // Must be reading in trend direction
   if (scored.direction !== direction) return null;
 
-  // Minimum GEX score
-  if (scored.score < minScore) return null;
-
-  // Momentum must not oppose the pullback direction
-  // If momentum says DOWN on a BULLISH pullback, price hasn't actually reversed yet
+  // Momentum must not oppose — if price is still falling, the pullback isn't done yet
   if (scored.momentum) {
     const opposes = (direction === 'BULLISH' && scored.momentum.direction === 'DOWN' && scored.momentum.strength !== 'WEAK')
       || (direction === 'BEARISH' && scored.momentum.direction === 'UP' && scored.momentum.strength !== 'WEAK');

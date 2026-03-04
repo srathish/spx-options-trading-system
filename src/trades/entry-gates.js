@@ -6,7 +6,7 @@
 
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
-import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, detectChopMode, getRegime } from '../store/state.js';
+import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, getRegime } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -119,30 +119,9 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     return { allowed: false, reason: `Time gate: no entries after ${noEntryAfter} ET` };
   }
 
-  // Gate 10: Opening caution 9:33-9:40 (higher thresholds)
-  if (timeET >= '09:33' && timeET < '09:40') {
-    if (scored.score < 85) {
-      return { allowed: false, reason: `Opening caution: score ${scored.score} < 85 before 09:40` };
-    }
-    const alignment = multiAnalysis?.alignment?.count || 0;
-    if (alignment < 3) {
-      return { allowed: false, reason: `Opening caution: alignment ${alignment}/3 < 3/3 before 09:40` };
-    }
-  }
+  // Gate 10: removed (opening caution — pattern confidence handles this)
 
-  // Gate 11: Chop mode — higher score required + increased entry spacing
-  const chopResult = detectChopMode('SPXW', cfg.chop_lookback_cycles || 60, cfg);
-  if (chopResult.isChop) {
-    if (scored.score < (cfg.gex_strong_score || 80)) {
-      return { allowed: false, reason: `Chop mode (${chopResult.reason}) — need score >= ${cfg.gex_strong_score || 80}, got ${scored.score}` };
-    }
-    // Dynamic spacing in chop: enforce longer gap between entries
-    const chopSpacing = cfg.chop_entry_spacing_ms ?? 120_000;
-    if (lastEntryTime > 0 && (now - lastEntryTime) < chopSpacing) {
-      const remaining = Math.round((chopSpacing - (now - lastEntryTime)) / 1000);
-      return { allowed: false, reason: `Chop spacing: ${remaining}s until next entry (chop mode active)` };
-    }
-  }
+  // Gate 11: removed (chop score gate — replaced by confidence-based chop check in entry-engine)
 
   // Gate 12: Regime conflict — don't enter against a persistent opposing regime
   // Skip when regime is CHOP — chop is not a directional regime, handled by Gate 0.5 in entry-engine
