@@ -185,7 +185,8 @@ function replayCycle(cycleData, state, cfg) {
   }
 
   // ---- ENTRY CHECK (if flat) ----
-  if (!state.position) {
+  // Skip entries before market open — pre-market GEX data builds state but shouldn't trigger trades
+  if (!state.position && replayTime.hour >= 9 && (replayTime.hour > 9 || replayTime.minute >= 30)) {
     const nodeTouches = getNodeTouches();
     const nodeTrends = getNodeTrends('SPXW');
 
@@ -344,7 +345,7 @@ function closeReplayPosition(state, exitSpx, exitReason, timestamp) {
   log.info(`EXIT  ${timestamp} | ${pos.direction} ${exitReason} | ${pnlStr} | ${spxChange > 0 ? 'WIN' : 'LOSS'}`);
 
   state.position = null;
-  recordExitForGates(pos.direction, spxChange <= 0, exitMs, pos.pattern);
+  recordExitForGates(pos.direction, spxChange <= 0, exitMs, pos.pattern, spxChange);
 }
 
 // ---- Exit Trigger Checks (Pure, No DB Writes) ----
@@ -550,10 +551,16 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
   }
 
   // 8. OPPOSING_WALL — skip during confirmed trend days (walls shift naturally)
+  // v3: proximity check — only exit if wall is within 15 pts of spot (distant walls aren't immediate threats)
   if (!isTrendAligned && !holdTooShort) {
     const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
+    const opposingWallMaxDist = cfg.opposing_wall_max_dist_pts ?? 15;
     const walls = isBullish ? scored.wallsAbove : scored.wallsBelow;
-    const hasOpposing = walls?.some(w => Math.abs(w.gexValue || w.absGexValue || 0) >= opposingWallValue && w.type === 'positive');
+    const hasOpposing = walls?.some(w =>
+      Math.abs(w.gexValue || w.absGexValue || 0) >= opposingWallValue
+      && w.type === 'positive'
+      && Math.abs(w.strike - currentSpot) <= opposingWallMaxDist
+    );
     if (hasOpposing) {
       return { exit: true, reason: 'OPPOSING_WALL' };
     }

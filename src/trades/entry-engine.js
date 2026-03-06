@@ -8,6 +8,8 @@
 
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
+import { getEffectiveTime } from '../store/state.js';
+import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('EntryEngine');
@@ -76,6 +78,19 @@ export function checkGexOnlyEntry(state) {
       continue;
     }
 
+    // Time-based confidence gates
+    const etTime = getEffectiveTime() || nowET();
+    const hourDec = etTime.hour + etTime.minute / 60;
+
+    // Opening volatility gate: REVERSE_RUG needs HIGH+ in first 30 min
+    // Reversal patterns are unreliable before market direction establishes
+
+    // Midday confidence gate: 11:30-14:00 requires HIGH+ (midday lull = low conviction)
+    if (hourDec >= 11.5 && hourDec < 14 && confidence === 'MEDIUM') {
+      log.debug(`Lane A skip ${trigger.pattern}: midday gate (11:30-14:00) requires HIGH+, got MEDIUM`);
+      continue;
+    }
+
     const action = trigger.direction === 'BULLISH' ? 'ENTER_CALLS' : 'ENTER_PUTS';
 
     log.info(`Lane A entry: ${trigger.pattern} ${trigger.direction} (${confidence}) — ${trigger.reasoning}`);
@@ -133,6 +148,24 @@ export function validateGexOnlyEntry(trigger, state, config) {
   const gexMinScore = cfg.gex_min_entry_score ?? 0;
   if (gexMinScore > 0 && scored.score < gexMinScore) {
     return { valid: false, reason: `GEX score ${scored.score} < min ${gexMinScore}` };
+  }
+
+  // 3. Max stop distance: prevent catastrophic single-trade losses
+  if (trigger.stop_strike && scored.spotPrice) {
+    const stopDist = Math.abs(trigger.stop_strike - scored.spotPrice);
+    const maxStopDist = cfg.max_stop_distance_pts ?? 50;
+    if (stopDist > maxStopDist) {
+      return { valid: false, reason: `Stop too far: ${stopDist.toFixed(0)} pts (max ${maxStopDist})` };
+    }
+  }
+
+  // 3b. MAGNET_PULL: minimum distance to target (don't enter when already at the magnet)
+  if (trigger.pattern === 'MAGNET_PULL' && trigger.target_strike && scored.spotPrice) {
+    const distToTarget = Math.abs(trigger.target_strike - scored.spotPrice);
+    const minMagnetDist = cfg.magnet_pull_min_entry_dist_pts ?? 10;
+    if (distToTarget < minMagnetDist) {
+      return { valid: false, reason: `MAGNET_PULL too close: ${distToTarget.toFixed(0)} pts to target (need ${minMagnetDist})` };
+    }
   }
 
   // Time gate handled by checkEntryGates (Gate 9) which uses replayTime correctly

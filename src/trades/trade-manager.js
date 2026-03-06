@@ -355,10 +355,16 @@ export function manageCycle(currentSpot, scored, agentAction, context = {}) {
 
   // 3e. Opposing wall — large positive wall materialized against our position
   // Skip during confirmed trend days — walls shift naturally during trends
+  // v3: proximity check — only exit if wall is within 15 pts of spot
   const opposingWallValue = cfg.opposing_wall_exit_value || 5_000_000;
+  const opposingWallMaxDist = cfg.opposing_wall_max_dist_pts ?? 15;
   if (!isTrendAligned && !holdTooShort && scored) {
     const opposingWalls = isBullish ? scored.wallsAbove : scored.wallsBelow;
-    const bigOpposing = opposingWalls?.find(w => Math.abs(w.gexValue) >= opposingWallValue && w.type === 'positive');
+    const bigOpposing = opposingWalls?.find(w =>
+      Math.abs(w.gexValue) >= opposingWallValue
+      && w.type === 'positive'
+      && Math.abs(w.strike - currentSpot) <= opposingWallMaxDist
+    );
     if (bigOpposing) {
       result.exitTriggered = true;
       result.exitReason = 'OPPOSING_WALL';

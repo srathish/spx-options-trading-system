@@ -27,7 +27,7 @@
 
 import { SCORE, CONFIDENCE, MIDPOINT, AIR_POCKET, NEUTRAL_THRESHOLD, MOMENTUM } from './constants.js';
 import { getGexAtSpot, formatDollar } from './gex-parser.js';
-import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection, saveNetGex, getNetGexRoC } from '../store/state.js';
+import { getSpotMomentum, pushGexAtSpot, getSmoothedGexAtSpot, smoothGexScore, recordDirection, saveNetGex, getNetGexRoC, getEffectiveTime } from '../store/state.js';
 import { getActiveConfig } from '../review/strategy-store.js';
 import { nowET } from '../utils/market-hours.js';
 
@@ -122,7 +122,7 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   const putWall = wallsBelow.find(w => w.type === 'negative') || null;
 
   // --- Feature 2: Time-of-Day Wall Reliability ---
-  const etNow = nowET();
+  const etNow = getEffectiveTime() || nowET();
   const hourDecimal = etNow.hour + etNow.minute / 60;
   const wallReliability = hourDecimal >= 14 ? Math.max(0.4, 1.0 - (hourDecimal - 14) * 0.3) : 1.0;
 
@@ -716,7 +716,7 @@ function getRecommendation(direction, confidence, environment) {
  * More OTM call decay = bearish (MMs unwind long hedges).
  */
 function estimateCharmPressure(aggregatedGex, spotPrice, sortedStrikes) {
-  const now = nowET();
+  const now = getEffectiveTime() || nowET();
   const hour = now.hour + now.minute / 60;
   if (hour < 13.5) return { direction: null, strength: 0, active: false };
 

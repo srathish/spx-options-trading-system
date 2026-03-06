@@ -22,6 +22,10 @@ let consecutiveLosses = { BULLISH: 0, BEARISH: 0 };
 let consecutiveLossCooldownUntil = { BULLISH: 0, BEARISH: 0 };
 let lastExitWasLoss = { BULLISH: false, BEARISH: false };
 
+// Chop cooldown — track recent small-P&L trades
+let recentTrades = [];                   // [{ timestamp, pnlPts }]
+let chopCooldownUntil = 0;
+
 // Pattern-level tracking
 let patternTradeCount = {};         // { 'TRIPLE_FLOOR': 5, ... }
 let patternConsecutiveLosses = {};   // { 'TRIPLE_FLOOR': 3, ... }
@@ -193,12 +197,33 @@ export function recordEntryForGates(nowMs, pattern) {
  * @param {boolean} isLoss - Whether the trade was a loss
  * @param {number} [nowMs] - Optional timestamp override (for replay engine)
  * @param {string} [pattern] - Pattern name for per-pattern tracking
+ * @param {number} [pnlPts] - P&L in SPX points (for chop cooldown tracking)
  */
-export function recordExitForGates(direction, isLoss, nowMs, pattern) {
+export function recordExitForGates(direction, isLoss, nowMs, pattern, pnlPts) {
   const now = nowMs || Date.now();
   lastExitTime = now;
   lastExitDirection = direction;
   lastExitWasLoss[direction] = isLoss;
+
+  // Track recent trades for chop cooldown
+  if (pnlPts !== undefined) {
+    recentTrades.push({ timestamp: now, pnlPts });
+    // Keep only trades from last 30 min
+    const windowMs = 30 * 60_000;
+    while (recentTrades.length > 0 && recentTrades[0].timestamp < now - windowMs) {
+      recentTrades.shift();
+    }
+    // Check chop cooldown: 3+ trades in window, all with |P&L| < 3 pts
+    const smallThreshold = 3;
+    const minCount = 3;
+    if (recentTrades.length >= minCount) {
+      const allSmall = recentTrades.slice(-minCount).every(t => Math.abs(t.pnlPts) < smallThreshold);
+      if (allSmall) {
+        chopCooldownUntil = now + 20 * 60_000; // 20 min cooldown
+        log.warn(`Chop cooldown activated: ${minCount} consecutive small trades (<${smallThreshold} pts) → 20m pause`);
+      }
+    }
+  }
 
   if (isLoss) {
     consecutiveLosses[direction] = (consecutiveLosses[direction] || 0) + 1;
@@ -252,6 +277,8 @@ export function resetDailyGates() {
   consecutiveLosses = { BULLISH: 0, BEARISH: 0 };
   consecutiveLossCooldownUntil = { BULLISH: 0, BEARISH: 0 };
   lastExitWasLoss = { BULLISH: false, BEARISH: false };
+  recentTrades = [];
+  chopCooldownUntil = 0;
   patternTradeCount = {};
   patternConsecutiveLosses = {};
   patternCooldownUntil = {};

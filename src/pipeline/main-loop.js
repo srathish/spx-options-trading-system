@@ -514,7 +514,7 @@ async function runCycle(phase) {
           const result = exitPosition(mgmt.exitReason, parsed.spotPrice);
           if (result) {
             // Track exit for entry gates (loss streaks, re-entry cooldown)
-            recordExitForGates(result.direction, result.spxChange <= 0, undefined, result.entryTrigger);
+            recordExitForGates(result.direction, result.spxChange <= 0, undefined, result.entryTrigger, result.spxChange);
 
             await sendTradeClosed(result);
             try { dashboardEmitter.emit('trade_closed', result); } catch (_) {}

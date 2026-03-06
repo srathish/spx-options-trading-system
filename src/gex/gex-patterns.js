@@ -17,7 +17,7 @@
 
 import { characterizeAirPocket } from './gex-scorer.js';
 import { getActiveConfig } from '../review/strategy-store.js';
-import { getNodeDwellAnalysis, getStackPersistence } from '../store/state.js';
+import { getNodeDwellAnalysis, getStackPersistence, getEffectiveTime } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -386,7 +386,7 @@ function detectKingNodeBounce(ctx) {
     }
 
     // Feature 8: KNB time-of-day behavior
-    const now1 = nowET();
+    const now1 = getEffectiveTime() || nowET();
     const hour1 = now1.hour + now1.minute / 60;
     let timeNote = '';
     if (hour1 < 11) {
@@ -469,7 +469,7 @@ function detectKingNodeBounce(ctx) {
   }
 
   // Feature 8: KNB time-of-day behavior
-  const now2 = nowET();
+  const now2 = getEffectiveTime() || nowET();
   const hour2 = now2.hour + now2.minute / 60;
   let timeNote2 = '';
   if (hour2 < 11) {
