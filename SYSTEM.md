@@ -31,7 +31,7 @@ Fully automated SPX 0DTE options trading system. Reads real-time Gamma Exposure 
 
 ## Architecture Overview
 
-```
+```                
 Heatseeker API ──┐
   (SPXW/SPY/QQQ) │     ┌──────────────┐    ┌──────────────┐    ┌─────────────┐
                   ├───> │  GEX Engine   ├───>│  Algorithmic  ├───>│  Trade Exec │

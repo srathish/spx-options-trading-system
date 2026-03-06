@@ -19,7 +19,7 @@ import { fetchTrinityData, getTrinityState } from '../gex/trinity.js';
 import { analyzeMultiTicker, getLastMultiAnalysis } from '../gex/multi-ticker-analyzer.js';
 import { CONFIDENCE, FULL_ANALYSIS_COOLDOWN_MS, HEALTH_HEARTBEAT_INTERVAL_MS } from '../gex/constants.js';
 import { saveSnapshot, savePrediction, saveHealth, saveMultiAnalysis, saveAlert, saveRawSnapshot, getCheckedPredictionsToday, getUncheckedPredictions, markPredictionChecked, cleanupOldData, getTradeById, getTradesByDate, getPhantomTradesByDate, getDecisionsByDate, getTvSignalLogByDate, getGexSnapshotsByDate, getAlertsByDate, getTodaysPredictions } from '../store/db.js';
-import { resetDailyState, updateLatestSpot, recordScore, detectChopMode, updateRegime, saveKingNode, getNodeSignChanges, getKingNodeFlip, saveStackSnapshot } from '../store/state.js';
+import { resetDailyState, updateLatestSpot, updateHodLod, recordScore, detectChopMode, updateRegime, saveKingNode, getNodeSignChanges, getKingNodeFlip, saveStackSnapshot } from '../store/state.js';
 import { shouldSendAlert } from '../alerts/throttle.js';
 import { sendSpxAnalysis, sendLiveAlert, sendOpeningSummary, sendEodRecap, sendEodSummary, sendHealthHeartbeat, sendCombinedSignalAlert, sendTradeCard, sendPositionUpdate, sendTradeClosed, sendStrategyChange, sendStrategyRollback, sendNoChange, sendMapReshuffleAlert, sendReviewReport } from '../alerts/discord.js';
 import { runDecisionCycle } from '../agent/decision-engine.js';
@@ -494,7 +494,10 @@ async function runCycle(phase) {
     }
 
     // Update Heatseeker spot cache for price feed (only if sane)
-    if (spotSane) updateLatestSpot(parsed.spotPrice);
+    if (spotSane) {
+      updateLatestSpot(parsed.spotPrice);
+      updateHodLod(parsed.spotPrice);
+    }
 
     try {
       if (!spotSane) {

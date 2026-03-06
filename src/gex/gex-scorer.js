@@ -131,7 +131,15 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
 
   // Score both directions — use smoothed gexAtSpot for sign determination
   // Pass new metrics to scoring functions
-  const scoringCtx = { gammaRatio, wallAsymmetry, charmPressure, wallReliability };
+  // Directional GEX balance: sum of |GEX| above vs below spot
+  let gexSumAbove = 0, gexSumBelow = 0;
+  for (const [strike, value] of aggregatedGex) {
+    if (strike > spotPrice) gexSumAbove += Math.abs(value);
+    else if (strike < spotPrice) gexSumBelow += Math.abs(value);
+  }
+  const directionalBalance = gexSumBelow > 0 ? gexSumAbove / gexSumBelow : 1.0;
+
+  const scoringCtx = { gammaRatio, wallAsymmetry, charmPressure, wallReliability, directionalBalance };
   const bullish = scoreBullish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, largestWallAbs, momentum, gexAtSpot, wallTrends, scoringCtx);
   const bearish = scoreBearish(smoothedGexAtSpot, wallsAbove, wallsBelow, spotPrice, parsedData, wallTrends, largestWallAbs, momentum, gexAtSpot, scoringCtx);
 
@@ -249,6 +257,7 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
     charmPressure,
     callWall,
     putWall,
+    directionalBalance: parseFloat(directionalBalance.toFixed(2)),
   };
 }
 
@@ -256,7 +265,7 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
-  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0 } = ctx;
+  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0, directionalBalance = 1.0 } = ctx;
 
   // +30: Negative GEX at spot — volatile, dealers amplify moves
   // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
@@ -378,6 +387,15 @@ function scoreBullish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, larges
     breakdown.push(`+5: Bullish charm pressure (${(charmPressure.strength * 100).toFixed(0)}% strength)`);
   }
 
+  // Directional GEX balance: more GEX above spot = bullish support
+  if (directionalBalance >= 3.0) {
+    score += 10;
+    breakdown.push(`+10: Strong GEX above spot (${directionalBalance.toFixed(1)}x balance)`);
+  } else if (directionalBalance >= 2.0) {
+    score += 5;
+    breakdown.push(`+5: GEX above spot (${directionalBalance.toFixed(1)}x balance)`);
+  }
+
   score = Math.max(0, Math.min(100, score));
 
   return {
@@ -396,7 +414,7 @@ function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTr
   let score = 0;
   const breakdown = [];
   const minSignificant = largestWallAbs * 0.10;
-  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0 } = ctx;
+  const { gammaRatio = 1.0, wallAsymmetry = 1.0, charmPressure = {}, wallReliability = 1.0, directionalBalance = 1.0 } = ctx;
 
   // +30: Negative GEX at spot — volatile, dealers amplify moves
   // Uses smoothed gexAtSpot (passed as gexAtSpot) to prevent oscillation
@@ -504,6 +522,15 @@ function scoreBearish(gexAtSpot, wallsAbove, wallsBelow, spotPrice, data, wallTr
   if (charmPressure.active && charmPressure.strength > 0.3 && charmPressure.direction === 'BEARISH') {
     score += 5;
     breakdown.push(`+5: Bearish charm pressure (${(charmPressure.strength * 100).toFixed(0)}% strength)`);
+  }
+
+  // Directional GEX balance: more GEX below spot = bearish support
+  if (directionalBalance <= 0.33) {
+    score += 10;
+    breakdown.push(`+10: Strong GEX below spot (${directionalBalance.toFixed(2)} balance)`);
+  } else if (directionalBalance <= 0.50) {
+    score += 5;
+    breakdown.push(`+5: GEX below spot (${directionalBalance.toFixed(2)} balance)`);
   }
 
   score = Math.max(0, Math.min(100, score));

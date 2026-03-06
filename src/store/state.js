@@ -58,6 +58,18 @@ const STACK_SNAPSHOT_SIZE = 30;  // ~2.5 min at 5s polling
 const netGexBuffer = { SPXW: [], SPY: [], QQQ: [] };
 const NET_GEX_BUFFER_SIZE = 30; // ~2.5 min at 5s polling
 
+// HOD/LOD tracking — for negative gamma at extremes pattern
+let dailyHOD = { price: 0, timestamp: 0 };
+let dailyLOD = { price: Infinity, timestamp: 0 };
+
+// Round-trip day detection — price returning to open range after big move = chop signal
+let dailyOpenRange = { open: 0, rangeHigh: 0, rangeLow: 0, maxExcursion: 0, roundTripDetected: false };
+const OPEN_RANGE_READINGS = 20; // ~100s at 5s polling (first ~2 min of data)
+let openRangeReadings = 0;
+
+// Replay time override — when set, scoring/patterns use this instead of nowET()
+let replayTimeOverride = null;
+
 /**
  * Save a GEX read for trend detection (keeps last 3 in memory per ticker).
  * Also tracks spot price in ring buffer for momentum detection.
@@ -194,6 +206,10 @@ export function getNodeTrends(ticker = 'SPXW') {
       else longTrend = 'STABLE';
     }
 
+    // Absolute change over 30 cycles (~15 min) — $5M+ absolute growth is significant
+    // regardless of percentage (a $2M wall growing to $7M = +$5M absolute)
+    const absChange30 = prev30 !== undefined ? wall.value - prev30 : 0;
+
     trends.set(wall.strike, {
       trend,
       longTrend,
@@ -205,6 +221,7 @@ export function getNodeTrends(ticker = 'SPXW') {
       changePct10: parseFloat(changePct10.toFixed(3)),
       changePct30: parseFloat(changePct30.toFixed(3)),
       changePct60: parseFloat(changePct60.toFixed(3)),
+      absChange30,
     });
   }
 
@@ -810,6 +827,138 @@ export function getNetGexRoC(ticker = 'SPXW') {
   return { delta: delta5, slope: Math.round(slope), trend, current: recent };
 }
 
+/**
+ * Set replay time override. When set, getEffectiveTime() returns this instead of nowET().
+ * Call with null to clear.
+ */
+export function setReplayTime(dateTime) {
+  replayTimeOverride = dateTime;
+}
+
+/**
+ * Get effective time — replay override or live nowET().
+ * Use this in scoring/patterns instead of nowET() directly.
+ */
+export function getEffectiveTime() {
+  if (replayTimeOverride) return replayTimeOverride;
+  // Dynamic import avoided — caller should import nowET separately if needed
+  return null; // null = use nowET() at call site
+}
+
+/**
+ * Update HOD/LOD tracking. Call each cycle with current spot price.
+ * Also tracks opening range and round-trip detection.
+ */
+export function updateHodLod(spotPrice, timestamp = Date.now()) {
+  if (!spotPrice || spotPrice <= 0) return;
+  if (spotPrice > dailyHOD.price) {
+    dailyHOD = { price: spotPrice, timestamp };
+  }
+  if (spotPrice < dailyLOD.price) {
+    dailyLOD = { price: spotPrice, timestamp };
+  }
+
+  // Track opening range (first ~2 min of readings)
+  openRangeReadings++;
+  if (openRangeReadings <= OPEN_RANGE_READINGS) {
+    if (openRangeReadings === 1) {
+      dailyOpenRange.open = spotPrice;
+      dailyOpenRange.rangeHigh = spotPrice;
+      dailyOpenRange.rangeLow = spotPrice;
+    }
+    if (spotPrice > dailyOpenRange.rangeHigh) dailyOpenRange.rangeHigh = spotPrice;
+    if (spotPrice < dailyOpenRange.rangeLow) dailyOpenRange.rangeLow = spotPrice;
+  }
+
+  // Round-trip detection: after establishing opening range, check if price
+  // moved >15pts away and then returned within 3pts of open
+  if (openRangeReadings > OPEN_RANGE_READINGS && !dailyOpenRange.roundTripDetected) {
+    const excursion = Math.max(
+      Math.abs(dailyHOD.price - dailyOpenRange.open),
+      Math.abs(dailyLOD.price - dailyOpenRange.open)
+    );
+    dailyOpenRange.maxExcursion = Math.max(dailyOpenRange.maxExcursion, excursion);
+
+    // Price moved >15pts from open AND returned within 3pts of open = round trip
+    if (dailyOpenRange.maxExcursion >= 15 && Math.abs(spotPrice - dailyOpenRange.open) <= 3) {
+      dailyOpenRange.roundTripDetected = true;
+    }
+  }
+}
+
+/**
+ * Get current HOD/LOD and whether spot is at a new extreme.
+ */
+export function getHodLod(spotPrice) {
+  const isNewHOD = spotPrice && spotPrice >= dailyHOD.price;
+  const isNewLOD = spotPrice && spotPrice <= dailyLOD.price;
+  const nearHOD = spotPrice && Math.abs(spotPrice - dailyHOD.price) <= 3;
+  const nearLOD = spotPrice && Math.abs(spotPrice - dailyLOD.price) <= 3;
+  return {
+    hod: dailyHOD.price,
+    lod: dailyLOD.price === Infinity ? 0 : dailyLOD.price,
+    isNewHOD,
+    isNewLOD,
+    nearHOD,
+    nearLOD,
+  };
+}
+
+/**
+ * Get round-trip day status — true when price returned to open after big excursion.
+ * Round-trip days are chop days — confidence should be reduced.
+ */
+export function getRoundTripStatus() {
+  return {
+    roundTrip: dailyOpenRange.roundTripDetected,
+    openPrice: dailyOpenRange.open,
+    maxExcursion: dailyOpenRange.maxExcursion,
+    rangeHigh: dailyOpenRange.rangeHigh,
+    rangeLow: dailyOpenRange.rangeLow,
+  };
+}
+
+/**
+ * Find walls that have doubled (100%+ growth) over 30 cycles (~15 min).
+ * Returns array of { strike, currentValue, growth30Pct, longTrend }.
+ */
+export function getDoublingWalls(ticker = 'SPXW') {
+  const trends = getNodeTrends(ticker);
+  const doubling = [];
+  for (const [strike, t] of trends) {
+    if (t.changePct30 >= 1.0 && t.currentValue >= 3_000_000) {
+      doubling.push({ strike, currentValue: t.currentValue, growth30Pct: t.changePct30, longTrend: t.longTrend });
+    }
+  }
+  return doubling;
+}
+
+/**
+ * Find walls with rapid absolute growth ($5M+ over 30 cycles) within range of spot.
+ * Absolute growth catches walls going $2M→$7M (significant!) that percentage thresholds miss
+ * because they start small. Also catches $20M→$25M walls that don't hit 20% but gained $5M.
+ * @param {number} spotPrice - Current spot price
+ * @param {number} [maxDistPts=15] - Maximum distance from spot in points
+ * @param {number} [minAbsGrowth=5_000_000] - Minimum absolute growth
+ */
+export function getRapidGrowthWalls(ticker = 'SPXW', spotPrice = 0, maxDistPts = 15, minAbsGrowth = 5_000_000) {
+  const trends = getNodeTrends(ticker);
+  const rapid = [];
+  for (const [strike, t] of trends) {
+    if (spotPrice > 0 && Math.abs(strike - spotPrice) > maxDistPts) continue;
+    if ((t.absChange30 || 0) >= minAbsGrowth) {
+      rapid.push({
+        strike,
+        currentValue: t.currentValue,
+        absChange30: t.absChange30,
+        changePct30: t.changePct30,
+        trend: t.trend,
+      });
+    }
+  }
+  return rapid.sort((a, b) => b.absChange30 - a.absChange30);
+}
+
 export function resetDailyState() {
   smoothedScores.SPXW = null;
   smoothedScores.SPY = null;
@@ -835,6 +984,10 @@ export function resetDailyState() {
   netGexBuffer.SPXW = [];
   netGexBuffer.SPY = [];
   netGexBuffer.QQQ = [];
+  dailyHOD = { price: 0, timestamp: 0 };
+  dailyLOD = { price: Infinity, timestamp: 0 };
+  dailyOpenRange = { open: 0, rangeHigh: 0, rangeLow: 0, maxExcursion: 0, roundTripDetected: false };
+  openRangeReadings = 0;
 }
 
 /**

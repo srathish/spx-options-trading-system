@@ -22,126 +22,121 @@ const DATES = ['2026-03-03', '2026-03-02'];
 // The base config comes from the active DB strategy.
 
 const STRATEGIES = [
-  // Baseline
+  // Baseline: current config (P0 60s, +1pt)
   {
-    name: '1. Baseline (current)',
-    desc: 'Current config — no changes',
+    name: '1. Baseline (60s/+1pt)',
+    desc: 'Current config — exit if <+1pt at 60s',
     config: {},
   },
 
-  // Fix 1: Faster Phase 0 exit
+  // ---- "Exit if losing" approach: negative min_pts = max allowed loss ----
+  // 60s timeframe
   {
-    name: '2. Phase0 60s',
-    desc: 'Exit duds in 60s instead of 120s',
-    config: { momentum_phase0_seconds: 60 },
+    name: '2. 60s/-1pt',
+    desc: '60s: exit only if losing >1pt',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: -1.0 },
   },
   {
-    name: '3. Phase0 90s',
-    desc: 'Exit duds in 90s',
-    config: { momentum_phase0_seconds: 90 },
+    name: '3. 60s/-2pt',
+    desc: '60s: exit only if losing >2pts',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: -2.0 },
   },
   {
-    name: '4. Phase0 60s +1pt',
-    desc: '60s exit, need +1pt instead of +0.5',
-    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: 1.0 },
-  },
-
-  // Fix 2: Pattern loss limit
-  {
-    name: '5. PatLoss 2/15m',
-    desc: '2 pattern losses → 15m cooldown',
-    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
-  },
-  {
-    name: '6. PatLoss 2/10m',
-    desc: '2 pattern losses → 10m cooldown',
-    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 10 * 60_000 },
-  },
-  {
-    name: '7. PatLoss 3/15m',
-    desc: '3 pattern losses → 15m cooldown (tighter than 30m)',
-    config: { pattern_loss_limit: 3, pattern_loss_cooldown_ms: 15 * 60_000 },
+    name: '4. 60s/-3pt',
+    desc: '60s: exit only if losing >3pts',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: -3.0 },
   },
 
-  // Fix 3: Same-direction cap
+  // 90s timeframe
   {
-    name: '8. DirCap 3/VH',
-    desc: '3 same-dir losses → need VERY_HIGH',
-    config: { direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '5. 90s/-1pt',
+    desc: '90s: exit only if losing >1pt',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: -1.0 },
   },
   {
-    name: '9. DirCap 2/VH',
-    desc: '2 same-dir losses → need VERY_HIGH',
-    config: { direction_loss_cap: 2, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '6. 90s/-2pt',
+    desc: '90s: exit only if losing >2pts',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: -2.0 },
   },
   {
-    name: '10. DirCap 3/HIGH',
-    desc: '3 same-dir losses → need HIGH (softer)',
-    config: { direction_loss_cap: 3, direction_loss_cap_min_confidence: 'HIGH' },
-  },
-
-  // Combos: Fix 1 + Fix 2
-  {
-    name: '11. P0-60s + PL-2/15m',
-    desc: 'Fast exit + tight pattern cooldown',
-    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
-  },
-  {
-    name: '12. P0-90s + PL-2/15m',
-    desc: '90s exit + tight pattern cooldown',
-    config: { momentum_phase0_seconds: 90, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000 },
+    name: '7. 90s/-3pt',
+    desc: '90s: exit only if losing >3pts',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: -3.0 },
   },
 
-  // Combos: Fix 1 + Fix 3
+  // 120s timeframe
   {
-    name: '13. P0-60s + DC-3/VH',
-    desc: 'Fast exit + direction cap',
-    config: { momentum_phase0_seconds: 60, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '8. 120s/-1pt',
+    desc: '120s: exit only if losing >1pt',
+    config: { momentum_phase0_seconds: 120, momentum_phase0_min_pts: -1.0 },
+  },
+  {
+    name: '9. 120s/-2pt',
+    desc: '120s: exit only if losing >2pts',
+    config: { momentum_phase0_seconds: 120, momentum_phase0_min_pts: -2.0 },
+  },
+  {
+    name: '10. 120s/-3pt',
+    desc: '120s: exit only if losing >3pts',
+    config: { momentum_phase0_seconds: 120, momentum_phase0_min_pts: -3.0 },
   },
 
-  // Combos: Fix 2 + Fix 3
+  // ---- Hybrid: softer gain requirement (not as strict as +1pt) ----
   {
-    name: '14. PL-2/15m + DC-3/VH',
-    desc: 'Tight pattern cooldown + direction cap',
-    config: { pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '11. 60s/+0.5pt',
+    desc: '60s: exit if <+0.5pt (original threshold)',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: 0.5 },
+  },
+  {
+    name: '12. 90s/+0.5pt',
+    desc: '90s: exit if <+0.5pt',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: 0.5 },
+  },
+  {
+    name: '13. 90s/+1pt',
+    desc: '90s: exit if <+1pt (more time to develop)',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: 1.0 },
+  },
+  {
+    name: '14. 120s/+1pt',
+    desc: '120s: exit if <+1pt',
+    config: { momentum_phase0_seconds: 120, momentum_phase0_min_pts: 1.0 },
   },
 
-  // All 3 fixes combined
+  // ---- "Break even or better" ----
   {
-    name: '15. ALL: P0-60 PL-2 DC-3',
-    desc: 'All 3 fixes: 60s exit, 2-loss pattern, 3-dir cap',
-    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '15. 60s/0pt',
+    desc: '60s: exit only if losing (must be >=0)',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: 0 },
   },
   {
-    name: '16. ALL: P0-90 PL-2 DC-3',
-    desc: 'All 3 fixes: 90s exit, 2-loss pattern, 3-dir cap',
-    config: { momentum_phase0_seconds: 90, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH' },
+    name: '16. 90s/0pt',
+    desc: '90s: exit only if losing (must be >=0)',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: 0 },
   },
   {
-    name: '17. ALL: P0-60 PL-2 DC-2',
-    desc: 'All 3 fixes aggressive: 60s, 2-pat, 2-dir',
-    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 2, direction_loss_cap_min_confidence: 'VERY_HIGH' },
-  },
-
-  // Wider entry spacing combos
-  {
-    name: '18. ALL + 120s spacing',
-    desc: 'All 3 fixes + 120s between entries',
-    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH', entry_min_spacing_ms: 120_000 },
+    name: '17. 120s/0pt',
+    desc: '120s: exit only if losing (must be >=0)',
+    config: { momentum_phase0_seconds: 120, momentum_phase0_min_pts: 0 },
   },
 
-  // Phase 1 tighter too
+  // ---- No Phase 0 at all (disable early exit) ----
   {
-    name: '19. P0-60 + P1-5min',
-    desc: 'Fast Phase 0 + tighter Phase 1 (5min instead of 7)',
-    config: { momentum_phase0_seconds: 60, momentum_phase1_minutes: 5 },
+    name: '18. No Phase 0',
+    desc: 'Disable Phase 0 entirely (first check at Phase 1 / 7min)',
+    config: { momentum_phase0_seconds: 0 },
   },
 
-  // Kitchen sink: best guess
+  // ---- Best combos with Phase 1 tuning ----
   {
-    name: '20. Best guess',
-    desc: 'P0-60, PL-2/15m, DC-3/VH, P1-5min',
-    config: { momentum_phase0_seconds: 60, pattern_loss_limit: 2, pattern_loss_cooldown_ms: 15 * 60_000, direction_loss_cap: 3, direction_loss_cap_min_confidence: 'VERY_HIGH', momentum_phase1_minutes: 5 },
+    name: '19. 90s/-2pt + P1-5min',
+    desc: '90s max loss 2pt + Phase 1 at 5min',
+    config: { momentum_phase0_seconds: 90, momentum_phase0_min_pts: -2.0, momentum_phase1_minutes: 5 },
+  },
+  {
+    name: '20. 60s/-2pt + P1-5min',
+    desc: '60s max loss 2pt + Phase 1 at 5min',
+    config: { momentum_phase0_seconds: 60, momentum_phase0_min_pts: -2.0, momentum_phase1_minutes: 5 },
   },
 ];
 

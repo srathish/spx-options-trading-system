@@ -19,7 +19,7 @@ import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGat
 import { buildEntryContext } from '../trades/entry-context.js';
 import {
   resetDailyState, saveGexRead, saveNodeSnapshot, recordScore,
-  updateRegime, getNodeTrends, updateLatestSpot, getGexHistory,
+  updateRegime, getNodeTrends, updateLatestSpot, updateHodLod, setReplayTime, getGexHistory,
   detectWallTrends, saveKingNode, getNodeSignChanges, getKingNodeFlip,
   saveStackSnapshot, getStackPersistence,
 } from '../store/state.js';
@@ -97,7 +97,10 @@ export function replayDate(dateStr, configOverride = null) {
     }
   }
 
-  // 6. Build report
+  // 6. Clear replay time override
+  setReplayTime(null);
+
+  // 7. Build report
   return buildReplayReport(state, dateStr);
 }
 
@@ -106,6 +109,13 @@ export function replayDate(dateStr, configOverride = null) {
 function replayCycle(cycleData, state, cfg) {
   const spxwRow = cycleData.SPXW;
   if (!spxwRow) return;
+
+  // Set replay time override for scoring/patterns to use correct snapshot time
+  const snapshotTime = DateTime.fromFormat(
+    spxwRow.timestamp, 'yyyy-MM-dd HH:mm:ss',
+    { zone: 'America/New_York' }
+  );
+  setReplayTime(snapshotTime);
 
   // Reconstruct SPXW parsed data
   const spxwParsed = reconstructParsedData(spxwRow);
@@ -154,16 +164,14 @@ function replayCycle(cycleData, state, cfg) {
   recordScore('SPXW', scored.score, scored.direction, scored.spotPrice);
   updateRegime('SPXW', scored.direction);
   updateLatestSpot(spxwParsed.spotPrice);
+  updateHodLod(spxwParsed.spotPrice);
 
   // Trend day detection
   updateTrendBuffer(scored, cfg);
   detectTrendDay();
 
-  // Parse replay time for time-based gates
-  const replayTime = DateTime.fromFormat(
-    spxwRow.timestamp, 'yyyy-MM-dd HH:mm:ss',
-    { zone: 'America/New_York' }
-  );
+  // Use the already-parsed snapshot time for time-based gates
+  const replayTime = snapshotTime;
 
   // ---- EXIT CHECK (if in position) ----
   if (state.position) {
