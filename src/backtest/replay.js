@@ -297,6 +297,15 @@ function openReplayPosition(state, params) {
     stopSpx = direction === 'BULLISH' ? spotPrice - stopDist * breakoutMult : spotPrice + stopDist * breakoutMult;
   }
 
+  // Clamp stop to max distance after all multipliers
+  const maxStopDist = cfg.max_stop_distance_pts ?? 6;
+  if (maxStopDist > 0 && stopSpx) {
+    const finalDist = Math.abs(stopSpx - spotPrice);
+    if (finalDist > maxStopDist) {
+      stopSpx = direction === 'BULLISH' ? spotPrice - maxStopDist : spotPrice + maxStopDist;
+    }
+  }
+
   state.position = {
     direction,
     entrySpx: spotPrice,

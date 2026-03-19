@@ -22,6 +22,7 @@ const GEX_AT_SPOT_WINDOW = 3;
 
 // EMA score smoothing — prevents score whipsaw on small spot moves
 const smoothedScores = { SPXW: null, SPY: null, QQQ: null };
+const smoothedDirection = { SPXW: null, SPY: null, QQQ: null }; // track direction to reset EMA on flip
 const SMOOTHING_ALPHA = 0.3; // 0.3 = responsive (30% toward new value each cycle)
 
 // Cached latest spot price (updated each main loop cycle)
@@ -480,15 +481,21 @@ export function getSmoothedGexAtSpot(ticker) {
 
 /**
  * Smooth a GEX score using EMA to prevent whipsaw.
+ * Resets EMA state when direction flips — prevents smoothing across a boundary
+ * (e.g. BULLISH 70 → BEARISH 65 would wrongly smooth to BULLISH 55 without reset).
  * Returns the smoothed score (integer).
  */
-export function smoothGexScore(ticker, rawScore) {
-  if (!smoothedScores[ticker] && smoothedScores[ticker] !== 0) {
+export function smoothGexScore(ticker, rawScore, direction) {
+  // Reset EMA on direction flip or first call
+  if (!smoothedScores[ticker] && smoothedScores[ticker] !== 0 ||
+      (direction && smoothedDirection[ticker] && direction !== smoothedDirection[ticker])) {
     smoothedScores[ticker] = rawScore;
+    smoothedDirection[ticker] = direction || null;
     return rawScore;
   }
   const smoothed = Math.round(SMOOTHING_ALPHA * rawScore + (1 - SMOOTHING_ALPHA) * smoothedScores[ticker]);
   smoothedScores[ticker] = smoothed;
+  smoothedDirection[ticker] = direction || smoothedDirection[ticker];
   return smoothed;
 }
 
@@ -963,6 +970,9 @@ export function resetDailyState() {
   smoothedScores.SPXW = null;
   smoothedScores.SPY = null;
   smoothedScores.QQQ = null;
+  smoothedDirection.SPXW = null;
+  smoothedDirection.SPY = null;
+  smoothedDirection.QQQ = null;
   directionHistory.SPXW = [];
   directionHistory.SPY = [];
   directionHistory.QQQ = [];

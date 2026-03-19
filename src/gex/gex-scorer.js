@@ -161,17 +161,32 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
     }
   }
 
-  // Momentum conflict override — if score direction fights strong price trend, degrade to CHOP
-  // This catches the scenario where walls say BULLISH but price is falling through them
-  if (momentum.strength === 'STRONG') {
+  // Momentum conflict override — if score direction fights price trend, penalize hard
+  // Fires on MODERATE+ (was STRONG-only, which waited until 30-40pts into a move)
+  // On STRONG momentum: hard override flips direction instead of just penalizing
+  if (momentum.strength === 'MODERATE' || momentum.strength === 'STRONG') {
     if (bullish.score > bearish.score && momentum.direction === 'DOWN') {
-      const conflictPenalty = Math.min(30, Math.round(Math.abs(momentum.points) * 2));
-      bullish.score = Math.max(25, bullish.score - conflictPenalty);
-      bullish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BULLISH but price falling ${momentum.points}pts`);
+      if (momentum.strength === 'STRONG') {
+        // Hard override: price is crashing, walls are wrong — force bearish
+        const override = bullish.score - bearish.score + 10; // flip + 10pt margin
+        bullish.score = Math.max(0, bullish.score - override);
+        bullish.breakdown.push(`-${override}: MOMENTUM OVERRIDE — price falling ${momentum.points}pts (STRONG), forcing direction flip`);
+      } else {
+        // Moderate conflict: scale penalty by move size, no floor
+        const conflictPenalty = Math.min(40, Math.round(Math.abs(momentum.points) * 3));
+        bullish.score = Math.max(0, bullish.score - conflictPenalty);
+        bullish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BULLISH but price falling ${momentum.points}pts`);
+      }
     } else if (bearish.score > bullish.score && momentum.direction === 'UP') {
-      const conflictPenalty = Math.min(30, Math.round(momentum.points * 2));
-      bearish.score = Math.max(25, bearish.score - conflictPenalty);
-      bearish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BEARISH but price rising +${momentum.points}pts`);
+      if (momentum.strength === 'STRONG') {
+        const override = bearish.score - bullish.score + 10;
+        bearish.score = Math.max(0, bearish.score - override);
+        bearish.breakdown.push(`-${override}: MOMENTUM OVERRIDE — price rising +${momentum.points}pts (STRONG), forcing direction flip`);
+      } else {
+        const conflictPenalty = Math.min(40, Math.round(momentum.points * 3));
+        bearish.score = Math.max(0, bearish.score - conflictPenalty);
+        bearish.breakdown.push(`-${conflictPenalty}: MOMENTUM CONFLICT — walls say BEARISH but price rising +${momentum.points}pts`);
+      }
     }
   }
 
@@ -200,8 +215,9 @@ export function scoreSpxGex(parsedData, wallTrends = null, trinityBonus = 0, tic
   }
 
   // EMA score smoothing — prevents whipsaw on small spot moves
+  // Resets on direction flip to avoid smoothing across BULLISH↔BEARISH boundary
   const rawScore = result.score;
-  result.score = smoothGexScore(ticker, result.score);
+  result.score = smoothGexScore(ticker, result.score, result.direction);
   if (result.score !== rawScore) {
     result.breakdown.push(`EMA smoothed: ${rawScore} → ${result.score} (α=${0.3})`);
   }

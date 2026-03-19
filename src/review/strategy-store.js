@@ -43,7 +43,7 @@ const V1_BASELINE = {
   // Entry/exit rules
   min_rr_ratio: 1.0,
   max_trades_per_day: 5,
-  no_entry_after: '15:30',
+  no_entry_after: '14:30',          // v3: 3PM hour is -16 pts across 19 days — cut it
   theta_warning_time: '15:00',
   stop_buffer_pct: 0.05,
   gex_exit_threshold: 40,
@@ -103,7 +103,10 @@ const V1_BASELINE = {
   // Entry quality gates — v2: wider spacing to prevent churn
   entry_min_spacing_ms: 300_000,     // 5 min between entries — target 5-8 trades/day, not 15+
   entry_blackout_start: '09:30',
-  entry_blackout_end: '09:45',
+  entry_blackout_end: '10:00',       // v3: 9AM hour loses -27 pts across 19 days — extend blackout
+  noon_blackout_enabled: true,       // v4: 12PM hour is 22% WR, -68 pts — dead zone
+  noon_blackout_start: '12:00',
+  noon_blackout_end: '13:00',
   consecutive_loss_limit: 2,
   consecutive_loss_cooldown_ms: 15 * 60_000,
 
@@ -147,8 +150,8 @@ const V1_BASELINE = {
   magnet_pull_min_growth_pct: 0.15,      // must grow 15%+ over tracking window
 
   // Pattern-level risk management
-  max_trades_per_pattern: 8,         // max trades per pattern per day
-  pattern_loss_limit: 3,             // consecutive losses on same pattern → cooldown
+  max_trades_per_pattern: 2,         // v4: max 2 per pattern per day (was 4 — still overtrading at 6.7/day avg)
+  pattern_loss_limit: 2,             // v4: 2 consecutive losses → cooldown (was 3)
   pattern_loss_cooldown_ms: 30 * 60_000, // 30min cooldown after pattern loss limit
   pattern_win_rate_min: 0.30,        // auto-disable patterns below 30% win rate
   pattern_win_rate_min_trades: 10,   // need 10+ trades before win rate gate activates
@@ -157,6 +160,14 @@ const V1_BASELINE = {
   min_entry_rr_ratio: 1.5,           // require target >= 1.5x stop distance
   structural_min_score: 40,          // structural patterns still need GEX score >= 40
   midpoint_danger_zone_pct: 0.08,    // widen midpoint buffer from 0.05% to 0.08%
+  max_stop_distance_pts: 5,          // v4: tighten to 5 pts (was 6) — stops still averaging -5 pts
+
+  // Pattern enable/disable
+  wall_flip_enabled: false,          // v3: WALL_FLIP is -36 pts from 3 trades — disable
+  range_edge_fade_enabled: false,    // v4: 31% WR, -42 pts across 60 days — disable
+  triple_ceiling_enabled: false,     // v4: 25% WR, -24 pts across 60 days — disable
+  pika_pillow_enabled: false,        // v4: 47% WR but avg loss 2.5x avg win, -40 pts — disable
+  reverse_rug_min_confidence: 'HIGH', // v4: require HIGH+ confidence (was MEDIUM, 37% WR at 136 trades)
 
   // Adaptive momentum
   momentum_phase1_high_conf_minutes: 7, // HIGH/VERY_HIGH entries get 7min Phase 1 (vs 5)
@@ -189,6 +200,34 @@ const V1_BASELINE = {
   trend_pullback_chop_block: true,            // block TP entries during chop
   trend_pullback_max_dist_pts: 8,             // within 8 pts of support floor
   trend_pullback_stop_buffer_pts: 5,          // stop 5 pts below support floor
+
+  // Lane C: Trend Day Overlay
+  lane_c_enabled: true,                    // enable Lane C trend day overlay
+  lane_c_min_score: 4,                     // need 4/9 weighted score + mandatory neg GEX to activate
+  lane_c_gex_neg_threshold: 0,             // GEX below 0 = negative at open
+  lane_c_gex_delta_threshold: -20_000_000, // delta vs prior day must be < -20M
+  lane_c_overnight_range_pts: 40,          // overnight range > 40 pts AND directional (was 30)
+  lane_c_stop_min_pts: 10,                // structural stop minimum 10 pts
+  lane_c_stop_max_pts: 15,                // structural stop maximum 15 pts
+  lane_c_trail_activate_pts: 8,            // start trailing after 8 pts profit
+  lane_c_trail_distance_pts: 15,           // trail 15 pts behind HWM
+  lane_c_time_stop_hour: 15,              // time stop at 3:45 PM
+  lane_c_time_stop_minute: 45,
+  lane_c_regime_reversal_drawdown_pts: 10, // need 10 pt drawdown + GEX flip to exit
+  lane_c_max_entries: 2,                   // max 2 Lane C entries per day
+  lane_c_entry_start_minute: 45,          // earliest Lane C entry at 9:45
+  lane_c_scoring_frames: 5,               // use first 5 frames (~2.5 min) for pre-session scoring
+  lane_c_early_velocity_pts: 5,           // 5+ pt move in first N frames = early velocity signal
+  lane_c_gex_deep_neg_threshold: -30_000_000, // -30M = deep negative (fallback for signal 2)
+  lane_c_confirm_threshold_pts: 8,        // first 10-min candle must move 8+ pts to confirm
+
+  // GEX regime gates (v5) — based on 60-day quant analysis
+  regime_gate_enabled: true,              // v5: enable GEX regime directional gate
+  regime_deep_negative_threshold: -30,    // v5: below -30M = bullish momentum, block low-conf BEARISH
+  regime_positive_threshold: 10,          // v5: above 10M = bearish bias, block low-conf BULLISH
+  regime_mod_negative_low: -60,           // v5: moderate negative zone lower (bullish sweet spot)
+  regime_mod_negative_high: -15,          // v5: moderate negative zone upper
+  regime_gate_min_confidence: 'HIGH',     // v5: minimum confidence to override regime gate
 
   // Entry engine — simplified (pattern confidence drives entries)
   chop_min_confidence: 'HIGH',                // require HIGH+ confidence to enter during chop
@@ -227,7 +266,7 @@ export function initStrategyStore() {
 
   const active = getActiveVersion();
   if (active) {
-    activeConfig = JSON.parse(active.config);
+    activeConfig = { ...V1_BASELINE, ...JSON.parse(active.config) };
     activeVersionNum = active.version;
     log.info(`Strategy v${active.version} loaded (source: ${active.source})`);
   } else {

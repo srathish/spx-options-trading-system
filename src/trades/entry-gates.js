@@ -6,7 +6,7 @@
 
 import { getActiveConfig } from '../review/strategy-store.js';
 import { getSignalSnapshot, getTvRegime } from '../tv/tv-signal-store.js';
-import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, getRegime } from '../store/state.js';
+import { getSpotMomentum, isDirectionStable, hadRecentDirectionFlip, getRegime, getNetGexRoC, getRoundTripStatus, getNodeTrends } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -26,12 +26,19 @@ let lastExitWasLoss = { BULLISH: false, BEARISH: false };
 let recentTrades = [];                   // [{ timestamp, pnlPts }]
 let chopCooldownUntil = 0;
 
+// Daily P&L circuit breaker
+let todayNetPnl = 0;                    // Accumulated net PnL for the day (in SPX pts)
+
 // Pattern-level tracking
 let patternTradeCount = {};         // { 'TRIPLE_FLOOR': 5, ... }
 let patternConsecutiveLosses = {};   // { 'TRIPLE_FLOOR': 3, ... }
 let patternCooldownUntil = {};       // { 'TRIPLE_FLOOR': 1709312345000, ... }
 let patternWins = {};                // { 'TRIPLE_FLOOR': 2, ... }
 let patternTotal = {};               // { 'TRIPLE_FLOOR': 10, ... }
+
+// Day-trend lock: once CONFIRMED trend fires, lock the direction for the day.
+// Prevents flip-flopping between BULLISH and BEARISH within the same day.
+let dayTrendLocked = null;           // null | 'BULLISH' | 'BEARISH'
 
 // ---- Main gate check ----
 
@@ -51,8 +58,75 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const now = opts.nowMs || Date.now();
   const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
 
-  // Gate 1: 60s minimum spacing between ANY entries (reduced during trend days after wins)
+  // Gate 0a: Daily P&L circuit breaker.
+  // When today's cumulative P&L hits the max daily loss threshold, halt all new entries.
+  // Prevents spiraling losses on adverse market days (e.g. 0W/9L days in 60-day backtest).
+  if (cfg.max_daily_loss_pts && todayNetPnl <= -Math.abs(cfg.max_daily_loss_pts)) {
+    return { allowed: false, reason: `Daily loss limit: ${todayNetPnl.toFixed(2)} pts (limit: -${cfg.max_daily_loss_pts})` };
+  }
+
+  // Gate 0b: SPY momentum gate — "the brain."
+  // If SPY 5-min momentum is STRONG in the opposite direction to our entry, the broad
+  // market is actively fighting the GEX signal. Block to avoid trading into crashes.
+  // Only fires on STRONG (≥$15 move in 5 min) to avoid filtering choppy chop.
+  // Key scenario: 2026-02-03 SPX crashed 89 pts while system took 9 BULLISH entries.
+  if (cfg.spy_momentum_gate_enabled) {
+    const minStrength = cfg.spy_momentum_gate_min_strength ?? 'STRONG';
+    const strengthOrder = { STRONG: 3, MODERATE: 2, WEAK: 1, CHOP: 0 };
+    const minLevel = strengthOrder[minStrength] ?? 3;
+    const spyMom = getSpotMomentum('SPY');
+    const qqqMom = cfg.qqq_momentum_gate_enabled ? getSpotMomentum('QQQ') : null;
+    const spyHeadwind = (strengthOrder[spyMom?.strength] ?? 0) >= minLevel
+      && spyMom?.direction && spyMom.direction !== 'CHOP' && spyMom.direction !== direction;
+    const qqqHeadwind = qqqMom && (strengthOrder[qqqMom?.strength] ?? 0) >= minLevel
+      && qqqMom.direction !== 'CHOP' && qqqMom.direction !== direction;
+    if (spyHeadwind) {
+      return { allowed: false, reason: `SPY momentum headwind: SPY ${spyMom.strength} ${spyMom.direction} vs ${direction} (${spyMom.points?.toFixed(1) ?? '?'} pts)` };
+    }
+    if (qqqHeadwind) {
+      return { allowed: false, reason: `QQQ momentum headwind: QQQ ${qqqMom.strength} ${qqqMom.direction} vs ${direction} (${qqqMom.points?.toFixed(1) ?? '?'} pts)` };
+    }
+  }
+
+  // Gate 0: Trend-only mode — only enter when a solid intraday trend is confirmed.
+  // Direction is anchored to raw price move from the day's open, not the trend detector's
+  // first-fire direction. This prevents locking the wrong direction on gap-and-reverse days.
   const trendState = opts.trendState;
+  if (cfg.trend_only_mode) {
+    const trendStrength = trendState?.strength;
+    const trendActive = trendState?.isTrend && (trendStrength === 'CONFIRMED' || trendStrength === 'STRONG');
+
+    if (!trendActive) {
+      return { allowed: false, reason: `Trend-only: waiting for CONFIRMED trend (current: ${trendStrength || 'none'})` };
+    }
+
+    // Determine day direction from raw price move from open (not trend detector's first-fire).
+    // This correctly handles gap-and-reverse days where the first candle's direction reverses.
+    if (!dayTrendLocked) {
+      const { openPrice } = getRoundTripStatus();
+      const minDayMove = cfg.trend_only_min_move_pts ?? 30;
+      if (openPrice && openPrice > 0) {
+        const moveFromOpen = scored.spotPrice - openPrice;
+        if (moveFromOpen >= minDayMove) {
+          dayTrendLocked = 'BULLISH';
+        } else if (moveFromOpen <= -minDayMove) {
+          dayTrendLocked = 'BEARISH';
+        } else {
+          return { allowed: false, reason: `Trend-only: move from open only ${moveFromOpen.toFixed(0)}pts (need ±${minDayMove})` };
+        }
+        log.info(`Trend-only: day direction LOCKED ${dayTrendLocked} (move: ${moveFromOpen.toFixed(0)}pts from open ${openPrice.toFixed(0)})`);
+      } else {
+        return { allowed: false, reason: 'Trend-only: open price not yet established' };
+      }
+    }
+
+    // Only trade the locked direction — no reversals mid-day
+    if (direction !== dayTrendLocked) {
+      return { allowed: false, reason: `Trend-only: ${direction} blocked — day locked ${dayTrendLocked}` };
+    }
+  }
+
+  // Gate 1: 60s minimum spacing between ANY entries (reduced during trend days after wins)
   const isTrendConfirmed = trendState?.isTrend && trendState.direction === direction
     && (trendState.strength === 'CONFIRMED' || trendState.strength === 'STRONG');
   const isTrendAligned = isTrendConfirmed;
@@ -135,7 +209,12 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     return { allowed: false, reason: `Time gate: no entries after ${noEntryAfter} ET` };
   }
 
-  // Gate 10: removed (opening caution — pattern confidence handles this)
+  // Gate 10: Noon dead zone — 12:00-12:59 ET is 22% WR, -68 pts across 60 days
+  const noonBlackoutStart = cfg.noon_blackout_start || '12:00';
+  const noonBlackoutEnd = cfg.noon_blackout_end || '13:00';
+  if (cfg.noon_blackout_enabled !== false && timeET >= noonBlackoutStart && timeET < noonBlackoutEnd) {
+    return { allowed: false, reason: `Noon dead zone: no entries ${noonBlackoutStart}-${noonBlackoutEnd}` };
+  }
 
   // Gate 11: removed (chop score gate — replaced by confidence-based chop check in entry-engine)
 
@@ -173,6 +252,103 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
     }
   }
 
+  // Gate 16: Max stop distance — reject entries with stops too far away
+  const maxStopDist = cfg.max_stop_distance_pts ?? 6;
+  const trigger = opts.trigger;
+  if (maxStopDist > 0 && trigger?.stop_strike && scored?.spotPrice) {
+    const stopDist = Math.abs(trigger.stop_strike - scored.spotPrice);
+    if (stopDist > maxStopDist) {
+      return { allowed: false, reason: `Stop too wide: ${stopDist.toFixed(1)} pts > ${maxStopDist} max` };
+    }
+  }
+
+  // Gate 17: GEX regime directional gate
+  // Data: deep negative GEX (<-30M) = 68% up days → block low-confidence BEARISH entries
+  //       positive GEX (>10M) = 60% down days → block low-confidence BULLISH entries
+  if (cfg.regime_gate_enabled !== false) {
+    const netGexM = getNetGexRoC('SPXW').current / 1e6;
+    const deepNegThreshold = cfg.regime_deep_negative_threshold ?? -30;
+    const posThreshold = cfg.regime_positive_threshold ?? 10;
+    const triggerConf = trigger?.confidence || 'MEDIUM';
+    const confOrder = ['LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH'];
+    const minRegimeConf = cfg.regime_gate_min_confidence ?? 'HIGH';
+
+    if (direction === 'BEARISH' && netGexM < deepNegThreshold && confOrder.indexOf(triggerConf) < confOrder.indexOf(minRegimeConf)) {
+      return { allowed: false, reason: `GEX regime gate: BEARISH in deep negative GEX (${netGexM.toFixed(0)}M < ${deepNegThreshold}M) — need ${minRegimeConf}+, got ${triggerConf}` };
+    }
+    if (direction === 'BULLISH' && netGexM > posThreshold && confOrder.indexOf(triggerConf) < confOrder.indexOf(minRegimeConf)) {
+      return { allowed: false, reason: `GEX regime gate: BULLISH in positive GEX (${netGexM.toFixed(0)}M > ${posThreshold}M) — need ${minRegimeConf}+, got ${triggerConf}` };
+    }
+  }
+
+  // Gate 18: MAGNET_PULL magnet still growing at entry time
+  // Pattern detects GROWING magnet but by entry (1-2 frames later) it may have weakened.
+  // Block if target node has become WEAKENING or GONE since detection.
+  if (cfg.magnet_entry_freshness_check !== false && trigger?.pattern === 'MAGNET_PULL' && trigger?.target_strike) {
+    const nodeTrends = getNodeTrends('SPXW');
+    const nodeTrend = nodeTrends?.get(trigger.target_strike);
+    if (nodeTrend && (nodeTrend.trend === 'GONE' || nodeTrend.trend === 'WEAKENING')) {
+      return { allowed: false, reason: `Magnet stale: ${trigger.target_strike} is now ${nodeTrend.trend} since detection` };
+    }
+  }
+
+  // Gate 19: Multi-ticker alignment gate — require SPY+QQQ consensus to support entry direction.
+  // If 2+ tickers (majority) show opposing direction, the MAGNET_PULL has a strong headwind.
+  // Default: enabled for MAGNET_PULL. Disable with multi_alignment_gate_enabled: false.
+  if (cfg.multi_alignment_gate_enabled !== false) {
+    const gatePatterns = cfg.multi_alignment_gate_patterns ?? ['MAGNET_PULL'];
+    if (pattern && gatePatterns.includes(pattern)) {
+      const alignment = multiAnalysis?.alignment;
+      const minCount = cfg.multi_alignment_min_count ?? 2;
+      if (alignment && alignment.count >= minCount && alignment.direction !== 'MIXED' && alignment.direction !== direction) {
+        return { allowed: false, reason: `Multi-ticker headwind: ${alignment.count}/3 tickers say ${alignment.direction} vs entry ${direction}` };
+      }
+    }
+  }
+
+  // Gate 20: REVERSE_RUG time window restrictions.
+  // Early morning (pre-09:50): 0% win rate (0W/8L), opening volatility breaks setups.
+  // Late afternoon (post-15:00): 20% win rate (1W/4L), theta decay + poor reward/risk.
+  if (pattern === 'REVERSE_RUG') {
+    if (cfg.reverse_rug_morning_blackout_end && timeET < cfg.reverse_rug_morning_blackout_end) {
+      return { allowed: false, reason: `REVERSE_RUG morning blackout: no entries before ${cfg.reverse_rug_morning_blackout_end}` };
+    }
+    if (cfg.reverse_rug_no_entry_after && timeET >= cfg.reverse_rug_no_entry_after) {
+      return { allowed: false, reason: `REVERSE_RUG afternoon cutoff: no entries after ${cfg.reverse_rug_no_entry_after}` };
+    }
+  }
+
+  // Gate 21a: MAGNET_PULL 9AM HIGH confidence block (score >= threshold at 9AM).
+  // The "high confidence paradox": HIGH score (>=80) MAGNET_PULL at 9AM has 34% WR
+  // while LOW score (<60) has 80% WR. Opening volatility breaks the strongest setups.
+  if (pattern === 'MAGNET_PULL' && cfg.magnet_pull_9am_max_score) {
+    const entryScore = scored?.score ?? 0;
+    if (etNow.hour === 9 && entryScore > cfg.magnet_pull_9am_max_score) {
+      return { allowed: false, reason: `MAGNET_PULL 9AM high-score block: score ${entryScore.toFixed(0)} > ${cfg.magnet_pull_9am_max_score} at 9AM (low WR paradox)` };
+    }
+  }
+
+  // Gate 21: MAGNET_PULL morning blackout (pre-09:40).
+  // 09:33-09:39: 6W/15L (29% WR), NET: +5.60 vs 09:40-09:46: 8W/5L (62% WR), NET: +49.97
+  // First 7 minutes: opening auction volatility causes most setups to stop out immediately.
+  if (pattern === 'MAGNET_PULL') {
+    if (cfg.magnet_pull_morning_blackout_end && timeET < cfg.magnet_pull_morning_blackout_end) {
+      return { allowed: false, reason: `MAGNET_PULL morning blackout: no entries before ${cfg.magnet_pull_morning_blackout_end}` };
+    }
+  }
+
+  // Gate 22: RUG_PULL score 70-79 block.
+  // Score 70-79: 7W/16L (30% WR), NET: -17.16 — worst performing score bucket for RUG_PULL.
+  // Scores below 70 and above 79 all outperform this specific range.
+  if (pattern === 'RUG_PULL') {
+    const entryScore = scored?.score ?? 0;
+    const minScore = cfg.rug_pull_score_min ?? 0;
+    const maxBlockedScore = cfg.rug_pull_score_max_blocked ?? 0;
+    if (maxBlockedScore > 0 && entryScore >= minScore && entryScore <= maxBlockedScore) {
+      return { allowed: false, reason: `RUG_PULL score ${entryScore.toFixed(0)} in blocked range (${minScore}-${maxBlockedScore})` };
+    }
+  }
+
   return { allowed: true };
 }
 
@@ -204,6 +380,11 @@ export function recordExitForGates(direction, isLoss, nowMs, pattern, pnlPts) {
   lastExitTime = now;
   lastExitDirection = direction;
   lastExitWasLoss[direction] = isLoss;
+
+  // Track daily net P&L for circuit breaker (Gate 0a)
+  if (pnlPts !== undefined) {
+    todayNetPnl += pnlPts;
+  }
 
   // Track recent trades for chop cooldown
   if (pnlPts !== undefined) {
@@ -279,11 +460,13 @@ export function resetDailyGates() {
   lastExitWasLoss = { BULLISH: false, BEARISH: false };
   recentTrades = [];
   chopCooldownUntil = 0;
+  todayNetPnl = 0;
   patternTradeCount = {};
   patternConsecutiveLosses = {};
   patternCooldownUntil = {};
   patternWins = {};
   patternTotal = {};
+  dayTrendLocked = null;
   log.info('Daily entry gates reset');
 }
 
@@ -294,6 +477,7 @@ export function getGateState() {
   return {
     lastEntryTime,
     todayTradeCount,
+    todayNetPnl,
     lastExitTime,
     lastExitDirection,
     consecutiveLosses: { ...consecutiveLosses },

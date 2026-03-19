@@ -17,7 +17,7 @@
 
 import { characterizeAirPocket } from './gex-scorer.js';
 import { getActiveConfig } from '../review/strategy-store.js';
-import { getNodeDwellAnalysis, getStackPersistence, getEffectiveTime } from '../store/state.js';
+import { getNodeDwellAnalysis, getStackPersistence, getEffectiveTime, getNetGexRoC } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -81,11 +81,11 @@ export function detectAllPatterns(scored, parsedData, multiAnalysis, nodeTouches
   const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
   valid.sort((a, b) => (order[a.confidence] || 2) - (order[b.confidence] || 2));
 
-  // Deduplicate: if two patterns share the same direction + target strike, keep highest confidence
+  // Deduplicate: if two patterns of the same type share the same direction + target strike, keep highest confidence
   const seen = new Set();
   const deduped = [];
   for (const p of valid) {
-    const key = `${p.direction}:${p.target_strike}`;
+    const key = `${p.pattern}:${p.direction}:${p.target_strike}`;
     if (!seen.has(key)) {
       seen.add(key);
       deduped.push(p);
@@ -142,6 +142,11 @@ function adjustConfidence(confidence, direction) {
   if (direction === 'upgrade' && idx < 2) return tiers[idx + 1];
   if (direction === 'downgrade' && idx > 0) return tiers[idx - 1];
   return confidence;
+}
+
+function meetsMinConfidence(confidence, minConfidence) {
+  const tiers = ['LOW', 'MEDIUM', 'HIGH', 'VERY_HIGH'];
+  return tiers.indexOf(confidence) >= tiers.indexOf(minConfidence);
 }
 
 // ---- Cross-Ticker Confirmation ----
@@ -253,6 +258,17 @@ function detectRugPull(ctx) {
     const crossTicker = getCrossTickerConfirmation(multiAnalysis, 'BEARISH');
     if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
+    // GEX regime gate: deep negative GEX = bullish momentum amplification → bearish entries are counter-trend
+    // Data: GEX < -30M → 68% up days, +8.9pt avg. Shorting into momentum amplification is dangerous.
+    const rugNetGex = getNetGexRoC('SPXW').current / 1e6;
+    const rugDeepNegThreshold = cfg.regime_deep_negative_threshold ?? -30;
+    const rugPositiveThreshold = cfg.regime_positive_threshold ?? 10;
+    if (rugNetGex < rugDeepNegThreshold) {
+      confidence = adjustConfidence(confidence, 'downgrade'); // Don't short into bullish momentum
+    } else if (rugNetGex > rugPositiveThreshold) {
+      confidence = adjustConfidence(confidence, 'upgrade'); // Positive GEX aligns with bearish bias
+    }
+
     // Target must be BELOW spot for bearish — use negStrike only if below, else nearest wall below
     const targetStrike = rug.negStrike < scored.spotPrice
       ? rug.negStrike
@@ -280,6 +296,7 @@ function detectReverseRug(ctx) {
   const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
   const rugSetups = multiAnalysis.rug_setups || [];
   const results = [];
+  const minConfidence = cfg.reverse_rug_min_confidence || 'LOW';
 
   for (const rug of rugSetups) {
     if (rug.type !== 'reverse_rug') continue;
@@ -307,6 +324,21 @@ function detectReverseRug(ctx) {
     const crossTicker = getCrossTickerConfirmation(multiAnalysis, 'BULLISH');
     if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
+    // GEX regime context: moderate negative GEX is the bullish sweet spot
+    // Data: -60M to -15M → 73% up days, +15.8pt avg. This is momentum amplification FOR bulls.
+    const rrNetGex = getNetGexRoC('SPXW').current / 1e6;
+    const rrModNegLow = cfg.regime_mod_negative_low ?? -60;
+    const rrModNegHigh = cfg.regime_mod_negative_high ?? -15;
+    const rrPositiveThreshold = cfg.regime_positive_threshold ?? 10;
+    if (rrNetGex >= rrModNegLow && rrNetGex < rrModNegHigh) {
+      confidence = adjustConfidence(confidence, 'upgrade'); // Bullish sweet spot
+    } else if (rrNetGex > rrPositiveThreshold) {
+      confidence = adjustConfidence(confidence, 'downgrade'); // Positive GEX is bearish — buying is counter-trend
+    }
+
+    // Filter by minimum confidence
+    if (!meetsMinConfidence(confidence, minConfidence)) continue;
+
     // Target must be ABOVE spot for bullish — use negStrike only if above, else nearest wall above
     const targetStrike = rug.negStrike > scored.spotPrice
       ? rug.negStrike
@@ -330,136 +362,41 @@ function detectReverseRug(ctx) {
 
 // ---- Pattern 3: King Node Bounce ----
 
-function detectKingNodeBounce(ctx) {
-  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends, kingNodeFlip } = ctx;
-  const kingNodes = multiAnalysis.king_nodes || {};
-  const results = [];
-  const maxTouches = cfg.pattern_king_node_max_touches ?? 1;
+/**
+ * Shared confidence scoring for king node bounces (both positive and negative types).
+ * Eliminates duplication between the two branches.
+ */
+function scoreKingNodeConfidence({ kn, scored, multiAnalysis, nodeTrends, kingNodeFlip, direction, initialConfidence }) {
+  let confidence = initialConfidence;
 
-  const kn = kingNodes.SPXW;
-  if (!kn) return results;
-
-  const knDistPts = Math.abs(kn.strike - scored.spotPrice);
-
-  if (kn.type === 'negative') {
-    // --- NEGATIVE MAGNET BOUNCE ---
-    // When price arrives at a negative magnet, the pull is satisfied → reversal zone
-    const maxMagnetDist = cfg.negative_king_node_max_dist_pts ?? 5;
-    if (knDistPts > maxMagnetDist) return results;
-
-    // Dwell analysis: reject accepted levels (price sliced through)
-    const dwellAnalysis = getNodeDwellAnalysis(kn.strike);
-    if (dwellAnalysis.accepted) return results;
-
-    const touches = nodeTouches[kn.strike]?.touches || 0;
-    if (touches > maxTouches) return results;
-
-    // Start at MEDIUM — magnets are less reliable bounce zones than positive walls
-    let confidence = 'MEDIUM';
-    if (kn.absGexValue < (scored.wallsAbove[0]?.absGexValue || 1) * 0.30) {
-      confidence = 'LOW';
-    }
-
-    const knTrend = nodeTrends.get(kn.strike);
-    if (knTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
-    else if (knTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
-    if (knTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
-
-    // Negative magnet below → price was pulled down, now reverses UP (BULLISH)
-    // Negative magnet above → price was pulled up, now reverses DOWN (BEARISH)
-    const direction = kn.relativeToSpot === 'above' ? 'BEARISH' : 'BULLISH';
-
-    // Cross-ticker boost: SPY/QQQ king nodes confirming same direction
-    const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
-    if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
-
-    // Dwell rejection boost: price dwelled and reversed → higher quality bounce
-    if (dwellAnalysis.rejected) confidence = adjustConfidence(confidence, 'upgrade');
-
-    // Stack persistence: overhead/underfoot magnet stack still present?
-    const stackPersistence = getStackPersistence('SPXW', direction);
-    if (stackPersistence.isPresent && stackPersistence.presentCycles >= 5) {
-      confidence = adjustConfidence(confidence, 'upgrade');
-    }
-    if (stackPersistence.trend === 'GONE' || stackPersistence.presentCycles < 3) {
-      confidence = adjustConfidence(confidence, 'downgrade');
-    }
-
-    // Feature 8: KNB time-of-day behavior
-    const now1 = getEffectiveTime() || nowET();
-    const hour1 = now1.hour + now1.minute / 60;
-    let timeNote = '';
-    if (hour1 < 11) {
-      confidence = adjustConfidence(confidence, 'upgrade');
-      timeNote = ', MORNING_DRIVEOFF';
-    } else if (hour1 >= 14) {
-      confidence = adjustConfidence(confidence, 'downgrade');
-      timeNote = ', AFTERNOON_PIN';
-    }
-
-    // Feature 10: Call Wall 83% / Put Wall fade boost
-    let wallFadeNote = '';
-    if (scored.callWall && kn.strike === scored.callWall.strike && direction === 'BEARISH') {
-      confidence = adjustConfidence(confidence, 'upgrade');
-      wallFadeNote = ', CALL_WALL_83';
-    }
-    if (scored.putWall && kn.strike === scored.putWall.strike && direction === 'BULLISH') {
-      confidence = adjustConfidence(confidence, 'upgrade');
-      wallFadeNote = ', PUT_WALL_FADE';
-    }
-
-    const targetWall = direction === 'BEARISH'
-      ? scored.wallsBelow?.[0]
-      : scored.wallsAbove?.[0];
-
-    results.push({
-      pattern: 'KING_NODE_BOUNCE',
-      direction,
-      confidence,
-      entry_strike: Math.round(scored.spotPrice / 5) * 5,
-      target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
-      stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-      reasoning: `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}${timeNote}${wallFadeNote}) — expect ${direction.toLowerCase()} reversal`,
-      source_ticker: 'SPXW',
-      walls: { king: kn.strike, king_value: kn.gexValue },
-    });
-    return results;
-  }
-
-  // --- POSITIVE KING NODE BOUNCE (existing logic) ---
-  if (knDistPts > 10) return results;
-
-  // Dwell analysis: reject accepted levels (price sliced through)
-  const dwellAnalysis = getNodeDwellAnalysis(kn.strike);
-  if (dwellAnalysis.accepted) return results;
-
-  const touches = nodeTouches[kn.strike]?.touches || 0;
-  if (touches > maxTouches) return results;
-
-  let confidence = touches === 0 ? 'HIGH' : 'MEDIUM';
+  // Size check: too small relative to largest wall → low quality
   if (kn.absGexValue < (scored.wallsAbove[0]?.absGexValue || 1) * 0.30) {
     confidence = 'LOW';
   }
 
+  // Trend adjustment
   const knTrend = nodeTrends.get(kn.strike);
   if (knTrend?.trend === 'GROWING') confidence = adjustConfidence(confidence, 'upgrade');
   else if (knTrend?.trend === 'WEAKENING') confidence = adjustConfidence(confidence, 'downgrade');
   if (knTrend?.changePct30 >= 1.0) confidence = adjustConfidence(confidence, 'upgrade');
 
-  if (kingNodeFlip?.strike === kn.strike && kingNodeFlip.fromType === 'negative' && kingNodeFlip.toType === 'positive') {
-    confidence = adjustConfidence(confidence, 'upgrade');
+  // King node polarity flip boost (was missing from negative branch)
+  if (kingNodeFlip?.strike === kn.strike) {
+    if ((kingNodeFlip.fromType === 'negative' && kingNodeFlip.toType === 'positive') ||
+        (kingNodeFlip.fromType === 'positive' && kingNodeFlip.toType === 'negative')) {
+      confidence = adjustConfidence(confidence, 'upgrade');
+    }
   }
 
-  const direction = kn.relativeToSpot === 'above' ? 'BEARISH' : 'BULLISH';
-
-  // Cross-ticker boost: SPY/QQQ king nodes confirming same direction
+  // Cross-ticker boost
   const crossTicker = getCrossTickerConfirmation(multiAnalysis, direction);
   if (crossTicker.count >= 1) confidence = adjustConfidence(confidence, 'upgrade');
 
-  // Dwell rejection boost: price dwelled and reversed → higher quality bounce
+  // Dwell rejection boost
+  const dwellAnalysis = getNodeDwellAnalysis(kn.strike);
   if (dwellAnalysis.rejected) confidence = adjustConfidence(confidence, 'upgrade');
 
-  // Stack persistence: overhead/underfoot magnet stack still present?
+  // Stack persistence
   const stackPersistence = getStackPersistence('SPXW', direction);
   if (stackPersistence.isPresent && stackPersistence.presentCycles >= 5) {
     confidence = adjustConfidence(confidence, 'upgrade');
@@ -468,32 +405,72 @@ function detectKingNodeBounce(ctx) {
     confidence = adjustConfidence(confidence, 'downgrade');
   }
 
-  // Feature 8: KNB time-of-day behavior
-  const now2 = getEffectiveTime() || nowET();
-  const hour2 = now2.hour + now2.minute / 60;
-  let timeNote2 = '';
-  if (hour2 < 11) {
+  // Time-of-day behavior
+  const now = getEffectiveTime() || nowET();
+  const hour = now.hour + now.minute / 60;
+  let timeNote = '';
+  if (hour < 11) {
     confidence = adjustConfidence(confidence, 'upgrade');
-    timeNote2 = ', MORNING_DRIVEOFF';
-  } else if (hour2 >= 14) {
+    timeNote = ', MORNING_DRIVEOFF';
+  } else if (hour >= 14) {
     confidence = adjustConfidence(confidence, 'downgrade');
-    timeNote2 = ', AFTERNOON_PIN';
+    timeNote = ', AFTERNOON_PIN';
   }
 
-  // Feature 10: Call Wall 83% / Put Wall fade boost
-  let wallFadeNote2 = '';
+  // Call Wall 83% / Put Wall fade boost
+  let wallFadeNote = '';
   if (scored.callWall && kn.strike === scored.callWall.strike && direction === 'BEARISH') {
     confidence = adjustConfidence(confidence, 'upgrade');
-    wallFadeNote2 = ', CALL_WALL_83';
+    wallFadeNote = ', CALL_WALL_83';
   }
   if (scored.putWall && kn.strike === scored.putWall.strike && direction === 'BULLISH') {
     confidence = adjustConfidence(confidence, 'upgrade');
-    wallFadeNote2 = ', PUT_WALL_FADE';
+    wallFadeNote = ', PUT_WALL_FADE';
   }
+
+  return { confidence, dwellAnalysis, crossTicker, stackPersistence, timeNote, wallFadeNote };
+}
+
+function detectKingNodeBounce(ctx) {
+  const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends, kingNodeFlip } = ctx;
+  if (cfg.king_node_bounce_enabled === false) return [];
+  const kingNodes = multiAnalysis.king_nodes || {};
+  const results = [];
+  const maxTouches = cfg.pattern_king_node_max_touches ?? 1;
+
+  const kn = kingNodes.SPXW;
+  if (!kn) return results;
+
+  const knDistPts = Math.abs(kn.strike - scored.spotPrice);
+  const touches = nodeTouches[kn.strike]?.touches || 0;
+
+  // Distance and dwell gates
+  const maxDist = kn.type === 'negative'
+    ? (cfg.negative_king_node_max_dist_pts ?? 5)
+    : 10;
+  if (knDistPts > maxDist) return results;
+
+  const dwellCheck = getNodeDwellAnalysis(kn.strike);
+  if (dwellCheck.accepted) return results;
+  if (touches > maxTouches) return results;
+
+  // Initial confidence: positive fresh = HIGH, negative/touched = MEDIUM
+  const initialConfidence = (kn.type === 'positive' && touches === 0) ? 'HIGH' : 'MEDIUM';
+
+  // Direction: above spot → BEARISH bounce, below → BULLISH bounce
+  const direction = kn.relativeToSpot === 'above' ? 'BEARISH' : 'BULLISH';
+
+  // Score confidence using shared helper
+  const { confidence, dwellAnalysis, crossTicker, stackPersistence, timeNote, wallFadeNote } =
+    scoreKingNodeConfidence({ kn, scored, multiAnalysis, nodeTrends, kingNodeFlip, direction, initialConfidence });
 
   const targetWall = direction === 'BEARISH'
     ? scored.wallsBelow?.[0]
     : scored.wallsAbove?.[0];
+
+  const label = kn.type === 'negative'
+    ? `Magnet arrival at ${kn.strike} (negative ${(kn.absGexValue / 1e6).toFixed(0)}M, ${knDistPts.toFixed(0)}pts`
+    : `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away`;
 
   results.push({
     pattern: 'KING_NODE_BOUNCE',
@@ -502,7 +479,7 @@ function detectKingNodeBounce(ctx) {
     entry_strike: Math.round(scored.spotPrice / 5) * 5,
     target_strike: targetWall?.strike || (direction === 'BEARISH' ? scored.spotPrice - 15 : scored.spotPrice + 15),
     stop_strike: direction === 'BEARISH' ? kn.strike + 5 : kn.strike - 5,
-    reasoning: `King node at ${kn.strike} (${kn.type}, ${kn.distancePct.toFixed(2)}% away, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}${timeNote2}${wallFadeNote2}) — expect ${direction.toLowerCase()} bounce`,
+    reasoning: `${label}, ${touches} touches${dwellAnalysis.rejected ? ', REJECTED' : ''}${stackPersistence.isPresent ? ', stack=' + stackPersistence.trend : ''}${crossTicker.count > 0 ? ', ' + crossTicker.details.join('+') : ''}${timeNote}${wallFadeNote}) — expect ${direction.toLowerCase()} ${kn.type === 'negative' ? 'reversal' : 'bounce'}`,
     source_ticker: 'SPXW',
     walls: { king: kn.strike, king_value: kn.gexValue },
   });
@@ -514,6 +491,7 @@ function detectKingNodeBounce(ctx) {
 
 function detectPikaPillow(ctx) {
   const { scored, multiAnalysis, cfg, nodeTrends } = ctx;
+  if (cfg.pika_pillow_enabled === false) return [];
   const results = [];
 
   // Requires: positive floor below spot
@@ -570,6 +548,7 @@ function detectPikaPillow(ctx) {
 
 function detectTripleCeilingFloor(ctx) {
   const { scored, multiAnalysis, cfg } = ctx;
+  if (cfg.triple_ceiling_enabled === false) return [];
   const stackedWalls = multiAnalysis.stacked_walls || [];
   const results = [];
   const minWalls = cfg.pattern_triple_min_walls ?? 3;
@@ -642,6 +621,9 @@ function detectAirPocket(ctx) {
 
   if (!scored.targetWall) return results;
 
+  // Guard: NEUTRAL direction → no valid air pocket scan direction
+  if (scored.direction !== 'BULLISH' && scored.direction !== 'BEARISH') return results;
+
   // Positive gamma or positive target wall → downgrade confidence, don't hard skip
   let positiveGammaDowngrade = scored.gexAtSpot >= 0;
   let positiveTargetDowngrade = scored.targetWall.type !== 'negative';
@@ -697,6 +679,7 @@ function detectAirPocket(ctx) {
 
 function detectRangeEdgeFade(ctx) {
   const { scored, multiAnalysis, nodeTouches, cfg, nodeTrends } = ctx;
+  if (cfg.range_edge_fade_enabled === false) return [];
   const classifications = multiAnalysis.wall_classifications || [];
   const results = [];
   const maxTouches = cfg.pattern_range_fade_max_touches ?? 1;
@@ -753,6 +736,7 @@ function detectRangeEdgeFade(ctx) {
 function detectWallFlip(ctx) {
   const { scored, cfg, nodeSignChanges } = ctx;
   const results = [];
+  if (cfg.wall_flip_enabled === false) return results;
   if (!nodeSignChanges || nodeSignChanges.length === 0) return results;
 
   const minMagnitude = cfg.wall_flip_min_magnitude ?? 5_000_000;
@@ -833,10 +817,12 @@ function allTickersShowSameSetup(multiAnalysis, direction) {
     }
   }
 
-  // Also check rug setups for bearish confirmation across tickers
-  if (direction === 'BEARISH' && multiAnalysis.rug_setups) {
+  // Also check rug setups for confirmation across tickers (filter by direction)
+  if (multiAnalysis.rug_setups) {
     for (const rug of multiAnalysis.rug_setups) {
-      if (rug.ticker && !tickers.includes(rug.ticker)) {
+      if (!rug.ticker || tickers.includes(rug.ticker)) continue;
+      const rugDirection = rug.type === 'rug' ? 'BEARISH' : rug.type === 'reverse_rug' ? 'BULLISH' : null;
+      if (rugDirection === direction) {
         tickers.push(rug.ticker);
       }
     }
@@ -934,10 +920,11 @@ function detectMagnetPull(ctx) {
   const direction = best.direction;
   const isAbove = direction === 'BULLISH';
 
-  // --- Directional conflict gate: don't fight a strong GEX score ---
-  // If GEX score reads opposite direction at 50+, skip entirely
-  if (direction === 'BULLISH' && scored.direction === 'BEARISH' && scored.score >= 50) return results;
-  if (direction === 'BEARISH' && scored.direction === 'BULLISH' && scored.score >= 50) return results;
+  // --- Directional conflict gate: don't fight a HIGH-confidence GEX score ---
+  // Only skip when GEX score is strongly opposite. Configurable threshold (default 65).
+  const dirConflictScore = cfg.magnet_pull_directional_conflict_score ?? 65;
+  if (direction === 'BULLISH' && scored.direction === 'BEARISH' && scored.score >= dirConflictScore) return results;
+  if (direction === 'BEARISH' && scored.direction === 'BULLISH' && scored.score >= dirConflictScore) return results;
 
   // Check path is clear — no large positive wall blocking between spot and magnet
   const wallsInPath = (isAbove ? scored.wallsAbove : scored.wallsBelow)
@@ -981,11 +968,26 @@ function detectMagnetPull(ctx) {
     confidence = adjustConfidence(confidence, 'upgrade');
   }
 
+  // GEX regime context for MAGNET_PULL:
+  // Bearish magnets in deep negative GEX = counter-trend (68% up days when GEX < -30M)
+  // Bullish magnets in moderate negative GEX = with-trend (73% up days in -60M to -15M)
+  const mpNetGex = getNetGexRoC('SPXW').current / 1e6;
+  const mpDeepNeg = cfg.regime_deep_negative_threshold ?? -30;
+  const mpModNegLow = cfg.regime_mod_negative_low ?? -60;
+  const mpModNegHigh = cfg.regime_mod_negative_high ?? -15;
+  if (direction === 'BEARISH' && mpNetGex < mpDeepNeg) {
+    confidence = adjustConfidence(confidence, 'downgrade');
+  } else if (direction === 'BULLISH' && mpNetGex >= mpModNegLow && mpNetGex < mpModNegHigh) {
+    confidence = adjustConfidence(confidence, 'upgrade');
+  }
+
   // Require at least HIGH confidence to fire — MEDIUM is not enough for this pattern
   if (confidence === 'LOW' || confidence === 'MEDIUM') return results;
 
-  // Stop: 30% of distance behind entry for asymmetric R:R
-  const stopDist = Math.max(5, best.distance * 0.30);
+  // Stop: 30% of distance, capped at 5 pts max.
+  // Wide stops (-8 pts) on distant magnets produced outsized losses on immediate reversals
+  // while TM winners (which reach +2 in 2 min) never triggered a 5-pt stop anyway.
+  const stopDist = Math.min(cfg.magnet_pull_max_stop_pts ?? 5, Math.max(5, best.distance * 0.30));
   const stopStrike = isAbove
     ? Math.round(spotPrice - stopDist)
     : Math.round(spotPrice + stopDist);
