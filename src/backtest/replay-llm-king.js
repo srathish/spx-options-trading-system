@@ -79,13 +79,15 @@ ANALYSIS STEPS:
 6. Check SPY/QQQ alignment
 7. If we have a current_position, check if thesis is intact
 
-Respond JSON:
+Respond JSON — you MUST name the opposing signal if one exists:
 {
   "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "regime": "TREND" | "CHOP" | "PINNED",
   "action": "ENTER" | "HOLD" | "EXIT" | "WAIT",
-  "reasoning": "<1-2 sentences citing specific data fields>"
+  "primary_signal": "<what supports this direction — cite the specific data>",
+  "opposing_signal": "<what opposes this direction — cite specific data, or 'none'>",
+  "why_primary_wins": "<why the primary signal is stronger, or why you're cautious>"
 }`;
 
 // ---- Helpers ----
@@ -539,6 +541,15 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         else if (progress <= -s) exitReason = 'RANGE_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         else if (position.llmSaysExit) exitReason = 'LLM_EXIT';
+      } else if (mode === 'SQUEEZE') {
+        // Squeeze trades: target 25 pts, stop 12, lock at 40% of MFE
+        if (progress >= 25) exitReason = 'SQUEEZE_TARGET';
+        else if (position.mfe >= 15 && progress <= position.mfe * 0.4) exitReason = 'SQUEEZE_LOCK';
+        else if (progress <= -12) exitReason = 'SQUEEZE_STOP';
+        else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
+        // Exit if squeeze condition disappears
+        else if (position.direction === 'BULLISH' && !king.squeezeUp && progress <= 0) exitReason = 'SQUEEZE_GONE';
+        else if (position.direction === 'BEARISH' && !king.squeezeDown && progress <= 0) exitReason = 'SQUEEZE_GONE';
       } else if (mode === 'BREAKOUT') {
         const t = 20;
         const s = position._breakStop || 12;
@@ -590,6 +601,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const pnl = exitReason === 'MAX_LOSS' ? -CONFIG.max_loss_pts
           : exitReason === 'PIN_STOP' ? -(position._pinnedStop || 8)
           : exitReason === 'RANGE_STOP' ? -(position._rangeStop || 8)
+          : exitReason === 'SQUEEZE_STOP' ? -12
           : exitReason === 'BREAK_STOP' ? -(position._breakStop || 12)
           : exitReason === 'DEFY_STOP' ? -(position._defyStop || 15)
           : Math.round(progress * 100) / 100;
@@ -724,6 +736,65 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const bullM = king.bullMagnet;
         const dayMove = spot - localState.openPrice;
 
+        // === SQUEEZE ENTRY: requires WALL BREACH, not just squeeze pressure ===
+        // Track top positive walls and detect when price crosses through one.
+        // The squeeze happens at the BREACH moment — when price breaks a positive wall,
+        // dealers unwind hedges in the same direction, accelerating the move.
+        if (!localState._prevPosWalls) localState._prevPosWalls = [];
+        // Find top 3 positive walls near spot
+        const posWalls = [];
+        for (const s of parsed.strikes) {
+          const g = parsed.aggregatedGex.get(s) || 0;
+          if (g > 5_000_000 && Math.abs(s - spot) < 50) posWalls.push({ strike: s, value: g });
+        }
+        posWalls.sort((a, b) => b.value - a.value);
+        const topPosWalls = posWalls.slice(0, 3);
+
+        // Detect breach: price was on one side of a positive wall, now on the other
+        let breachUp = false, breachDown = false, breachedWall = null;
+        if (localState._prevPosWalls.length > 0 && localState._prevSpot) {
+          for (const wall of localState._prevPosWalls) {
+            if (localState._prevSpot < wall.strike && spot > wall.strike + 2) {
+              breachUp = true; breachedWall = wall; break;
+            }
+            if (localState._prevSpot > wall.strike && spot < wall.strike - 2) {
+              breachDown = true; breachedWall = wall; break;
+            }
+          }
+        }
+        localState._prevPosWalls = topPosWalls;
+        localState._prevSpot = spot;
+
+        // Also require squeeze pressure (POS on breach side > NEG on magnet side)
+        const squeezeConfirmsUp = breachUp && king.squeezeUp;
+        const squeezeConfirmsDown = breachDown && king.squeezeDown;
+
+        if (llmDir !== 'NEUTRAL' && llmConf === 'HIGH'
+            && ((squeezeConfirmsUp && llmDir === 'BULLISH') || (squeezeConfirmsDown && llmDir === 'BEARISH'))) {
+          const squeezeDir = king.squeezeUp ? 'BULLISH' : 'BEARISH';
+          const sqDirEntries = localState._entriesPerDir[squeezeDir] || 0;
+          const sqDirLosses = localState._dirLosses?.[squeezeDir] || 0;
+          // Target: nearest positive gamma wall in squeeze direction (the wall being breached)
+          const squeezeTarget = squeezeDir === 'BULLISH'
+            ? Math.round((spot + 25) / 5) * 5
+            : Math.round((spot - 25) / 5) * 5;
+
+          if (sqDirEntries < 2 && sqDirLosses < 1) {
+            position = {
+              mode: 'SQUEEZE',
+              direction: squeezeDir,
+              entrySpx: spot,
+              targetStrike: squeezeTarget,
+              openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+              entryMinute: minuteOfDay,
+              mfe: 0, mae: 0, llmSaysExit: false,
+            };
+            localState._entriesPerDir[squeezeDir]++;
+            if (verbose) console.log(`  SQUEEZE ${etStr} | ${squeezeDir} @ $${Math.round(spot)} → ${squeezeTarget} | POS above ${(king.posAbove/1e6).toFixed(0)}M vs NEG below ${(king.negBelow/1e6).toFixed(0)}M | LLM=${llmRegime}`);
+          }
+        }
+
+        // === MAGNET ENTRY (existing logic) ===
         // Pick the best magnet (price trend breaks ties when competing)
         let bestMagnet = null;
         if (bearM && bullM) {
@@ -773,12 +844,15 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           if (dirWins > 0 && dirEntries >= 3) quality = 0;
           else if (dirWins === 0 && dirEntries >= 2) quality = 0;
 
-          // CONFIRMATION BONUS: if we already won in this direction, the day is confirmed
-          // Lower the bar for re-entry
-          if (dirWins > 0) quality += 15;
+          // No win bonus — a prior win doesn't validate the next trade's structural setup.
+          // The magnet size and trend already capture whether the setup is still valid.
 
-          // Midday penalty: 12:00-13:30 has 29% WR — penalize heavily
-          if (minuteOfDay >= 720 && minuteOfDay <= 810) quality -= 15;
+          // Time-band structural penalty for TREND mode:
+          // 10:00-12:00 = best for TREND (regime confirms)
+          // 12:00-14:00 = dead zone, pinning strongest, TREND fails
+          // 14:00-close = gamma collapsing, momentum dominates over magnets
+          if (minuteOfDay >= 720 && minuteOfDay <= 840) quality -= 20; // 12:00-14:00 dead zone
+          if (minuteOfDay >= 840) quality -= 10; // after 14:00, magnets weaken
 
           // Late to the party penalty
           if ((dir === 'BEARISH' && dayMove < -80) || (dir === 'BULLISH' && dayMove > 80)) quality -= 30;
@@ -843,11 +917,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           const reversing = (priceDir === 'BULLISH' && priceTrend30 < -15) || (priceDir === 'BEARISH' && priceTrend30 > 15);
           const bigMove = Math.abs(dayMove) >= 40;
           // Don't enter if 30-min trend shows price bouncing back 15+ pts
-          const defying = gexPullDir !== priceDir && bigMove && !reversing;
+          // REGIME FILTER: DEFY only in NEGATIVE GEX (dealers amplifying moves).
+          // In POSITIVE GEX, a 40pt move against a wall is a fade setup, not a trend.
+          const defyRegimeOk = king.regime === 'NEGATIVE';
+          const defying = gexPullDir !== priceDir && bigMove && !reversing && defyRegimeOk;
           const dirEntries = localState._entriesPerDir[priceDir] || 0;
           if (!localState._defyCount) localState._defyCount = 0;
 
-          // Don't DEFY in a direction where we already won a TREND trade — the move is captured
           const alreadyWonTrend = (localState._trendWins?.[priceDir] || 0) > 0;
           const defyMax = 2;
           if (defying && !alreadyWonTrend && dirEntries < 2 && localState._defyCount < defyMax && minuteOfDay >= timeToMinutes('11:00')) {
@@ -964,18 +1040,24 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
       // One LLM wobble shouldn't kill a thesis that's been correct for hours.
       // Also: sanity check — if king node is still on our side, LLM direction flip is wrong.
       if (position) {
-        // Check if the MAGNET on our side is still alive (not just the king node)
+        // Check if our magnet is still the DOMINANT force, not just alive
         const ourMagnet = position.direction === 'BEARISH' ? king.bearMagnet : king.bullMagnet;
+        const oppMagnet = position.direction === 'BEARISH' ? king.bullMagnet : king.bearMagnet;
+        const oppSqueeze = (position.direction === 'BEARISH' && king.squeezeUp) || (position.direction === 'BULLISH' && king.squeezeDown);
         const magnetStillAlive = ourMagnet && ourMagnet.absValue >= 10_000_000;
+        // RELATIVE check: is our magnet still dominant, or has something bigger emerged?
+        const magnetStillDominant = magnetStillAlive
+          && (!oppMagnet || ourMagnet.absValue >= oppMagnet.absValue * 0.7)
+          && !oppSqueeze; // a squeeze on the other side overpowers our magnet
 
         const llmWantsExit = llmResult.action === 'EXIT'
           || (llmResult.confidence !== 'LOW' && llmResult.direction !== 'NEUTRAL'
               && llmResult.direction !== position.direction);
 
-        if (llmWantsExit && !magnetStillAlive) {
-          // Our magnet died — LLM exit is valid
+        if (llmWantsExit && !magnetStillDominant) {
+          // Our magnet is no longer dominant — LLM exit is valid
           position._exitSignals = (position._exitSignals || 0) + 1;
-        } else if (llmWantsExit && magnetStillAlive) {
+        } else if (llmWantsExit && magnetStillDominant) {
           // Sanity: our magnet is still there. LLM is confused about direction. Ignore.
           if (verbose) {
             console.log(`  SANITY: LLM said ${llmResult.direction} but our ${position.direction} magnet at ${ourMagnet.strike} still ${fmtVal(ourMagnet.value)} — ignoring`);
