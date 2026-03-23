@@ -23,11 +23,12 @@ import 'dotenv/config';
 const CONFIG = {
   call_interval_frames: 10,       // call LLM every 10 frames (~10 min)
   min_history_frames: 20,         // need 20 min of data before first call
-  model: 'moonshot-v1-auto',      // NOT kimi-k2.5 (reasoning model burns tokens)
+  model: process.env.LLM_KING_MODEL || 'moonshot-v1-auto',
+  provider: process.env.LLM_KING_PROVIDER || 'moonshot',  // 'moonshot' or 'claude'
   temperature: 0,
-  max_tokens: 400,
-  api_delay_ms: 150,              // delay between API calls
-  cache_file: 'data/llm-king-cache.json',
+  max_tokens: 300,
+  api_delay_ms: 200,
+  cache_file: 'data/llm-king-cache-v2.json',  // new cache for new prompt
 
   // Trade simulation
   max_loss_pts: 12,
@@ -41,52 +42,31 @@ const CONFIG = {
 
 // ---- System prompt ----
 
-const SYSTEM_PROMPT = `You are an expert GEX trader watching the SPX gamma exposure chart update every minute. You think in narratives: "I see the 6500 node building from 18M to 45M over the last hour — that's a magnet pulling price down."
+const SYSTEM_PROMPT = `You assess SPX GEX (gamma exposure) trading setups. We pre-compute the direction. You ONLY assess quality: TRADE or SKIP.
 
-The "narrative" field tells you the STORY of what's been happening. Read it carefully — it contains the key information: how long the king node has been building, how much it's grown, whether it's stable or flipping, and whether competing nodes exist.
+EXAMPLES OF WINNING SETUPS (say TRADE):
+1. "Node at 6500 grew from 18M to 45M (+150%), stable 91% of the time, no competing nodes" → TRADE. One dominant magnet, growing consistently, clean path.
+2. "Node at 6855, stable 80%, grew from 10M to 20M, no opponent" → TRADE. Established magnet, no competition.
+3. "Price dropped 80pts while gamma pulled bullish — momentum overwhelming gamma" → TRADE. Strong DEFY signal.
 
-GEX BASICS — READ CAREFULLY:
-Gamma exposure (GEX) walls influence where price moves:
+EXAMPLES OF LOSING SETUPS (say SKIP):
+1. "King node at 4 different strikes, unstable" → SKIP. Chop day, no clear direction.
+2. "Node at 6510 only $10M, 76pts away" → SKIP. Small value + far distance = weak pull.
+3. "Node at 6900 only 12pts from spot" → SKIP. Too close to be a real magnet.
+4. "Competing: 15M below AND 12M above spot" → SKIP. Tug of war, unpredictable.
 
-1. NEGATIVE gamma = MAGNET. Price gets PULLED toward these strikes.
-   - Negative gamma wall BELOW spot → price gets pulled DOWN (BEARISH)
-   - Negative gamma wall ABOVE spot → price gets pulled UP (BULLISH)
-   Example: SPX at 6900, node at 6950 with -30M gamma → BULLISH, price moves UP toward 6950
-
-2. POSITIVE gamma = PIN/SUPPORT. Price gets STUCK at these strikes.
-   - Positive gamma wall AT spot → price pinned, range-bound
-   - Positive gamma below spot = support floor
-   - Positive gamma above spot = resistance ceiling
-
-3. The "biggest_magnet" field shows the largest negative gamma node — that's the TRUE directional signal.
-   The "king_node" might be positive gamma (a pin), which is NOT a directional signal.
-
-4. "computed_direction" tells you the mechanical direction based on where the magnet is.
-
-IMPORTANT: If you see a negative gamma wall ABOVE spot, that is BULLISH, not bearish. The wall pulls price UP toward it. Do not confuse this.
-
-THREE REGIMES:
-1. TREND: King node far from spot (25+ pts), stable, growing consistently → big directional trade
-2. PINNED: Large gamma at spot keeping price stuck → fade moves away from the pin
-3. CHOP: King node keeps flipping strikes, no clear dominant node → sit flat, don't trade
-
-HOW TO READ THE NARRATIVE:
-- "grown from 18M to 45M (+150%)" = strong building, good setup
-- "king node at 4 different strikes" = CHOP, stay out
-- "no competing nodes on other side" = clean setup
-- "stability 90%+" = very clean trend day
-- "stability <50%" with many strikes = choppy, be cautious
-
-If we have a current_position: respect the thesis. A king node at 6500 below spot is ALWAYS bearish. Don't flip unless the king node actually moves to the other side of spot.
+DECISION RULES:
+- Stability 80%+ AND growing AND no competitor → TRADE
+- Stability <50% OR 4+ king strikes → SKIP (chop)
+- Node value $20M+ AND 30+ pts from spot AND no opponent → TRADE
+- Node value <$10M OR <15 pts from spot → SKIP
+- If we have a current_position that's working, say HOLD
 
 Respond JSON only:
 {
-  "regime": "TREND" | "PINNED" | "CHOP",
-  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "confidence": "HIGH" | "MEDIUM" | "LOW",
-  "king_node_target": <strike number or null>,
-  "action": "ENTER" | "HOLD" | "EXIT" | "WAIT",
-  "reasoning": "<1-2 sentences about what the narrative tells you>"
+  "assessment": "STRONG" | "MODERATE" | "WEAK",
+  "action": "TRADE" | "HOLD" | "SKIP",
+  "reasoning": "<1 sentence>"
 }`;
 
 // ---- Helpers ----
@@ -334,11 +314,12 @@ async function callLLM(snapshot, cache, cacheKey) {
     const content = response.choices[0]?.message?.content || '{}';
     const parsed = JSON.parse(content);
     const result = {
-      regime: parsed.regime || 'CHOP',
-      direction: parsed.direction || 'NEUTRAL',
-      confidence: parsed.confidence || 'LOW',
-      king_node_target: parsed.king_node_target || null,
-      action: parsed.action || 'WAIT',
+      // Map new prompt format to old field names for compatibility
+      regime: parsed.assessment === 'STRONG' ? 'TREND' : parsed.assessment === 'MODERATE' ? 'TREND' : 'CHOP',
+      direction: 'NEUTRAL', // we compute direction mechanically now
+      confidence: parsed.assessment === 'STRONG' ? 'HIGH' : parsed.assessment === 'MODERATE' ? 'MEDIUM' : 'LOW',
+      king_node_target: null,
+      action: parsed.action === 'TRADE' ? 'ENTER' : parsed.action === 'HOLD' ? 'HOLD' : 'WAIT',
       reasoning: parsed.reasoning || '',
     };
 
@@ -501,6 +482,10 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
             exitReason = 'MAX_LOSS';
           }
         }
+        // After 2:30 PM, tighten profit lock — lock in any gains before close
+        if (!exitReason && minuteOfDay >= timeToMinutes('14:30') && position.mfe >= 10 && progress <= Math.max(3, position.mfe * 0.3)) {
+          exitReason = 'LATE_LOCK';
+        }
         if (!exitReason && minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         if (!exitReason && position.llmSaysExit) exitReason = 'LLM_EXIT';
       }
@@ -525,9 +510,12 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           mfe: Math.round(position.mfe * 100) / 100,
           mae: Math.round(position.mae * 100) / 100,
         });
+        if (!localState._dirLosses) localState._dirLosses = { BULLISH: 0, BEARISH: 0 };
         if (pnl <= 0) {
-          if (!localState._dirLosses) localState._dirLosses = { BULLISH: 0, BEARISH: 0 };
           localState._dirLosses[position.direction]++;
+        } else if (pnl >= 15) {
+          // Big win — reset direction entries to allow re-entry
+          localState._entriesPerDir[position.direction] = Math.max(0, (localState._entriesPerDir[position.direction] || 1) - 1);
         }
         if (verbose) {
           const tag = pnl > 0 ? 'WIN' : 'LOSS';
