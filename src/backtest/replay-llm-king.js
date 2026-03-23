@@ -33,8 +33,6 @@ const CONFIG = {
   // Trade simulation
   max_loss_pts: 12,
   target_proximity_pts: 8,         // close enough to target = take the win
-  trailing_activate_pts: 40,       // activate trailing stop after 40 pts profit
-  trailing_distance_pts: 20,       // trail 20 pts behind high water mark (big moves need room)
   entry_start_time: '09:50',
   entry_end_time: '15:00',
   eod_exit_time: '15:45',
@@ -584,6 +582,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // Exit if squeeze condition disappears
         else if (position.direction === 'BULLISH' && !king.squeezeUp && progress <= 0) exitReason = 'SQUEEZE_GONE';
         else if (position.direction === 'BEARISH' && !king.squeezeDown && progress <= 0) exitReason = 'SQUEEZE_GONE';
+        else if (position.llmSaysExit) exitReason = 'LLM_EXIT';
       } else if (mode === 'BREAKOUT') {
         const t = 20;
         const s = position._breakStop || 12;
@@ -791,11 +790,20 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         if ((squeezeConfirmsUp || squeezeConfirmsDown) && llmRegime !== 'CHOP') {
           const squeezeDir = king.squeezeUp ? 'BULLISH' : 'BEARISH';
           const sqDirEntries = localState._entriesPerDir[squeezeDir] || 0;
-          const sqDirLosses = localState._dirLosses?.[squeezeDir] || 0;
-          // Target: nearest positive gamma wall in squeeze direction (the wall being breached)
-          const squeezeTarget = squeezeDir === 'BULLISH'
+          const sqDirLosses = localState._dirLosses[squeezeDir] || 0;
+          // Target: nearest positive gamma wall in squeeze direction, fallback +25
+          let squeezeTarget = squeezeDir === 'BULLISH'
             ? Math.round((spot + 25) / 5) * 5
             : Math.round((spot - 25) / 5) * 5;
+          // Find actual nearest positive wall in squeeze direction
+          for (const s of parsed.strikes) {
+            const g = parsed.aggregatedGex.get(s) || 0;
+            if (g < 5_000_000) continue; // only significant positive walls
+            const dist = Math.abs(s - spot);
+            if (dist < 10 || dist > 60) continue; // within reasonable range
+            if (squeezeDir === 'BULLISH' && s > spot) { squeezeTarget = s; break; }
+            if (squeezeDir === 'BEARISH' && s < spot) { squeezeTarget = s; break; }
+          }
 
           if (sqDirEntries < 2 && sqDirLosses < 1) {
             position = {
@@ -928,9 +936,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // is overpowering gamma. The selling/buying is real. Trade WITH price, not GEX.
         // Jan 20: SPX dropped 149 pts while GEX pulled bullish the entire day.
         // Feb 12: SPX dropped 108 pts while GEX pulled bullish.
-        if (!position && bearM && bullM) {
-          const totalNegBelow = bearM.absValue;
-          const totalNegAbove = bullM.absValue;
+        if (!position && (bearM || bullM)) {
+          const totalNegBelow = bearM ? bearM.absValue : 0;
+          const totalNegAbove = bullM ? bullM.absValue : 0;
           const gexPullDir = totalNegBelow > totalNegAbove ? 'BEARISH' : 'BULLISH';
           const priceDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
           // Dynamic DEFY: big move from open, not reversing, and still room to run
@@ -977,7 +985,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // Dec 23: 6885 magnet at spot, SPX rallied to 6908 (+30)
         // Jan 5: 6930 magnet at spot, SPX rallied to 6920 (+43)
         // When a big magnet is within 15pts of spot but price has moved 20+ away, breakout
-        if (!position && king.magnetStrike && Math.abs(king.magnetDist) <= 15 && king.magnetAbsValue >= 15_000_000) {
+        // LLM CHOP gate: don't breakout if LLM sees chop with high confidence
+        const breakoutChopBlock = llmRegime === 'CHOP' && llmConf === 'HIGH';
+        if (!position && !breakoutChopBlock && king.magnetStrike && Math.abs(king.magnetDist) <= 15 && king.magnetAbsValue >= 15_000_000) {
           const breakDist = Math.abs(dayMove);
           if (breakDist >= 20 && breakDist <= 60 && minuteOfDay >= timeToMinutes('10:30')) {
             const breakDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
