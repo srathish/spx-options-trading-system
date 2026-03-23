@@ -26,7 +26,7 @@ const CONFIG = {
   model: process.env.LLM_KING_MODEL || 'moonshot-v1-auto',
   provider: process.env.LLM_KING_PROVIDER || 'moonshot',  // 'moonshot' or 'claude'
   temperature: 0,
-  max_tokens: 300,
+  max_tokens: 500,
   api_delay_ms: 200,
   cache_file: 'data/llm-king-cache-v2.json',  // new cache for new prompt
 
@@ -595,8 +595,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const t = 30;
         const s = position._defyStop || 15;
         if (progress >= t) exitReason = 'DEFY_TARGET';
-        // Profit lock for DEFY: lock at 40% of MFE once MFE hits +15
-        else if (position.mfe >= 15 && progress <= position.mfe * 0.4) exitReason = 'DEFY_LOCK';
+        // Profit lock for DEFY: tighter on pinning days, wider on trending days
+        // In NEGATIVE GEX (trending), let it breathe — lock at 25% of MFE
+        // In POSITIVE GEX (pinning), tighter — lock at 40% of MFE
+        else if (position.mfe >= 15) {
+          const defyLockPct = king.regime === 'NEGATIVE' ? 0.25 : 0.4;
+          if (progress <= position.mfe * defyLockPct) exitReason = 'DEFY_LOCK';
+        }
         else if (progress <= -s) exitReason = 'DEFY_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else {
@@ -606,8 +611,11 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
             : spot <= position.targetStrike + CONFIG.target_proximity_pts;
           if (hit) exitReason = 'TARGET_HIT';
         }
-        // Profit lock for TREND: if MFE hits +25, don't let it go below +10
-        if (!exitReason && position.mfe >= 25 && progress <= 10) {
+        // Trend-aware dynamic lock: only lock when you've captured 60%+ of the magnet distance
+        // A +25 on a -149 day targeting 80pts away is mid-trade, not a lock situation
+        const magnetDist = Math.abs(position.targetStrike - position.entrySpx);
+        const capturedPct = magnetDist > 0 ? progress / magnetDist : 1;
+        if (!exitReason && position.mfe >= 25 && progress <= 10 && capturedPct >= 0.6) {
           exitReason = 'TREND_LOCK';
         }
         // Early cut disabled — thesis hold + max loss handle this better
@@ -657,8 +665,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           localState._dirLosses[position.direction]++;
         } else if (pnl >= 10) {
           localState._dirWins[position.direction]++;
-          if (position.mode === 'TREND') {
-            if (!localState._trendWins) localState._trendWins = { BULLISH: 0, BEARISH: 0 };
+          if (position.mode === 'TREND' && pnl >= 20) {
+            // Only count as a TREND win for DEFY-blocking purposes if pnl >= 20
+            // A TREND_LOCK at +12 is an incomplete capture, not a "won direction" signal
             localState._trendWins[position.direction]++;
           }
         }
