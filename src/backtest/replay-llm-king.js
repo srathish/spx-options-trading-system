@@ -771,8 +771,8 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
       // Daily P&L circuit breaker
       const dailyLossLimit = -25;
       // Session energy filter: after 11 AM, need dayRange >= 20 OR abs(dayMove) >= 20
-      // Before 11 AM, allow entries — the day hasn't had time to show its hand yet
       const dayRange = localState.hod - localState.lod;
+      const dayMove = spot - localState.openPrice;
       const sessionHasEnergy = minuteOfDay < 660 || dayRange >= 20 || Math.abs(dayMove) >= 20;
       if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit && sessionHasEnergy) {
 
@@ -782,7 +782,6 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
 
         const bearM = king.bearMagnet;
         const bullM = king.bullMagnet;
-        const dayMove = spot - localState.openPrice;
 
         // === SQUEEZE ENTRY: requires WALL BREACH, not just squeeze pressure ===
         // Track top positive walls and detect when price crosses through one.
