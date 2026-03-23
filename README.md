@@ -1,6 +1,6 @@
 # GexClaw
 
-Autonomous SPX 0DTE options trading system. Analyzes gamma exposure (GEX) data from Heatseeker, combines it with TradingView technical indicator signals (Echo + Bravo + Tango), and executes algorithmic trades based on detected GEX patterns. A Kimi K2.5 AI agent provides exit advisory when in a position.
+Autonomous SPX 0DTE options trading system powered by real-time gamma exposure (GEX) analysis and LLM-driven narrative reasoning. Two systems: a mechanical pattern engine for high-frequency entries, and an LLM king node system that reads the full GEX landscape like a human trader — tracking magnets, squeezes, vacuum zones, and gamma flip levels every 10 minutes.
 
 ## Architecture
 
@@ -264,6 +264,62 @@ Signal staleness: 1m signals expire after 3 min, 3m signals after 9 min.
 - **Alerts**: Discord webhooks
 - **Process Management**: PM2
 - **Timezone**: All market logic in US Eastern Time (via Luxon)
+
+## LLM King Node System
+
+A second trading system (`src/backtest/replay-llm-king.js`) that uses Moonshot AI to analyze GEX snapshots every 10 minutes, reasoning about the data like a human trader watching the Heatseeker chart.
+
+### Three GEX Forces
+1. **Negative Gamma Magnets** — pull price toward them (core signal)
+2. **Positive Gamma Pins** — hold price, but become squeeze accelerants when breached
+3. **Gamma Squeezes** — when positive gamma overwhelms negative on one side, dealers hedge WITH price
+
+### Five Trading Modes
+| Mode | Trigger | When |
+|------|---------|------|
+| **TREND** | Big negative magnet far from spot, quality 55+ | 10:00-15:00 |
+| **SQUEEZE** | Price breaches positive wall + squeeze pressure confirmed | Anytime |
+| **DEFY** | Price moves 40+ pts against GEX in NEGATIVE regime | 11:00+ |
+| **BREAKOUT** | Price escapes 20-60 pts from a big pin at spot | 10:30+ |
+
+### What the LLM Sees
+- King node vs biggest magnet (separated)
+- Gamma balance with squeeze detection (POS vs NEG on each side)
+- Net GEX regime: POSITIVE (pinning) vs NEGATIVE (amplifying)
+- Gamma flip level (above = stable, below = moves accelerate)
+- Vacuum zones (low-resistance corridors between walls)
+- GEX concentration (tight gravity vs loose structure)
+- SPY/QQQ cross-market alignment
+- Narrative: king node history, growth, stability, competing nodes
+
+### LLM Output Structure
+The LLM must name contradictory signals explicitly:
+```json
+{
+  "direction": "BEARISH",
+  "confidence": "HIGH",
+  "primary_signal": "6500 magnet at -45M, 60pts below, growing, no competition",
+  "opposing_signal": "Squeeze UP: POS above 30M vs NEG below 20M",
+  "why_primary_wins": "Magnet is 2x the squeeze force and has been dominant 90% of day"
+}
+```
+
+### Safety Mechanisms
+- **Thesis hold**: suppress price stop when target node still alive
+- **Quality score (0-100)**: gates on distance, relative size, squeeze opposition, time
+- **DEFY regime filter**: only in NEGATIVE GEX (dealers amplifying, not pinning)
+- **SQUEEZE breach trigger**: price must cross through a positive wall (structural event)
+- **Relative sanity check**: LLM exit ignored only if magnet still dominant (not just alive)
+- **Wall breach detection**: tracks top positive walls, detects when price crosses through
+
+### Backtesting
+```bash
+# Single day with narrative analysis
+node src/backtest/replay-llm-king.js data/gex-replay-2026-03-20.json --verbose
+
+# Full 62-day batch (caches all LLM calls)
+node src/backtest/replay-llm-king.js --batch data/gex-replay-*.json
+```
 
 ## License
 
