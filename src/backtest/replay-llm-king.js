@@ -166,7 +166,8 @@ function findKingNode(parsed) {
     const prevRunning = runningGex;
     runningGex += aggregatedGex.get(s) || 0;
     if (prevRunning <= 0 && runningGex > 0 && Math.abs(s - spotPrice) < 100) {
-      flipLevel = s; // first strike where cumulative GEX goes positive
+      flipLevel = s;
+      break; // take the first (nearest) crossing, not the last
     }
   }
 
@@ -363,7 +364,7 @@ function buildSnapshot(localState, parsed, king, spot, et, spyKing, qqqKing, pos
     gamma_balance: `POS above: ${(king.posAbove/1e6).toFixed(0)}M | POS below: ${(king.posBelow/1e6).toFixed(0)}M | NEG above: ${(king.negAbove/1e6).toFixed(0)}M | NEG below: ${(king.negBelow/1e6).toFixed(0)}M${king.squeezeUp ? ' | ⚠️ SQUEEZE UP: POS above is 2x NEG below — dealers forced to BUY as price rises' : ''}${king.squeezeDown ? ' | ⚠️ SQUEEZE DOWN: POS below is 2x NEG above — dealers forced to SELL as price falls' : ''}`,
     net_gex_regime: `${king.regime} gamma (net ${(king.netGex/1e6).toFixed(0)}M) — ${king.regime === 'POSITIVE' ? 'dealers absorb moves, PINNING/STABILIZING' : 'dealers amplify moves, TRENDING/VOLATILE'}`,
     gamma_flip_level: king.flipLevel ? `${king.flipLevel} (${king.flipLevel > spot ? (king.flipLevel - spot).toFixed(0) + 'pts ABOVE' : (spot - king.flipLevel).toFixed(0) + 'pts BELOW'} spot) — above this level market stabilizes, below it moves accelerate` : 'not found',
-    vacuum_zones: `${king.vacuumBelow ? 'BELOW: ' + king.vacuumBelow.pts + 'pt corridor from ' + king.vacuumBelow.from + ' to ' + king.vacuumBelow.to + ' (low resistance, fast move zone)' : 'no vacuum below'}${king.vacuumAbove ? ' | ABOVE: ' + king.vacuumAbove.pts + 'pt corridor from ' + king.vacuumAbove.from + ' to ' + king.vacuumAbove.to + ' (low resistance, fast move zone)' : ' | no vacuum above'}`,
+    vacuum_zones: `${king.vacuumBelow && king.vacuumBelow.pts >= 10 ? 'BELOW: ' + king.vacuumBelow.pts + 'pt corridor from ' + king.vacuumBelow.from + ' to ' + king.vacuumBelow.to + ' (low resistance, fast move zone)' : 'no significant vacuum below'}${king.vacuumAbove && king.vacuumAbove.pts >= 10 ? ' | ABOVE: ' + king.vacuumAbove.pts + 'pt corridor from ' + king.vacuumAbove.from + ' to ' + king.vacuumAbove.to + ' (low resistance, fast move zone)' : ' | no significant vacuum above'}`,
     concentration: `Top 3 strikes hold ${(king.concentration * 100).toFixed(0)}% of total GEX — ${king.concentration > 0.5 ? 'CONCENTRATED (tight gravity field, strong pin)' : 'SPREAD (loose structure, easier to trend)'}`,
     narrative: [kingStory, competingStory, priceStory, crossStory].filter(Boolean).join(' '),
     spy_magnet: spyKing ? `SPY king at ${spyKing.strike}, ${Math.abs(spyKing.dist).toFixed(0)}pts ${spyKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -460,11 +461,17 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
 
   // Local state (no imports from state.js)
   const localState = {
-    kingHistory: [],     // { time, strike, value, absValue }
-    wallHistory: [],     // array of [{strike, value}] per frame
+    kingHistory: [],
+    wallHistory: [],
     hod: -Infinity,
     lod: Infinity,
     openPrice: 0,
+    _entriesPerDir: { BULLISH: 0, BEARISH: 0 },
+    _dirLosses: { BULLISH: 0, BEARISH: 0 },
+    _dirWins: { BULLISH: 0, BEARISH: 0 },
+    _trendWins: { BULLISH: 0, BEARISH: 0 },
+    _defyCount: 0,
+    _dayPnl: 0,
   };
 
   const calls = [];      // LLM call log
@@ -495,6 +502,33 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
 
     const king = findKingNode(parsed);
     if (!king) continue;
+
+    // === BREACH DETECTION — runs EVERY frame, not just LLM frames ===
+    // Track top positive walls and detect when price crosses through one
+    const posWallsNow = [];
+    for (const s of parsed.strikes) {
+      const g = parsed.aggregatedGex.get(s) || 0;
+      if (g > 5_000_000 && Math.abs(s - spot) < 50) posWallsNow.push({ strike: s, value: g });
+    }
+    posWallsNow.sort((a, b) => b.value - a.value);
+    const topPosWallsNow = posWallsNow.slice(0, 3);
+
+    if (!localState._breachUp) localState._breachUp = false;
+    if (!localState._breachDown) localState._breachDown = false;
+    if (!localState._breachedWall) localState._breachedWall = null;
+
+    if (localState._prevPosWallsFrame && localState._prevSpotFrame) {
+      for (const wall of localState._prevPosWallsFrame) {
+        if (localState._prevSpotFrame < wall.strike && spot > wall.strike + 2) {
+          localState._breachUp = true; localState._breachedWall = wall; break;
+        }
+        if (localState._prevSpotFrame > wall.strike && spot < wall.strike - 2) {
+          localState._breachDown = true; localState._breachedWall = wall; break;
+        }
+      }
+    }
+    localState._prevPosWallsFrame = topPosWallsNow;
+    localState._prevSpotFrame = spot;
 
     // Update local history
     localState.kingHistory.push({ time: etStr, strike: king.strike, value: king.value, absValue: king.absValue });
@@ -637,9 +671,10 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           // Big win — reset direction entries to allow re-entry
           localState._entriesPerDir[position.direction] = Math.max(0, (localState._entriesPerDir[position.direction] || 1) - 1);
         }
+        localState._dayPnl += pnl;
         if (verbose) {
           const tag = pnl > 0 ? 'WIN' : 'LOSS';
-          console.log(`  EXIT  ${etStr} | ${position.direction} ${exitReason} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(2)} pts | ${tag}`);
+          console.log(`  EXIT  ${etStr} | ${position.direction} ${exitReason} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(2)} pts | dayPnl=${localState._dayPnl.toFixed(1)} | ${tag}`);
         }
         position = null;
       }
@@ -716,17 +751,19 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         localState._consecutiveDir.count = 0;
       }
 
-      // Track 30-min price trend mechanically (always, even outside entry window)
+      // Track 30-min price trend (3 LLM frames × 10 min = 30 min)
       if (!localState._priceTrend) localState._priceTrend = [];
       localState._priceTrend.push(spot);
-      if (localState._priceTrend.length > 30) localState._priceTrend.shift();
-      const priceTrend30 = localState._priceTrend.length >= 20
+      if (localState._priceTrend.length > 3) localState._priceTrend.shift();
+      const priceTrend30 = localState._priceTrend.length >= 3
         ? spot - localState._priceTrend[0] : 0;
 
       // Track entries per direction today (max 1 re-entry after stop)
       if (!localState._entriesPerDir) localState._entriesPerDir = { BULLISH: 0, BEARISH: 0 };
 
-      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin) {
+      // Daily P&L circuit breaker — stop trading if day loss exceeds -25 pts
+      const dailyLossLimit = -25;
+      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit) {
 
         // === MECHANICAL QUALITY SCORE ===
         // Score the setup 0-100. Only setups scoring 70+ go to LLM for confirmation.
@@ -740,37 +777,18 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // Track top positive walls and detect when price crosses through one.
         // The squeeze happens at the BREACH moment — when price breaks a positive wall,
         // dealers unwind hedges in the same direction, accelerating the move.
-        if (!localState._prevPosWalls) localState._prevPosWalls = [];
-        // Find top 3 positive walls near spot
-        const posWalls = [];
-        for (const s of parsed.strikes) {
-          const g = parsed.aggregatedGex.get(s) || 0;
-          if (g > 5_000_000 && Math.abs(s - spot) < 50) posWalls.push({ strike: s, value: g });
+        // Use per-frame breach detection (runs every frame, not just LLM frames)
+        const squeezeConfirmsUp = localState._breachUp && king.squeezeUp;
+        const squeezeConfirmsDown = localState._breachDown && king.squeezeDown;
+        // Reset breach flags after checking (one-shot event)
+        if (squeezeConfirmsUp || squeezeConfirmsDown) {
+          localState._breachUp = false;
+          localState._breachDown = false;
         }
-        posWalls.sort((a, b) => b.value - a.value);
-        const topPosWalls = posWalls.slice(0, 3);
 
-        // Detect breach: price was on one side of a positive wall, now on the other
-        let breachUp = false, breachDown = false, breachedWall = null;
-        if (localState._prevPosWalls.length > 0 && localState._prevSpot) {
-          for (const wall of localState._prevPosWalls) {
-            if (localState._prevSpot < wall.strike && spot > wall.strike + 2) {
-              breachUp = true; breachedWall = wall; break;
-            }
-            if (localState._prevSpot > wall.strike && spot < wall.strike - 2) {
-              breachDown = true; breachedWall = wall; break;
-            }
-          }
-        }
-        localState._prevPosWalls = topPosWalls;
-        localState._prevSpot = spot;
-
-        // Also require squeeze pressure (POS on breach side > NEG on magnet side)
-        const squeezeConfirmsUp = breachUp && king.squeezeUp;
-        const squeezeConfirmsDown = breachDown && king.squeezeDown;
-
-        if (llmDir !== 'NEUTRAL' && llmConf === 'HIGH'
-            && ((squeezeConfirmsUp && llmDir === 'BULLISH') || (squeezeConfirmsDown && llmDir === 'BEARISH'))) {
+        // Gate SQUEEZE purely on mechanical breach + squeeze ratio — LLM direction not required
+        // because the LLM will often call BEARISH (following the magnet) during a squeeze UP
+        if ((squeezeConfirmsUp || squeezeConfirmsDown) && llmRegime !== 'CHOP') {
           const squeezeDir = king.squeezeUp ? 'BULLISH' : 'BEARISH';
           const sqDirEntries = localState._entriesPerDir[squeezeDir] || 0;
           const sqDirLosses = localState._dirLosses?.[squeezeDir] || 0;
@@ -884,7 +902,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
             const qualityOverride = quality >= 75;
             const superQuality = quality >= 80; // very strong setup, enter regardless
 
-            if (llmConfirms || qualityOverride || superQuality) {
+            // Hard squeeze gate: NEVER enter TREND against an active squeeze
+            const squeezeBlocsTrend = (dir === 'BEARISH' && king.squeezeUp) || (dir === 'BULLISH' && king.squeezeDown);
+            if ((llmConfirms || qualityOverride || superQuality) && !squeezeBlocsTrend) {
               position = {
                 mode: 'TREND',
                 direction: dir,
@@ -924,9 +944,11 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           const dirEntries = localState._entriesPerDir[priceDir] || 0;
           if (!localState._defyCount) localState._defyCount = 0;
 
-          const alreadyWonTrend = (localState._trendWins?.[priceDir] || 0) > 0;
+          const alreadyWonTrend = (localState._trendWins[priceDir] || 0) > 0;
+          // Soft LLM block: if LLM says CHOP HIGH, don't DEFY
+          const llmBlocksDefy = llmRegime === 'CHOP' && llmConf === 'HIGH';
           const defyMax = 2;
-          if (defying && !alreadyWonTrend && dirEntries < 2 && localState._defyCount < defyMax && minuteOfDay >= timeToMinutes('11:00')) {
+          if (defying && !alreadyWonTrend && !llmBlocksDefy && dirEntries < 2 && localState._defyCount < defyMax && minuteOfDay >= timeToMinutes('11:00')) {
             // Price is overpowering gamma — trade with price momentum
             // Find a reasonable target: the next round number in price direction
             const targetStrike = priceDir === 'BEARISH'
@@ -1180,19 +1202,15 @@ async function main() {
 
     // Breakdown by mode
     const allTrades = allResults.flatMap(r => r.trades);
-    const trendTrades = allTrades.filter(t => t.mode === 'TREND');
-    const pinTrades = allTrades.filter(t => t.mode === 'PINNED');
-    if (trendTrades.length > 0) {
-      const tw = trendTrades.filter(t => t.pnl > 0).length;
-      const tl = trendTrades.filter(t => t.pnl <= 0).length;
-      const tp = trendTrades.reduce((s, t) => s + t.pnl, 0);
-      console.log(`\nTREND trades: ${trendTrades.length} (${tw}W/${tl}L) | NET: ${tp > 0 ? '+' : ''}${tp.toFixed(2)} pts`);
-    }
-    if (pinTrades.length > 0) {
-      const pw = pinTrades.filter(t => t.pnl > 0).length;
-      const pl = pinTrades.filter(t => t.pnl <= 0).length;
-      const pp = pinTrades.reduce((s, t) => s + t.pnl, 0);
-      console.log(`PIN trades: ${pinTrades.length} (${pw}W/${pl}L) | NET: ${pp > 0 ? '+' : ''}${pp.toFixed(2)} pts`);
+    // Breakdown by ALL modes
+    console.log('');
+    for (const mode of ['TREND', 'SQUEEZE', 'DEFY', 'BREAKOUT', 'PINNED']) {
+      const modeTrades = allTrades.filter(t => t.mode === mode);
+      if (modeTrades.length === 0) continue;
+      const mw = modeTrades.filter(t => t.pnl > 0).length;
+      const ml = modeTrades.filter(t => t.pnl <= 0).length;
+      const mp = modeTrades.reduce((s, t) => s + t.pnl, 0);
+      console.log(`${mode.padEnd(10)} ${modeTrades.length} trades (${mw}W/${ml}L) | NET: ${mp > 0 ? '+' : ''}${mp.toFixed(2)} pts`);
     }
 
     // Exit reason breakdown
