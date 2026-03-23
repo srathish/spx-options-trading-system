@@ -464,6 +464,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         else if (progress <= -s) exitReason = 'RANGE_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         else if (position.llmSaysExit) exitReason = 'LLM_EXIT';
+      } else if (mode === 'BREAKOUT') {
+        const t = 20;
+        const s = position._breakStop || 12;
+        if (progress >= t) exitReason = 'BREAK_TARGET';
+        else if (position.mfe >= 15 && progress <= 5) exitReason = 'BREAK_LOCK';
+        else if (progress <= -s) exitReason = 'BREAK_STOP';
+        else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else if (mode === 'DEFY') {
         const t = 30;
         const s = position._defyStop || 15;
@@ -480,7 +487,6 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           if (hit) exitReason = 'TARGET_HIT';
         }
         // Profit lock for TREND: if MFE hits +25, don't let it go below +10
-        // Wide enough to survive chop but locks in meaningful profit
         if (!exitReason && position.mfe >= 25 && progress <= 10) {
           exitReason = 'TREND_LOCK';
         }
@@ -503,6 +509,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const pnl = exitReason === 'MAX_LOSS' ? -CONFIG.max_loss_pts
           : exitReason === 'PIN_STOP' ? -(position._pinnedStop || 8)
           : exitReason === 'RANGE_STOP' ? -(position._rangeStop || 8)
+          : exitReason === 'BREAK_STOP' ? -(position._breakStop || 12)
           : exitReason === 'DEFY_STOP' ? -(position._defyStop || 15)
           : Math.round(progress * 100) / 100;
         trades.push({
@@ -684,7 +691,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           // Quality 60+ goes to LLM for confirmation. Quality 75+ overrides LLM.
           // Minimum: 20pts away and either $10M absolute OR 8% relative
           const meetsMinimum = dist >= 20 && value >= 10_000_000 && magnetPct >= 6;
-          if (quality >= 60 && meetsMinimum) {
+          if (quality >= 55 && meetsMinimum) {
             const llmConfirms = llmConf === 'HIGH' && llmRegime !== 'CHOP';
             const qualityOverride = quality >= 75;
 
@@ -716,7 +723,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           const totalNegAbove = bullM.absValue;
           const gexPullDir = totalNegBelow > totalNegAbove ? 'BEARISH' : 'BULLISH';
           const priceDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
-          const defying = gexPullDir !== priceDir && Math.abs(dayMove) >= 60 && Math.abs(dayMove) <= 80;
+          const defying = gexPullDir !== priceDir && Math.abs(dayMove) >= 40 && Math.abs(dayMove) <= 90;
           const dirEntries = localState._entriesPerDir[priceDir] || 0;
           if (!localState._defyCount) localState._defyCount = 0;
 
@@ -741,6 +748,34 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
               localState._entriesPerDir[priceDir]++;
               localState._defyCount++;
               if (verbose) console.log(`  DEFY ${etStr} | ${priceDir} @ $${Math.round(spot)} → ${targetStrike} | price ${dayMove > 0 ? '+' : ''}${dayMove.toFixed(0)} AGAINST ${gexPullDir} gamma`);
+            }
+          }
+        }
+
+        // === BREAKOUT: big magnet at spot, price broke away ===
+        // Dec 23: 6885 magnet at spot, SPX rallied to 6908 (+30)
+        // Jan 5: 6930 magnet at spot, SPX rallied to 6920 (+43)
+        // When a big magnet is within 15pts of spot but price has moved 20+ away, breakout
+        if (!position && king.magnetStrike && Math.abs(king.magnetDist) <= 15 && king.magnetAbsValue >= 15_000_000) {
+          const breakDist = Math.abs(dayMove);
+          if (breakDist >= 20 && minuteOfDay >= timeToMinutes('10:30')) {
+            const breakDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
+            const breakTarget = breakDir === 'BULLISH'
+              ? Math.round((spot + 20) / 5) * 5
+              : Math.round((spot - 20) / 5) * 5;
+            const bDirEntries = localState._entriesPerDir[breakDir] || 0;
+            if (bDirEntries < 1) {
+              position = {
+                mode: 'BREAKOUT',
+                direction: breakDir,
+                entrySpx: spot,
+                targetStrike: breakTarget,
+                openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+                mfe: 0, mae: 0, llmSaysExit: false,
+                _breakStop: 12,
+              };
+              localState._entriesPerDir[breakDir]++;
+              if (verbose) console.log(`  BREAKOUT ${etStr} | ${breakDir} @ $${Math.round(spot)} → ${breakTarget} | broke ${breakDist}pts from pin at ${king.magnetStrike}`);
             }
           }
         }
