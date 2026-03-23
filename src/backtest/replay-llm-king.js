@@ -42,43 +42,42 @@ const CONFIG = {
 
 // ---- System prompt ----
 
-const SYSTEM_PROMPT = `You are a GEX trader. I will show you the current gamma exposure landscape for SPX. You need to tell me: should I trade this, and which direction?
+const SYSTEM_PROMPT = `You are a GEX (gamma exposure) trader for SPX 0DTE. Analyze the data step by step.
 
-HOW I READ GEX — THINK STEP BY STEP:
+GEX FORCES — there are THREE forces acting on price:
 
-Step 1: FIND THE BIGGEST NEGATIVE GAMMA NODE
-Negative gamma nodes are MAGNETS — they pull price toward them. The biggest one dominates the day.
-- Look at "biggest_magnet" in the data — that's the key node.
-- If it says "BELOW spot" → it's pulling price DOWN → BEARISH
-- If it says "ABOVE spot" → it's pulling price UP → BULLISH
-- IGNORE positive gamma nodes for direction — they are pins/support, NOT magnets.
+1. NEGATIVE GAMMA MAGNETS: Pull price TOWARD them.
+   - "biggest_magnet" shows the strongest one. Below spot = BEARISH, above spot = BULLISH.
+   - Growing magnet = stronger pull. Stable magnet = reliable. Flipping = unreliable.
 
-Step 2: CHECK IF IT'S BUILDING
-Look at the "narrative" field:
-- "grew from 18M to 45M (+150%)" = the magnet is getting STRONGER. Good.
-- "stability 90%" = the magnet has been dominant all day. Very good.
-- "only been king 30% of time" = unstable, keeps flipping. Bad.
+2. POSITIVE GAMMA PINS: Hold price AT that level.
+   - Large positive GEX at spot = price pinned, range-bound.
+   - BUT if price breaks THROUGH a positive wall with momentum, dealers unwind hedges
+     in the same direction → the PIN becomes a SQUEEZE ACCELERANT.
 
-Step 3: CHECK FOR COMPETITION
-- "no competing nodes on other side" = clean setup. TRADE.
-- "competing: 15M below AND 12M above" = tug of war. SKIP.
+3. GAMMA SQUEEZE: When "gamma_balance" shows "SQUEEZE UP" or "SQUEEZE DOWN":
+   - POS gamma above spot > 2x NEG gamma below → dealers forced to BUY as price rises
+   - This OVERPOWERS bearish magnets. Do NOT go bearish during a squeeze up.
+   - Similarly, SQUEEZE DOWN overpowers bullish magnets.
+   - This is the #1 reason trades fail: fighting a gamma squeeze.
 
-Step 4: CHECK DISTANCE
-- Magnet 30-80 pts from spot = good distance, room for a big move
-- Magnet <15 pts from spot = too close, already at the magnet
-- Magnet >100 pts from spot = too far, may not reach
+KEY DATA FIELDS:
+- "net_gex_regime": POSITIVE = stabilizing/pinning, NEGATIVE = amplifying/trending
+- "gamma_flip_level": THE critical level. Above it = stable. Below it = moves accelerate.
+  If price is below the flip level in NEGATIVE gamma → expect large directional moves.
+- "vacuum_zones": Low-resistance corridors with near-zero GEX. Price moves FAST through vacuums.
+  If there's a vacuum between spot and the magnet → price can reach the magnet quickly.
+- "concentration": High = tight gravity field, hard to trend. Low/spread = loose, easy to trend.
+- "gamma_balance": The squeeze check. Most important safety check before entering.
 
-Step 5: CHECK SPY AND QQQ ALIGNMENT
-- "spy_magnet" and "qqq_magnet" show where the magnets are on SPY and QQQ
-- If all three (SPX, SPY, QQQ) have magnets on the SAME side of spot → very HIGH confidence
-- If they disagree → lower confidence, be cautious
-
-Step 6: DECIDE
-- Strong magnet (>$15M), far from spot (25+ pts), growing, no competition, SPY/QQQ aligned → HIGH confidence
-- Weak magnet (<$10M), flipping around, competition, markets disagree → CHOP, don't trade
-- If we already have a position in the right direction and the magnet is still there → HOLD
-
-IMPORTANT: The "computed_direction" field tells you which way the magnet is pulling. TRUST IT.
+ANALYSIS STEPS:
+1. Check net_gex_regime: NEGATIVE gamma = trending day, POSITIVE = pinning day
+2. Check gamma_flip_level: Is price above or below? Below = amplified moves
+3. Find the magnet (biggest_magnet) and check its direction, size, stability
+4. CHECK SQUEEZE (gamma_balance) — if squeeze opposes your magnet, DO NOT TRADE the magnet
+5. Check vacuum_zones — vacuum between spot and magnet = fast move likely
+6. Check SPY/QQQ alignment
+7. If we have a current_position, check if thesis is intact
 
 Respond JSON:
 {
@@ -86,7 +85,7 @@ Respond JSON:
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "regime": "TREND" | "CHOP" | "PINNED",
   "action": "ENTER" | "HOLD" | "EXIT" | "WAIT",
-  "reasoning": "<your step-by-step thinking in 1-2 sentences>"
+  "reasoning": "<1-2 sentences citing specific data fields>"
 }`;
 
 // ---- Helpers ----
@@ -132,9 +131,18 @@ function findKingNode(parsed) {
   if (kingStrike === null) return null;
 
   // Find biggest negative magnet on EACH side of spot (for competing magnet detection)
+  // AND total positive gamma on each side (for squeeze detection)
   let bearMagnet = null, bullMagnet = null;
+  let posAbove = 0, posBelow = 0, negAbove = 0, negBelow = 0;
   for (const strike of strikes) {
     const gex = aggregatedGex.get(strike) || 0;
+    if (Math.abs(strike - spotPrice) > 100) continue;
+
+    if (gex > 0 && strike > spotPrice + 5) posAbove += gex;
+    if (gex > 0 && strike < spotPrice - 5) posBelow += gex;
+    if (gex < 0 && strike > spotPrice + 5) negAbove += Math.abs(gex);
+    if (gex < 0 && strike < spotPrice - 5) negBelow += Math.abs(gex);
+
     if (gex >= 0) continue;
     const absGex = Math.abs(gex);
     if (absGex < 5_000_000) continue;
@@ -147,10 +155,70 @@ function findKingNode(parsed) {
     }
   }
 
+  // === GAMMA FLIP LEVEL: price where total GEX changes sign ===
+  // Above flip = positive gamma (stabilizing), below flip = negative gamma (amplifying)
+  let flipLevel = null;
+  const sortedStrikes = [...strikes].sort((a, b) => a - b);
+  let runningGex = 0;
+  for (const s of sortedStrikes) {
+    const prevRunning = runningGex;
+    runningGex += aggregatedGex.get(s) || 0;
+    if (prevRunning <= 0 && runningGex > 0 && Math.abs(s - spotPrice) < 100) {
+      flipLevel = s; // first strike where cumulative GEX goes positive
+    }
+  }
+
+  // === NET GEX REGIME: sum of all GEX near spot ===
+  let netGex = 0;
+  for (const s of strikes) {
+    if (Math.abs(s - spotPrice) < 80) netGex += aggregatedGex.get(s) || 0;
+  }
+  const regime = netGex > 0 ? 'POSITIVE' : 'NEGATIVE'; // positive = pinning, negative = amplifying
+
+  // === VACUUM ZONES: strikes with near-zero GEX between walls ===
+  // Find the biggest gap (lowest GEX corridor) between spot and the nearest major wall
+  let vacuumBelow = null, vacuumAbove = null;
+  const nearStrikes = sortedStrikes.filter(s => Math.abs(s - spotPrice) < 80);
+  // Check below spot for vacuum
+  const belowStrikes = nearStrikes.filter(s => s < spotPrice - 5).reverse();
+  let vacuumStartBelow = null;
+  for (const s of belowStrikes) {
+    const g = Math.abs(aggregatedGex.get(s) || 0);
+    if (g < 2_000_000 && !vacuumStartBelow) vacuumStartBelow = s;
+    if (g >= 5_000_000 && vacuumStartBelow) {
+      vacuumBelow = { from: s, to: vacuumStartBelow, pts: vacuumStartBelow - s };
+      break;
+    }
+  }
+  // Check above spot for vacuum
+  const aboveStrikes = nearStrikes.filter(s => s > spotPrice + 5);
+  let vacuumStartAbove = null;
+  for (const s of aboveStrikes) {
+    const g = Math.abs(aggregatedGex.get(s) || 0);
+    if (g < 2_000_000 && !vacuumStartAbove) vacuumStartAbove = s;
+    if (g >= 5_000_000 && vacuumStartAbove) {
+      vacuumAbove = { from: vacuumStartAbove, to: s, pts: s - vacuumStartAbove };
+      break;
+    }
+  }
+
+  // === GEX CONCENTRATION: how tight or spread is the structure ===
+  let top3Total = 0;
+  const allGex = strikes.map(s => ({ s, g: Math.abs(aggregatedGex.get(s) || 0) }))
+    .filter(x => Math.abs(x.s - spotPrice) < 80)
+    .sort((a, b) => b.g - a.g);
+  for (let j = 0; j < Math.min(3, allGex.length); j++) top3Total += allGex[j].g;
+  const concentration = totalAbsGamma > 0 ? top3Total / totalAbsGamma : 0;
+
   return {
     strike: kingStrike, value: kingValue, absValue: kingAbsValue, dist: kingStrike - spotPrice,
     magnetStrike, magnetValue, magnetAbsValue, magnetDist: magnetStrike ? magnetStrike - spotPrice : 0,
     bearMagnet, bullMagnet, totalAbsGamma,
+    posAbove, posBelow, negAbove, negBelow,
+    squeezeUp: posAbove > negBelow * 2,
+    squeezeDown: posBelow > negAbove * 2,
+    flipLevel, regime, netGex,
+    vacuumBelow, vacuumAbove, concentration,
   };
 }
 
@@ -290,6 +358,11 @@ function buildSnapshot(localState, parsed, king, spot, et, spyKing, qqqKing, pos
     king_tenure_min: tenure,
     computed_direction: king.value < 0 ? (king.dist < 0 ? 'BEARISH — negative magnet below pulling price DOWN' : 'BULLISH — negative magnet above pulling price UP') : (Math.abs(king.dist) < 10 ? 'PINNED — positive gamma at spot keeping price stuck' : 'WEAK — positive gamma node is support/resistance, not a magnet'),
     biggest_magnet: king.magnetStrike ? `${king.magnetStrike} at ${(king.magnetValue/1e6).toFixed(1)}M, ${Math.abs(king.magnetDist).toFixed(0)}pts ${king.magnetDist < 0 ? 'BELOW' : 'ABOVE'} spot — THIS is the true magnet pulling price ${king.magnetDist < 0 ? 'DOWN' : 'UP'}` : 'no significant negative gamma magnet found',
+    gamma_balance: `POS above: ${(king.posAbove/1e6).toFixed(0)}M | POS below: ${(king.posBelow/1e6).toFixed(0)}M | NEG above: ${(king.negAbove/1e6).toFixed(0)}M | NEG below: ${(king.negBelow/1e6).toFixed(0)}M${king.squeezeUp ? ' | ⚠️ SQUEEZE UP: POS above is 2x NEG below — dealers forced to BUY as price rises' : ''}${king.squeezeDown ? ' | ⚠️ SQUEEZE DOWN: POS below is 2x NEG above — dealers forced to SELL as price falls' : ''}`,
+    net_gex_regime: `${king.regime} gamma (net ${(king.netGex/1e6).toFixed(0)}M) — ${king.regime === 'POSITIVE' ? 'dealers absorb moves, PINNING/STABILIZING' : 'dealers amplify moves, TRENDING/VOLATILE'}`,
+    gamma_flip_level: king.flipLevel ? `${king.flipLevel} (${king.flipLevel > spot ? (king.flipLevel - spot).toFixed(0) + 'pts ABOVE' : (spot - king.flipLevel).toFixed(0) + 'pts BELOW'} spot) — above this level market stabilizes, below it moves accelerate` : 'not found',
+    vacuum_zones: `${king.vacuumBelow ? 'BELOW: ' + king.vacuumBelow.pts + 'pt corridor from ' + king.vacuumBelow.from + ' to ' + king.vacuumBelow.to + ' (low resistance, fast move zone)' : 'no vacuum below'}${king.vacuumAbove ? ' | ABOVE: ' + king.vacuumAbove.pts + 'pt corridor from ' + king.vacuumAbove.from + ' to ' + king.vacuumAbove.to + ' (low resistance, fast move zone)' : ' | no vacuum above'}`,
+    concentration: `Top 3 strikes hold ${(king.concentration * 100).toFixed(0)}% of total GEX — ${king.concentration > 0.5 ? 'CONCENTRATED (tight gravity field, strong pin)' : 'SPREAD (loose structure, easier to trend)'}`,
     narrative: [kingStory, competingStory, priceStory, crossStory].filter(Boolean).join(' '),
     spy_magnet: spyKing ? `SPY king at ${spyKing.strike}, ${Math.abs(spyKing.dist).toFixed(0)}pts ${spyKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
     qqq_magnet: qqqKing ? `QQQ king at ${qqqKing.strike}, ${Math.abs(qqqKing.dist).toFixed(0)}pts ${qqqKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(qqqKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -707,9 +780,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           // Midday penalty: 12:00-13:30 has 29% WR — penalize heavily
           if (minuteOfDay >= 720 && minuteOfDay <= 810) quality -= 15;
 
-          // Late to the party penalty: if price already moved 80+ pts in our direction,
-          // the easy money is gone and we're chasing an extended move
+          // Late to the party penalty
           if ((dir === 'BEARISH' && dayMove < -80) || (dir === 'BULLISH' && dayMove > 80)) quality -= 30;
+
+          // GAMMA SQUEEZE penalty: if positive gamma on opposite side overwhelms our magnet,
+          // dealers are hedging AGAINST our direction. Don't fight the squeeze.
+          if (dir === 'BEARISH' && king.squeezeUp) quality -= 25;
+          if (dir === 'BULLISH' && king.squeezeDown) quality -= 25;
 
           // Magnet rapidly growing = penalty (46% of losses vs 16% of wins)
           // Stable/established magnets work better than rapidly building ones
