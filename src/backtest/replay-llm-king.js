@@ -42,31 +42,51 @@ const CONFIG = {
 
 // ---- System prompt ----
 
-const SYSTEM_PROMPT = `You assess SPX GEX (gamma exposure) trading setups. We pre-compute the direction. You ONLY assess quality: TRADE or SKIP.
+const SYSTEM_PROMPT = `You are a GEX trader. I will show you the current gamma exposure landscape for SPX. You need to tell me: should I trade this, and which direction?
 
-EXAMPLES OF WINNING SETUPS (say TRADE):
-1. "Node at 6500 grew from 18M to 45M (+150%), stable 91% of the time, no competing nodes" → TRADE. One dominant magnet, growing consistently, clean path.
-2. "Node at 6855, stable 80%, grew from 10M to 20M, no opponent" → TRADE. Established magnet, no competition.
-3. "Price dropped 80pts while gamma pulled bullish — momentum overwhelming gamma" → TRADE. Strong DEFY signal.
+HOW I READ GEX — THINK STEP BY STEP:
 
-EXAMPLES OF LOSING SETUPS (say SKIP):
-1. "King node at 4 different strikes, unstable" → SKIP. Chop day, no clear direction.
-2. "Node at 6510 only $10M, 76pts away" → SKIP. Small value + far distance = weak pull.
-3. "Node at 6900 only 12pts from spot" → SKIP. Too close to be a real magnet.
-4. "Competing: 15M below AND 12M above spot" → SKIP. Tug of war, unpredictable.
+Step 1: FIND THE BIGGEST NEGATIVE GAMMA NODE
+Negative gamma nodes are MAGNETS — they pull price toward them. The biggest one dominates the day.
+- Look at "biggest_magnet" in the data — that's the key node.
+- If it says "BELOW spot" → it's pulling price DOWN → BEARISH
+- If it says "ABOVE spot" → it's pulling price UP → BULLISH
+- IGNORE positive gamma nodes for direction — they are pins/support, NOT magnets.
 
-DECISION RULES:
-- Stability 80%+ AND growing AND no competitor → TRADE
-- Stability <50% OR 4+ king strikes → SKIP (chop)
-- Node value $20M+ AND 30+ pts from spot AND no opponent → TRADE
-- Node value <$10M OR <15 pts from spot → SKIP
-- If we have a current_position that's working, say HOLD
+Step 2: CHECK IF IT'S BUILDING
+Look at the "narrative" field:
+- "grew from 18M to 45M (+150%)" = the magnet is getting STRONGER. Good.
+- "stability 90%" = the magnet has been dominant all day. Very good.
+- "only been king 30% of time" = unstable, keeps flipping. Bad.
 
-Respond JSON only:
+Step 3: CHECK FOR COMPETITION
+- "no competing nodes on other side" = clean setup. TRADE.
+- "competing: 15M below AND 12M above" = tug of war. SKIP.
+
+Step 4: CHECK DISTANCE
+- Magnet 30-80 pts from spot = good distance, room for a big move
+- Magnet <15 pts from spot = too close, already at the magnet
+- Magnet >100 pts from spot = too far, may not reach
+
+Step 5: CHECK SPY AND QQQ ALIGNMENT
+- "spy_magnet" and "qqq_magnet" show where the magnets are on SPY and QQQ
+- If all three (SPX, SPY, QQQ) have magnets on the SAME side of spot → very HIGH confidence
+- If they disagree → lower confidence, be cautious
+
+Step 6: DECIDE
+- Strong magnet (>$15M), far from spot (25+ pts), growing, no competition, SPY/QQQ aligned → HIGH confidence
+- Weak magnet (<$10M), flipping around, competition, markets disagree → CHOP, don't trade
+- If we already have a position in the right direction and the magnet is still there → HOLD
+
+IMPORTANT: The "computed_direction" field tells you which way the magnet is pulling. TRUST IT.
+
+Respond JSON:
 {
-  "assessment": "STRONG" | "MODERATE" | "WEAK",
-  "action": "TRADE" | "HOLD" | "SKIP",
-  "reasoning": "<1 sentence>"
+  "direction": "BULLISH" | "BEARISH" | "NEUTRAL",
+  "confidence": "HIGH" | "MEDIUM" | "LOW",
+  "regime": "TREND" | "CHOP" | "PINNED",
+  "action": "ENTER" | "HOLD" | "EXIT" | "WAIT",
+  "reasoning": "<your step-by-step thinking in 1-2 sentences>"
 }`;
 
 // ---- Helpers ----
@@ -271,6 +291,8 @@ function buildSnapshot(localState, parsed, king, spot, et, spyKing, qqqKing, pos
     computed_direction: king.value < 0 ? (king.dist < 0 ? 'BEARISH — negative magnet below pulling price DOWN' : 'BULLISH — negative magnet above pulling price UP') : (Math.abs(king.dist) < 10 ? 'PINNED — positive gamma at spot keeping price stuck' : 'WEAK — positive gamma node is support/resistance, not a magnet'),
     biggest_magnet: king.magnetStrike ? `${king.magnetStrike} at ${(king.magnetValue/1e6).toFixed(1)}M, ${Math.abs(king.magnetDist).toFixed(0)}pts ${king.magnetDist < 0 ? 'BELOW' : 'ABOVE'} spot — THIS is the true magnet pulling price ${king.magnetDist < 0 ? 'DOWN' : 'UP'}` : 'no significant negative gamma magnet found',
     narrative: [kingStory, competingStory, priceStory, crossStory].filter(Boolean).join(' '),
+    spy_magnet: spyKing ? `SPY king at ${spyKing.strike}, ${Math.abs(spyKing.dist).toFixed(0)}pts ${spyKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
+    qqq_magnet: qqqKing ? `QQQ king at ${qqqKing.strike}, ${Math.abs(qqqKing.dist).toFixed(0)}pts ${qqqKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(qqqKing.value/1e6).toFixed(1)}M)` : 'no data',
     top_5_walls: walls.slice(0, 5).map(w => `${w.strike}: ${w.gamma_M}M (${w.trend}, ${w.dist_from_spot > 0 ? '+' : ''}${w.dist_from_spot}pts)`),
     current_position: position ? {
       direction: position.direction,
@@ -314,12 +336,11 @@ async function callLLM(snapshot, cache, cacheKey) {
     const content = response.choices[0]?.message?.content || '{}';
     const parsed = JSON.parse(content);
     const result = {
-      // Map new prompt format to old field names for compatibility
-      regime: parsed.assessment === 'STRONG' ? 'TREND' : parsed.assessment === 'MODERATE' ? 'TREND' : 'CHOP',
-      direction: 'NEUTRAL', // we compute direction mechanically now
-      confidence: parsed.assessment === 'STRONG' ? 'HIGH' : parsed.assessment === 'MODERATE' ? 'MEDIUM' : 'LOW',
-      king_node_target: null,
-      action: parsed.action === 'TRADE' ? 'ENTER' : parsed.action === 'HOLD' ? 'HOLD' : 'WAIT',
+      regime: parsed.regime || 'CHOP',
+      direction: parsed.direction || 'NEUTRAL',
+      confidence: parsed.confidence || 'LOW',
+      king_node_target: parsed.king_node_target || null,
+      action: parsed.action || 'WAIT',
       reasoning: parsed.reasoning || '',
     };
 
@@ -449,15 +470,16 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const t = 20;
         const s = position._breakStop || 12;
         if (progress >= t) exitReason = 'BREAK_TARGET';
-        else if (position.mfe >= 15 && progress <= 5) exitReason = 'BREAK_LOCK';
+        // Lock at 30% of MFE once we hit +12 (was +15/+5 which was too tight)
+        else if (position.mfe >= 12 && progress <= Math.max(3, position.mfe * 0.3)) exitReason = 'BREAK_LOCK';
         else if (progress <= -s) exitReason = 'BREAK_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else if (mode === 'DEFY') {
         const t = 30;
         const s = position._defyStop || 15;
         if (progress >= t) exitReason = 'DEFY_TARGET';
-        // Profit lock for DEFY: if we hit +20, don't let it go below +5
-        else if (position.mfe >= 20 && progress <= 5) exitReason = 'DEFY_LOCK';
+        // Profit lock for DEFY: lock at 40% of MFE once MFE hits +15
+        else if (position.mfe >= 15 && progress <= position.mfe * 0.4) exitReason = 'DEFY_LOCK';
         else if (progress <= -s) exitReason = 'DEFY_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else {
@@ -471,6 +493,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         if (!exitReason && position.mfe >= 25 && progress <= 10) {
           exitReason = 'TREND_LOCK';
         }
+        // Early cut disabled — thesis hold + max loss handle this better
         // MAX LOSS — but check if our magnet is still alive first
         if (!exitReason && progress <= -CONFIG.max_loss_pts) {
           const ourMagnet = position.direction === 'BEARISH' ? king.bearMagnet : king.bullMagnet;
@@ -483,7 +506,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           }
         }
         // After 2:30 PM, tighten profit lock — lock in any gains before close
-        if (!exitReason && minuteOfDay >= timeToMinutes('14:30') && position.mfe >= 10 && progress <= Math.max(3, position.mfe * 0.3)) {
+        if (!exitReason && minuteOfDay >= timeToMinutes('14:30') && position.mfe >= 10 && progress > 0 && progress <= Math.max(3, position.mfe * 0.3)) {
           exitReason = 'LATE_LOCK';
         }
         if (!exitReason && minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
@@ -511,9 +534,21 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           mae: Math.round(position.mae * 100) / 100,
         });
         if (!localState._dirLosses) localState._dirLosses = { BULLISH: 0, BEARISH: 0 };
+        if (!localState._dirWins) localState._dirWins = { BULLISH: 0, BEARISH: 0 };
         if (pnl <= 0) {
           localState._dirLosses[position.direction]++;
-        } else if (pnl >= 15) {
+        } else if (pnl >= 10) {
+          localState._dirWins[position.direction]++;
+          if (position.mode === 'TREND') {
+            if (!localState._trendWins) localState._trendWins = { BULLISH: 0, BEARISH: 0 };
+            localState._trendWins[position.direction]++;
+          }
+        }
+        if (pnl >= 10) {
+          // Reset defy count on wins to allow re-entry
+          if (localState._defyCount) localState._defyCount = Math.max(0, localState._defyCount - 1);
+        }
+        if (pnl >= 15) {
           // Big win — reset direction entries to allow re-entry
           localState._entriesPerDir[position.direction] = Math.max(0, (localState._entriesPerDir[position.direction] || 1) - 1);
         }
@@ -652,15 +687,29 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           // Price fighting magnet: -20
           if ((dir === 'BEARISH' && dayMove > 40) || (dir === 'BULLISH' && dayMove < -40)) quality -= 20;
 
-          // Max 2 entries per direction per day (stop re-entry bleeding)
+          // Entry limits per direction
           const dirEntries = localState._entriesPerDir[dir] || 0;
-          // Max 1 re-entry after a stop loss in the same direction
           if (!localState._dirLosses) localState._dirLosses = { BULLISH: 0, BEARISH: 0 };
+          if (!localState._dirWins) localState._dirWins = { BULLISH: 0, BEARISH: 0 };
           const dirLosses = localState._dirLosses[dir] || 0;
-          if (dirEntries >= 2 || dirLosses >= 1) quality = 0;
+          const dirWins = localState._dirWins[dir] || 0;
+
+          // After a loss, no re-entry in same direction
+          if (dirLosses >= 1) quality = 0;
+          // Max 3 entries if winning, max 2 otherwise
+          if (dirWins > 0 && dirEntries >= 3) quality = 0;
+          else if (dirWins === 0 && dirEntries >= 2) quality = 0;
+
+          // CONFIRMATION BONUS: if we already won in this direction, the day is confirmed
+          // Lower the bar for re-entry
+          if (dirWins > 0) quality += 15;
 
           // Midday penalty: 12:00-13:30 has 29% WR — penalize heavily
           if (minuteOfDay >= 720 && minuteOfDay <= 810) quality -= 15;
+
+          // Late to the party penalty: if price already moved 80+ pts in our direction,
+          // the easy money is gone and we're chasing an extended move
+          if ((dir === 'BEARISH' && dayMove < -80) || (dir === 'BULLISH' && dayMove > 80)) quality -= 30;
 
           // Magnet rapidly growing = penalty (46% of losses vs 16% of wins)
           // Stable/established magnets work better than rapidly building ones
@@ -682,14 +731,16 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           if (quality >= 55 && meetsMinimum) {
             const llmConfirms = llmConf === 'HIGH' && llmRegime !== 'CHOP';
             const qualityOverride = quality >= 75;
+            const superQuality = quality >= 80; // very strong setup, enter regardless
 
-            if (llmConfirms || qualityOverride) {
+            if (llmConfirms || qualityOverride || superQuality) {
               position = {
                 mode: 'TREND',
                 direction: dir,
                 entrySpx: spot,
                 targetStrike: bestMagnet.strike,
                 openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+                entryMinute: minuteOfDay,
                 mfe: 0, mae: 0, llmSaysExit: false,
                 _quality: quality,
               };
@@ -707,15 +758,22 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // Jan 20: SPX dropped 149 pts while GEX pulled bullish the entire day.
         // Feb 12: SPX dropped 108 pts while GEX pulled bullish.
         if (!position && bearM && bullM) {
-          const totalNegBelow = bearM.absValue; // rough proxy
+          const totalNegBelow = bearM.absValue;
           const totalNegAbove = bullM.absValue;
           const gexPullDir = totalNegBelow > totalNegAbove ? 'BEARISH' : 'BULLISH';
           const priceDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
-          const defying = gexPullDir !== priceDir && Math.abs(dayMove) >= 40 && Math.abs(dayMove) <= 90;
+          // Dynamic DEFY: big move from open, not reversing, and still room to run
+          const reversing = (priceDir === 'BULLISH' && priceTrend30 < -15) || (priceDir === 'BEARISH' && priceTrend30 > 15);
+          const bigMove = Math.abs(dayMove) >= 40;
+          // Don't enter if 30-min trend shows price bouncing back 15+ pts
+          const defying = gexPullDir !== priceDir && bigMove && !reversing;
           const dirEntries = localState._entriesPerDir[priceDir] || 0;
           if (!localState._defyCount) localState._defyCount = 0;
 
-          if (defying && dirEntries < 2 && localState._defyCount < 2 && minuteOfDay >= timeToMinutes('11:00')) {
+          // Don't DEFY in a direction where we already won a TREND trade — the move is captured
+          const alreadyWonTrend = (localState._trendWins?.[priceDir] || 0) > 0;
+          const defyMax = 2;
+          if (defying && !alreadyWonTrend && dirEntries < 2 && localState._defyCount < defyMax && minuteOfDay >= timeToMinutes('11:00')) {
             // Price is overpowering gamma — trade with price momentum
             // Find a reasonable target: the next round number in price direction
             const targetStrike = priceDir === 'BEARISH'
@@ -746,7 +804,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // When a big magnet is within 15pts of spot but price has moved 20+ away, breakout
         if (!position && king.magnetStrike && Math.abs(king.magnetDist) <= 15 && king.magnetAbsValue >= 15_000_000) {
           const breakDist = Math.abs(dayMove);
-          if (breakDist >= 20 && minuteOfDay >= timeToMinutes('10:30')) {
+          if (breakDist >= 20 && breakDist <= 60 && minuteOfDay >= timeToMinutes('10:30')) {
             const breakDir = dayMove > 0 ? 'BULLISH' : 'BEARISH';
             const breakTarget = breakDir === 'BULLISH'
               ? Math.round((spot + 20) / 5) * 5
