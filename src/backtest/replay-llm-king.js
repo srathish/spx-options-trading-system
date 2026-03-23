@@ -771,7 +771,10 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
 
       // Daily P&L circuit breaker — stop trading if day loss exceeds -25 pts
       const dailyLossLimit = -25;
-      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit) {
+      // Small-range day suppression: after 11 AM, if day hasn't moved and range is tight, sit flat
+      const dayRange = localState.hod - localState.lod;
+      const tooFlat = minuteOfDay >= 660 && Math.abs(dayMove) < 15 && dayRange < 25;
+      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit && !tooFlat) {
 
         // === MECHANICAL QUALITY SCORE ===
         // Score the setup 0-100. Only setups scoring 70+ go to LLM for confirmation.
@@ -794,9 +797,11 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           localState._breachDown = false;
         }
 
-        // Gate SQUEEZE purely on mechanical breach + squeeze ratio — LLM direction not required
-        // because the LLM will often call BEARISH (following the magnet) during a squeeze UP
-        if ((squeezeConfirmsUp || squeezeConfirmsDown) && llmRegime !== 'CHOP') {
+        // Gate SQUEEZE on breach + squeeze ratio + minimum momentum
+        // The squeeze ratio alone triggers on flat days with no directional energy
+        const squeezeDir2 = squeezeConfirmsUp ? 'BULLISH' : 'BEARISH';
+        const squeezeHasMomentum = (squeezeDir2 === 'BULLISH' && dayMove >= 15) || (squeezeDir2 === 'BEARISH' && dayMove <= -15);
+        if ((squeezeConfirmsUp || squeezeConfirmsDown) && llmRegime !== 'CHOP' && squeezeHasMomentum) {
           const squeezeDir = king.squeezeUp ? 'BULLISH' : 'BEARISH';
           const sqDirEntries = localState._entriesPerDir[squeezeDir] || 0;
           const sqDirLosses = localState._dirLosses[squeezeDir] || 0;
