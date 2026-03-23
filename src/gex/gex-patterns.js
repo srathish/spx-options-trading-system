@@ -17,7 +17,7 @@
 
 import { characterizeAirPocket } from './gex-scorer.js';
 import { getActiveConfig } from '../review/strategy-store.js';
-import { getNodeDwellAnalysis, getStackPersistence, getEffectiveTime, getNetGexRoC } from '../store/state.js';
+import { getNodeDwellAnalysis, getStackPersistence, getEffectiveTime, getNetGexRoC, getGexConviction } from '../store/state.js';
 import { nowET } from '../utils/market-hours.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -875,8 +875,12 @@ function detectMagnetPull(ctx) {
   // Scan tracked walls for growing magnets
   const candidates = [];
 
+  // Also check strike memory conviction for walls that have been growing over the whole day
+  // A wall that grew from -18M to -48M is STABLE in short-term but massive from strike memory
+  const conviction = getGexConviction(spotPrice, 'SPXW');
+  const convictionMinMagnet = cfg.conviction_magnet_pull_min ?? 45;
+
   for (const [strike, trend] of nodeTrends) {
-    if (trend.trend !== 'GROWING') continue; // GROWING only — not NEW (unproven)
     if (trend.currentValue < minValue) continue;
 
     const dist = Math.abs(strike - spotPrice);
@@ -885,11 +889,25 @@ function detectMagnetPull(ctx) {
     // Must be a top-ranked wall (king node or #2-3)
     if (!rankedStrikes.includes(strike)) continue;
 
-    // Require meaningful sustained growth — prefer long-term (30/60 cycle) over short-term
+    // Primary path: wall is actively GROWING in short-term (original logic)
     const longGrowth = trend.changePct30 || 0;
     const shortGrowth = trend.changePct10 || 0;
     const growthPct = longGrowth > 0 ? longGrowth : shortGrowth;
-    if (growthPct < minGrowthPct) continue;
+
+    const isGrowing = trend.trend === 'GROWING' && growthPct >= minGrowthPct;
+
+    // Secondary path: wall is STABLE or just massive, but strike memory confirms
+    // sustained growth over longer timeframe. This catches the "6500 wall went from
+    // -18M to -48M and is now STABLE at -48M" case — the magnet is still pulling.
+    const hasConvictionConfirm = conviction.conviction >= convictionMinMagnet
+      && conviction.dominantStrike === strike;
+
+    // Also allow: wall is simply massive (>$30M) and a top-ranked negative wall below spot
+    // A $40M+ negative wall doesn't need to be growing — it IS the magnet
+    const isMassiveMagnet = trend.currentValue >= (cfg.magnet_pull_massive_value ?? 40_000_000)
+      && (trend.trend === 'STABLE' || trend.trend === 'GROWING');
+
+    if (!isGrowing && !hasConvictionConfirm && !isMassiveMagnet) continue;
 
     const direction = strike > spotPrice ? 'BULLISH' : 'BEARISH';
 
@@ -971,11 +989,15 @@ function detectMagnetPull(ctx) {
   // GEX regime context for MAGNET_PULL:
   // Bearish magnets in deep negative GEX = counter-trend (68% up days when GEX < -30M)
   // Bullish magnets in moderate negative GEX = with-trend (73% up days in -60M to -15M)
+  // EXCEPTION: If strike memory shows sustained conviction, the deep negative GEX IS the
+  // magnet pull — don't penalize a bearish magnet for being in the exact environment it creates
   const mpNetGex = getNetGexRoC('SPXW').current / 1e6;
   const mpDeepNeg = cfg.regime_deep_negative_threshold ?? -30;
   const mpModNegLow = cfg.regime_mod_negative_low ?? -60;
   const mpModNegHigh = cfg.regime_mod_negative_high ?? -15;
-  if (direction === 'BEARISH' && mpNetGex < mpDeepNeg) {
+  const hasStrikeConviction = conviction.conviction >= convictionMinMagnet
+    && conviction.direction === direction;
+  if (direction === 'BEARISH' && mpNetGex < mpDeepNeg && !hasStrikeConviction) {
     confidence = adjustConfidence(confidence, 'downgrade');
   } else if (direction === 'BULLISH' && mpNetGex >= mpModNegLow && mpNetGex < mpModNegHigh) {
     confidence = adjustConfidence(confidence, 'upgrade');
@@ -985,8 +1007,8 @@ function detectMagnetPull(ctx) {
   if (confidence === 'LOW' || confidence === 'MEDIUM') return results;
 
   // Stop: 30% of distance, capped at 5 pts max.
-  // Wide stops (-8 pts) on distant magnets produced outsized losses on immediate reversals
-  // while TM winners (which reach +2 in 2 min) never triggered a 5-pt stop anyway.
+  // Widening for trend days happens at position level (openReplayPosition)
+  // so the pattern always emits a conservative stop.
   const stopDist = Math.min(cfg.magnet_pull_max_stop_pts ?? 5, Math.max(5, best.distance * 0.30));
   const stopStrike = isAbove
     ? Math.round(spotPrice - stopDist)

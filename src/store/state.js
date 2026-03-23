@@ -44,6 +44,13 @@ const NODE_HISTORY_SIZE = 120;
 const kingNodeHistory = { SPXW: [], SPY: [], QQQ: [] };
 const KING_HISTORY_SIZE = 60;
 
+// Strike-level gamma memory — tracks every significant strike's gamma value over time
+// Key: ticker → Map<strike, Array<{value, rawValue, timestamp}>>
+// This lets us see "the 6500 strike went from -18M → -27M → -45M → -95M" over the full day
+const strikeMemory = { SPXW: new Map(), SPY: new Map(), QQQ: new Map() };
+const STRIKE_MEMORY_MAX_READINGS = 400; // Full trading day at 1-min polling
+const STRIKE_MEMORY_MIN_VALUE = 2_000_000; // Only track strikes with >$2M gamma
+
 // GEX regime persistence — tracks consecutive same-direction cycles
 const regimeState = {
   SPXW: { direction: null, startedAt: 0, cycles: 0 },
@@ -131,6 +138,187 @@ export function saveNodeSnapshot(walls, ticker = 'SPXW') {
   while (nodeHistory[ticker].length > NODE_HISTORY_SIZE) {
     nodeHistory[ticker].shift();
   }
+}
+
+/**
+ * Save per-strike gamma values into strike memory.
+ * Called with the full wall list each cycle — remembers every significant strike's gamma over time.
+ * This is the "trader watching each strike change" memory.
+ */
+export function saveStrikeMemory(walls, spot, ticker = 'SPXW') {
+  if (!walls || walls.length === 0) return;
+  const mem = strikeMemory[ticker];
+  if (!mem) return;
+
+  const now = Date.now();
+
+  // Record gamma for every wall with significant value within 150pts of spot
+  for (const w of walls) {
+    if (!w.strike || Math.abs(w.strike - spot) > 150) continue;
+    const absVal = w.absGexValue || Math.abs(w.gexValue || 0);
+    if (absVal < STRIKE_MEMORY_MIN_VALUE) continue;
+
+    if (!mem.has(w.strike)) {
+      mem.set(w.strike, []);
+    }
+    const history = mem.get(w.strike);
+    history.push({ value: absVal, rawValue: w.gexValue || 0, timestamp: now });
+
+    // Trim to max size
+    while (history.length > STRIKE_MEMORY_MAX_READINGS) {
+      history.shift();
+    }
+  }
+}
+
+/**
+ * Get GEX conviction for a direction by analyzing strike memory.
+ * Looks at: how many strikes below/above spot are growing, how consistently, how fast.
+ *
+ * Returns {
+ *   conviction: 0-100 (0 = no signal, 100 = massive sustained growth in one direction),
+ *   direction: 'BEARISH' | 'BULLISH' | null,
+ *   dominantStrike: number (the strike with strongest sustained growth),
+ *   dominantValue: number (current gamma at that strike),
+ *   growthRate: number (% growth of dominant strike over its history),
+ *   growingStrikes: number (count of strikes growing in this direction),
+ *   sustainedCycles: number (how many consecutive cycles the dominant strike has been growing),
+ * }
+ */
+export function getGexConviction(spot, ticker = 'SPXW') {
+  const mem = strikeMemory[ticker];
+  if (!mem || mem.size === 0) return { conviction: 0, direction: null };
+
+  const candidates = []; // { strike, direction, growthPct, sustainedCycles, currentValue, rawValue }
+
+  for (const [strike, history] of mem.entries()) {
+    if (history.length < 5) continue; // need at least 5 readings
+
+    const current = history[history.length - 1];
+    const isBelow = strike < spot;
+    const isNegative = current.rawValue < 0;
+
+    // For bearish conviction: negative walls BELOW spot growing = magnet pulling price down
+    // For bullish conviction: negative walls ABOVE spot growing = magnet pulling price up
+    // (positive walls are resistance, not magnets)
+    const isBearishMagnet = isBelow && isNegative;
+    const isBullishMagnet = !isBelow && isNegative;
+    if (!isBearishMagnet && !isBullishMagnet) continue;
+
+    // Compute sustained growth: how many of the last N readings show value increasing?
+    const lookback = Math.min(history.length, 60); // up to 60 cycles (~60 min at 1 min polling)
+    const recent = history.slice(-lookback);
+
+    let growingCycles = 0;
+    let consecutiveGrowing = 0;
+    let maxConsecutive = 0;
+
+    for (let i = 1; i < recent.length; i++) {
+      if (recent[i].value > recent[i - 1].value * 1.001) { // grew at least 0.1%
+        growingCycles++;
+        consecutiveGrowing++;
+        maxConsecutive = Math.max(maxConsecutive, consecutiveGrowing);
+      } else {
+        consecutiveGrowing = 0;
+      }
+    }
+
+    // Growth from earliest reading to now
+    const earliest = recent[0];
+    const growthPct = earliest.value > 0 ? (current.value - earliest.value) / earliest.value : 0;
+
+    // Growth from 10 cycles ago (shorter term acceleration)
+    const ago10 = history.length >= 11 ? history[history.length - 11] : null;
+    const recentGrowthPct = ago10 && ago10.value > 0
+      ? (current.value - ago10.value) / ago10.value
+      : 0;
+
+    const consistency = lookback > 1 ? growingCycles / (lookback - 1) : 0;
+
+    candidates.push({
+      strike,
+      direction: isBearishMagnet ? 'BEARISH' : 'BULLISH',
+      growthPct,
+      recentGrowthPct,
+      consistency,
+      sustainedCycles: maxConsecutive,
+      currentValue: current.value,
+      rawValue: current.rawValue,
+      distFromSpot: Math.abs(strike - spot),
+    });
+  }
+
+  if (candidates.length === 0) return { conviction: 0, direction: null };
+
+  // Score each candidate: combination of growth %, consistency, and absolute value
+  for (const c of candidates) {
+    c.score =
+      Math.min(c.growthPct, 5) * 20 +         // growth capped at 5x = 100 pts
+      c.consistency * 30 +                      // 30% consistency = 30 pts max
+      Math.min(c.sustainedCycles / 20, 1) * 20 + // sustained growth up to 20 pts
+      Math.min(c.currentValue / 100e6, 1) * 30;  // value up to $100M = 30 pts max
+  }
+
+  // Pick strongest candidate
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+
+  // Count how many strikes are growing in the same direction
+  const growingInDirection = candidates.filter(
+    c => c.direction === best.direction && c.growthPct > 0.1 && c.consistency > 0.3
+  ).length;
+
+  // Final conviction: 0-100
+  const conviction = Math.min(100, Math.round(best.score + growingInDirection * 5));
+
+  return {
+    conviction,
+    direction: best.direction,
+    dominantStrike: best.strike,
+    dominantValue: best.currentValue,
+    dominantRawValue: best.rawValue,
+    growthRate: best.growthPct,
+    recentGrowthRate: best.recentGrowthPct,
+    consistency: best.consistency,
+    growingStrikes: growingInDirection,
+    sustainedCycles: best.sustainedCycles,
+    distFromSpot: best.distFromSpot,
+  };
+}
+
+/**
+ * Check if a specific thesis strike node is still alive (growing or massive stable).
+ * Used by thesis hold: "is the 6500 node I entered on still building?"
+ * Returns { alive: boolean, currentValue, growthFromEntry, trend }
+ */
+export function isThesisNodeAlive(strike, entryValue, ticker = 'SPXW') {
+  const mem = strikeMemory[ticker];
+  if (!mem || !mem.has(strike)) return { alive: false, currentValue: 0 };
+
+  const history = mem.get(strike);
+  if (history.length === 0) return { alive: false, currentValue: 0 };
+
+  const current = history[history.length - 1];
+  const growthFromEntry = entryValue > 0 ? (current.value - entryValue) / entryValue : 0;
+
+  // Node is alive if:
+  // 1. It hasn't shrunk more than 30% from entry value (some decay is ok)
+  // 2. OR it's still massive (>$20M absolute)
+  const notShrunk = current.value >= entryValue * 0.70;
+  const stillMassive = current.value >= 20_000_000;
+  const alive = notShrunk || stillMassive;
+
+  // Trend: compare to 5 readings ago
+  let trend = 'UNKNOWN';
+  if (history.length >= 6) {
+    const prev = history[history.length - 6];
+    const pctChange = prev.value > 0 ? (current.value - prev.value) / prev.value : 0;
+    if (pctChange >= 0.05) trend = 'GROWING';
+    else if (pctChange <= -0.15) trend = 'WEAKENING';
+    else trend = 'STABLE';
+  }
+
+  return { alive, currentValue: current.value, growthFromEntry, trend };
 }
 
 /**
@@ -998,6 +1186,9 @@ export function resetDailyState() {
   dailyLOD = { price: Infinity, timestamp: 0 };
   dailyOpenRange = { open: 0, rangeHigh: 0, rangeLow: 0, maxExcursion: 0, roundTripDetected: false };
   openRangeReadings = 0;
+  strikeMemory.SPXW = new Map();
+  strikeMemory.SPY = new Map();
+  strikeMemory.QQQ = new Map();
 }
 
 /**

@@ -16,10 +16,10 @@ import { checkGexOnlyEntry, checkTrendPullbackEntry } from '../trades/entry-engi
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
 import {
-  resetDailyState, saveGexRead, saveNodeSnapshot, recordScore,
-  updateRegime, getNodeTrends, updateLatestSpot, updateHodLod, getHodLod, setReplayTime, getGexHistory,
-  detectWallTrends, saveKingNode, getNodeSignChanges, getKingNodeFlip,
-  saveStackSnapshot, getStackPersistence,
+  resetDailyState, saveGexRead, saveNodeSnapshot, saveStrikeMemory, getGexConviction,
+  isThesisNodeAlive, recordScore, updateRegime, getNodeTrends, updateLatestSpot,
+  updateHodLod, getHodLod, setReplayTime, getGexHistory, detectWallTrends,
+  saveKingNode, getNodeSignChanges, getKingNodeFlip, saveStackSnapshot, getStackPersistence,
 } from '../store/state.js';
 import { updateNodeTouches, resetNodeTouches, getNodeTouches } from '../gex/node-tracker.js';
 import { initStrategyStore, getActiveConfig, getVersionLabel, setActiveConfigOverride } from '../review/strategy-store.js';
@@ -254,6 +254,7 @@ function replayJsonCycle(frame, state, cfg, isTrinity) {
 
   saveGexRead(spxwParsed, 'SPXW');
   saveNodeSnapshot(spxwWalls, 'SPXW');
+  saveStrikeMemory(spxwWalls, spxwParsed.spotPrice, 'SPXW');
 
   const spxwHistory = getGexHistory('SPXW');
   const spxwWallTrends = spxwHistory.length >= 2 ? detectWallTrends(spxwWalls, spxwHistory) : [];
@@ -496,9 +497,10 @@ function replayJsonCycle(frame, state, cfg, isTrinity) {
 
       if (laneAResult?.shouldEnter) {
         const replayMs = replayTime.toMillis();
+        const conviction = getGexConviction(spxwParsed.spotPrice, 'SPXW');
         const guardrail = checkEntryGates(
           laneAResult.action, scored, multiAnalysis,
-          { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: laneAResult.trigger.pattern, trigger: laneAResult.trigger, trendState: getTrendState() }
+          { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: laneAResult.trigger.pattern, trigger: laneAResult.trigger, trendState: getTrendState(), conviction }
         );
 
         // Daily loss limit: stop trading if cumulative day PnL below threshold
@@ -566,6 +568,7 @@ function replayJsonCycle(frame, state, cfg, isTrinity) {
               timestamp: etTimestamp,
               multiAnalysis,
               replayTime,
+              conviction,
             });
             recordEntryForGates(replayMs, laneAResult.trigger.pattern);
           }
@@ -591,9 +594,10 @@ function replayJsonCycle(frame, state, cfg, isTrinity) {
         );
         if (pullbackResult?.shouldEnter) {
           const replayMs = replayTime.toMillis();
+          const pullbackConviction = getGexConviction(spxwParsed.spotPrice, 'SPXW');
           const guardrail = checkEntryGates(
             pullbackResult.action, scored, multiAnalysis,
-            { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: 'TREND_PULLBACK', trigger: pullbackResult.trigger, trendState: currentTrend }
+            { lane: 'A', timeOverride: replayTime, nowMs: replayMs, pattern: 'TREND_PULLBACK', trigger: pullbackResult.trigger, trendState: currentTrend, conviction: pullbackConviction }
           );
           if (guardrail.allowed) {
             const entryContext = buildEntryContext(pullbackResult.trigger, scored, multiAnalysis);
@@ -666,7 +670,7 @@ function replayJsonCycle(frame, state, cfg, isTrinity) {
 // ---- Position Management ----
 
 function openReplayPosition(state, params) {
-  const { direction, spotPrice, trigger, scored, entryContext, timestamp, multiAnalysis, replayTime } = params;
+  const { direction, spotPrice, trigger, scored, entryContext, timestamp, multiAnalysis, replayTime, conviction } = params;
   const cfg = getActiveConfig() || {};
 
   let stopSpx = trigger.stop_strike;
@@ -689,8 +693,20 @@ function openReplayPosition(state, params) {
   // Clamp stop to max distance after all multipliers
   // Pattern-specific stop caps: MAGNET_PULL benefits from tighter stops (MAE analysis shows
   // winners move immediately, so 3pt captures most wins while cutting stop losses)
+  // EXCEPTION: conviction trades with far targets get wider stops — the pattern already
+  // computed the right stop distance accounting for conviction, don't clamp it back down
   const patternStopKey = `${trigger.pattern.toLowerCase()}_max_stop_pts`;
-  const maxStopDist = cfg[patternStopKey] ?? cfg.position_max_stop_pts ?? cfg.max_stop_distance_pts ?? 6;
+  let maxStopDist = cfg[patternStopKey] ?? cfg.position_max_stop_pts ?? cfg.max_stop_distance_pts ?? 6;
+  // On confirmed trend days with conviction AND a distant target, widen stops.
+  // A 5-pt stop in a 20-pt chop zone before a 50-pt move wastes entries.
+  // Only on trend days — chop days keep the tight stop.
+  if (entryTrendAligned && conviction && conviction.conviction >= (cfg.conviction_min_override ?? 70) && conviction.direction === direction) {
+    const targetDistForStop = trigger.target_strike ? Math.abs(trigger.target_strike - spotPrice) : 0;
+    if (targetDistForStop >= 30) {
+      const trendStopMax = cfg.conviction_trend_max_stop_pts ?? 8;
+      maxStopDist = Math.max(maxStopDist, trendStopMax);
+    }
+  }
   if (maxStopDist > 0 && stopSpx) {
     const finalDist = Math.abs(stopSpx - spotPrice);
     if (finalDist > maxStopDist) {
@@ -791,6 +807,11 @@ function openReplayPosition(state, params) {
     _gexFlipCount: 0,
     _trendMode: false,
     _mlFeatures: mlFeatures,
+    _entryConviction: conviction?.conviction ?? 0,
+    // Thesis target is the TRADE's target strike (where the magnet is), not conviction's dominant.
+    // "I'm holding because the 6500 node is building" — 6500 is the target, not some random growing strike.
+    _entryConvictionTarget: trigger.target_strike ?? conviction?.dominantStrike ?? null,
+    _entryConvictionValue: conviction?.dominantValue ?? 0,
   };
 
   log.info(`ENTRY ${timestamp} | ${direction} @ $${spotPrice.toFixed(2)} via ${trigger.pattern} (${trigger.confidence}) | target=${trigger.target_strike} stop=${stopSpx?.toFixed(2) || '?'}`);
@@ -871,9 +892,24 @@ function evaluateTrendMode(position, scored, replayTime, cfg) {
     position._trendMode = true;
     // Adaptive trail: cap trail so we never risk more than maxLossAllowance from HWM.
     // e.g. HWM=2pts, maxLoss=5 → trail=7, worst case = 2-7 = -5pts (not -10pts with fixed 12)
-    const fixedTrail = cfg.trend_mode_trail_distance_pts ?? 12;
-    const maxLossAllowance = cfg.trend_mode_trail_max_loss_pts ?? 5;
+    let fixedTrail = cfg.trend_mode_trail_distance_pts ?? 12;
+    let maxLossAllowance = cfg.trend_mode_trail_max_loss_pts ?? 5;
     const minTrail = cfg.trend_mode_trail_min_pts ?? 4;
+
+    // Conviction-based trail widening: when the GEX landscape is screaming a direction
+    // and the target is far away, give the trade more room to breathe through pullbacks.
+    // A human trader watching -45M grow to -95M at 6500 wouldn't panic on a 3pt pullback.
+    const entryConviction = position._entryConviction || 0;
+    const targetDist = position.targetSpx ? Math.abs(position.targetSpx - position.entrySpx) : 0;
+    const convictionMinForWide = cfg.conviction_trail_min ?? 50;
+    if (entryConviction >= convictionMinForWide && targetDist >= 20) {
+      // Scale trail based on target distance: 20pt target → 1.5x, 50pt+ → 2x
+      const trailMultiplier = Math.min(2.0, 1.0 + targetDist / 100);
+      fixedTrail = Math.round(fixedTrail * trailMultiplier);
+      maxLossAllowance = Math.round(maxLossAllowance * trailMultiplier);
+      log.info(`Conviction trail: ${entryConviction} conviction, ${targetDist.toFixed(0)}pt target → ${trailMultiplier.toFixed(1)}x trail (${fixedTrail}pt max, ${maxLossAllowance}pt loss allow)`);
+    }
+
     const hwm = position.bestSpxChange > 0 ? position.bestSpxChange : spxProgress;
     const adaptiveTrail = Math.min(fixedTrail, hwm + maxLossAllowance);
     position._trendModeTrailDist = Math.max(adaptiveTrail, minTrail);
@@ -950,10 +986,38 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     }
   }
 
-  // STOP_HIT always checked first — must take precedence over all soft exits.
-  // Without this, a fast gap move can bypass the stop (e.g., NODE_SUPPORT_BREAK
-  // exits at current spot 100+ pts below the stop, causing outsized losses).
-  if (position.stopSpx) {
+  // STOP_HIT — hard price stop.
+  // CONVICTION HOLD: If this is a conviction trade and the thesis node is still building,
+  // REMOVE the price stop entirely. The thesis is "the node is building all day and price
+  // will reach it." A 5-pt bounce doesn't invalidate that — only the node weakening does.
+  // This is how a human trades it: "I see 6500 growing from -18M to -95M. I'm holding
+  // my puts through the chop at 6550 because the magnet keeps getting stronger."
+  const entryConv = position._entryConviction || 0;
+  const thesisTarget = position._entryConvictionTarget;
+  const convictionHoldMin = cfg.conviction_hold_min ?? 60;
+  let thesisHoldActive = false;
+
+  if (entryConv >= convictionHoldMin && thesisTarget) {
+    // Check the SPECIFIC thesis strike, not overall conviction.
+    // "Is the 6500 node I entered on still massive/growing?"
+    const thesisNode = isThesisNodeAlive(thesisTarget, position._entryConvictionValue, 'SPXW');
+    const thesisIntact = thesisNode.alive;
+    const convictionMaxLoss = cfg.conviction_hold_max_loss_pts ?? 10;
+    const withinLossLimit = spxProgress > -convictionMaxLoss;
+
+    if (thesisIntact && withinLossLimit) {
+      thesisHoldActive = true;
+      if (!position._thesisHoldLogged) {
+        log.info(`THESIS HOLD active: ${thesisTarget} node ${(thesisNode.currentValue / 1e6).toFixed(0)}M (${thesisNode.trend}, ${(thesisNode.growthFromEntry * 100).toFixed(0)}% from entry) — price stop DISABLED, max loss ${convictionMaxLoss}pts`);
+        position._thesisHoldLogged = true;
+      }
+    } else if (!thesisIntact && position._thesisHoldLogged) {
+      log.info(`THESIS BROKEN: ${thesisTarget} node ${thesisNode.alive ? 'alive but' : 'weakened to'} ${(thesisNode.currentValue / 1e6).toFixed(0)}M — re-enabling price stop`);
+      position._thesisHoldLogged = false;
+    }
+  }
+
+  if (position.stopSpx && !thesisHoldActive) {
     const stopHit = isBullish
       ? currentSpot <= position.stopSpx
       : currentSpot >= position.stopSpx;
@@ -1014,7 +1078,8 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
   }
 
   // 3. STOP_HIT — exit at stop level (simulates stop-limit order)
-  if (position.stopSpx) {
+  // Thesis hold: same logic as pre-TM stop check — suppress if thesis node still building
+  if (position.stopSpx && !thesisHoldActive) {
     const stopHit = isBullish
       ? currentSpot <= position.stopSpx
       : currentSpot >= position.stopSpx;
@@ -1133,8 +1198,8 @@ function checkReplayExits(position, currentSpot, scored, multiAnalysis, spxwRow,
     if (position.bestSpxChange >= trailActivate) {
       const drawdown = position.bestSpxChange - spxProgress;
       if (drawdown >= trailDistance) {
-        // Use exact trail level as exit price (same as STOP_HIT uses stopSpx).
-        // Without this, 30s gaps produce losses far below the trail stop level.
+        // Trailing stop ALWAYS fires — it protects profits. Thesis hold only disables
+        // the hard STOP_HIT (which is the one that kills entries on small bounces).
         const trailStopProgress = position.bestSpxChange - trailDistance;
         const trailExitPrice = isBullish
           ? position.entrySpx + trailStopProgress

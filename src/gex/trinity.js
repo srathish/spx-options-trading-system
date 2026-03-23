@@ -8,7 +8,7 @@ import { fetchGexData } from './gex-ingester.js';
 import { parseGexResponse, identifyWalls, getGexAtSpot } from './gex-parser.js';
 import { scoreSpxGex } from './gex-scorer.js';
 import { WALL_MIN_INDEX, WALL_MIN_QQQ, MULTI_TICKER } from './constants.js';
-import { saveGexRead, getGexHistory, detectWallTrends, saveNodeSnapshot, getNodeTrends } from '../store/state.js';
+import { saveGexRead, getGexHistory, detectWallTrends, saveNodeSnapshot, saveStrikeMemory, getNodeTrends } from '../store/state.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('Trinity');
@@ -45,6 +45,7 @@ export async function fetchTrinityData() {
       // Save to per-ticker history and compute wall trends
       saveGexRead(parsed, ticker);
       saveNodeSnapshot(walls, ticker);
+      saveStrikeMemory(walls, parsed.spotPrice, ticker);
       const history = getGexHistory(ticker);
       const wallTrends = history.length >= 2 ? detectWallTrends(walls, history) : [];
       const nodeTrends = getNodeTrends(ticker);

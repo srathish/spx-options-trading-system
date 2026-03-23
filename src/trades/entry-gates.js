@@ -58,6 +58,18 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   const now = opts.nowMs || Date.now();
   const timeET = `${String(etNow.hour).padStart(2, '0')}:${String(etNow.minute).padStart(2, '0')}`;
 
+  // GEX conviction override — when strike memory shows sustained directional growth,
+  // allow re-entry even through cooldowns. A human watching the chart would re-enter
+  // when the wall keeps growing after a stop-out.
+  const conviction = opts.conviction || null;
+  const convictionMinOverride = cfg.conviction_min_override ?? 70;
+  const hasConviction = conviction
+    && conviction.conviction >= convictionMinOverride
+    && conviction.direction === direction;
+  if (hasConviction) {
+    log.info(`GEX conviction ${conviction.conviction}: ${conviction.direction} | ${conviction.dominantStrike} @ ${(conviction.dominantValue / 1e6).toFixed(0)}M | growth ${(conviction.growthRate * 100).toFixed(0)}% | ${conviction.growingStrikes} strikes growing`);
+  }
+
   // Gate 0a: Daily P&L circuit breaker.
   // When today's cumulative P&L hits the max daily loss threshold, halt all new entries.
   // Prevents spiraling losses on adverse market days (e.g. 0W/9L days in 60-day backtest).
@@ -147,15 +159,18 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   }
 
   // Gate 3: Consecutive same-direction loss cooldown
+  // OVERRIDE: If GEX conviction is high, the wall is still growing — the thesis didn't fail,
+  // just timing. A human trader would re-enter when they see the magnet getting stronger.
   const cooldownUntil = consecutiveLossCooldownUntil[direction] || 0;
-  if (now < cooldownUntil) {
+  if (now < cooldownUntil && !hasConviction) {
     const remaining = Math.round((cooldownUntil - now) / 60_000);
     return { allowed: false, reason: `Loss cooldown: ${consecutiveLosses[direction]} consecutive ${direction} losses, ${remaining}m remaining` };
   }
 
   // Gate 3b: Same-direction loss cap — after N losses in one direction, require higher confidence
+  // OVERRIDE: High conviction means the GEX landscape is screaming this direction
   const dirLossCap = cfg.direction_loss_cap ?? 3;
-  if (dirLossCap > 0 && consecutiveLosses[direction] >= dirLossCap) {
+  if (dirLossCap > 0 && consecutiveLosses[direction] >= dirLossCap && !hasConviction) {
     const trigger = opts.trigger;
     const conf = trigger?.confidence || 'MEDIUM';
     const requiredConf = cfg.direction_loss_cap_min_confidence ?? 'VERY_HIGH';
@@ -210,9 +225,12 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   }
 
   // Gate 10: Noon dead zone — 12:00-12:59 ET is 22% WR, -68 pts across 60 days
+  // OVERRIDE: Only with very high conviction (80+) — noon chop is the most dangerous time
   const noonBlackoutStart = cfg.noon_blackout_start || '12:00';
   const noonBlackoutEnd = cfg.noon_blackout_end || '13:00';
-  if (cfg.noon_blackout_enabled !== false && timeET >= noonBlackoutStart && timeET < noonBlackoutEnd) {
+  const noonConvictionMin = cfg.conviction_noon_override ?? 90;
+  const hasNoonConviction = conviction && conviction.conviction >= noonConvictionMin && conviction.direction === direction;
+  if (cfg.noon_blackout_enabled !== false && timeET >= noonBlackoutStart && timeET < noonBlackoutEnd && !hasNoonConviction) {
     return { allowed: false, reason: `Noon dead zone: no entries ${noonBlackoutStart}-${noonBlackoutEnd}` };
   }
 
@@ -265,7 +283,9 @@ export function checkEntryGates(action, scored, multiAnalysis, opts = {}) {
   // Gate 17: GEX regime directional gate
   // Data: deep negative GEX (<-30M) = 68% up days → block low-confidence BEARISH entries
   //       positive GEX (>10M) = 60% down days → block low-confidence BULLISH entries
-  if (cfg.regime_gate_enabled !== false) {
+  // OVERRIDE: With conviction, the sustained growth in strike memory confirms the direction
+  // is correct despite the net GEX regime — the walls are actively pulling
+  if (cfg.regime_gate_enabled !== false && !hasConviction) {
     const netGexM = getNetGexRoC('SPXW').current / 1e6;
     const deepNegThreshold = cfg.regime_deep_negative_threshold ?? -30;
     const posThreshold = cfg.regime_positive_threshold ?? 10;
