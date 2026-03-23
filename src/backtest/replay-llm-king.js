@@ -612,7 +612,6 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           if (hit) exitReason = 'TARGET_HIT';
         }
         // Trend-aware dynamic lock: only lock when you've captured 60%+ of the magnet distance
-        // A +25 on a -149 day targeting 80pts away is mid-trade, not a lock situation
         const magnetDist = Math.abs(position.targetStrike - position.entrySpx);
         const capturedPct = magnetDist > 0 ? progress / magnetDist : 1;
         if (!exitReason && position.mfe >= 25 && progress <= 10 && capturedPct >= 0.6) {
@@ -769,12 +768,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
       // Track entries per direction today (max 1 re-entry after stop)
       if (!localState._entriesPerDir) localState._entriesPerDir = { BULLISH: 0, BEARISH: 0 };
 
-      // Daily P&L circuit breaker — stop trading if day loss exceeds -25 pts
+      // Daily P&L circuit breaker
       const dailyLossLimit = -25;
-      // Small-range day suppression: after 11 AM, if day hasn't moved and range is tight, sit flat
+      // Session energy filter: after 11 AM, need dayRange >= 20 OR abs(dayMove) >= 20
+      // Before 11 AM, allow entries — the day hasn't had time to show its hand yet
       const dayRange = localState.hod - localState.lod;
-      const tooFlat = minuteOfDay >= 660 && Math.abs(dayMove) < 15 && dayRange < 25;
-      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit && !tooFlat) {
+      const sessionHasEnergy = minuteOfDay < 660 || dayRange >= 20 || Math.abs(dayMove) >= 20;
+      if (!position && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin && localState._dayPnl > dailyLossLimit && sessionHasEnergy) {
 
         // === MECHANICAL QUALITY SCORE ===
         // Score the setup 0-100. Only setups scoring 70+ go to LLM for confirmation.
@@ -800,7 +800,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         // Gate SQUEEZE on breach + squeeze ratio + minimum momentum
         // The squeeze ratio alone triggers on flat days with no directional energy
         const squeezeDir2 = squeezeConfirmsUp ? 'BULLISH' : 'BEARISH';
-        const squeezeHasMomentum = (squeezeDir2 === 'BULLISH' && dayMove >= 15) || (squeezeDir2 === 'BEARISH' && dayMove <= -15);
+        const squeezeHasMomentum = (squeezeDir2 === 'BULLISH' && dayMove >= 20) || (squeezeDir2 === 'BEARISH' && dayMove <= -20);
         if ((squeezeConfirmsUp || squeezeConfirmsDown) && llmRegime !== 'CHOP' && squeezeHasMomentum) {
           const squeezeDir = king.squeezeUp ? 'BULLISH' : 'BEARISH';
           const sqDirEntries = localState._entriesPerDir[squeezeDir] || 0;
