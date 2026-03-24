@@ -96,9 +96,45 @@ for i in range(20, len(dates)):  # need 20 days lookback
     avg_spy_vol = np.mean(spy_vols_20d) if spy_vols_20d else 1
     vol_ratio = spy_vol / avg_spy_vol if avg_spy_vol > 0 else 1
 
-    # SPY vs QQQ divergence (are they moving together?)
+    # SPY vs QQQ cross-asset relationships
     spy_ret = ((today.get('spy_close') or 0) - (today.get('spy_open') or 0)) / (today.get('spy_open') or 1) * 100
     qqq_ret = ((today.get('qqq_close') or 0) - (today.get('qqq_open') or 0)) / (today.get('qqq_open') or 1) * 100
+    spx_ret = (today['spx_close'] - today['spx_open']) / today['spx_open'] * 100 if today.get('spx_open') else 0
+
+    # Divergence: are SPY and QQQ moving together or apart?
+    spy_qqq_divergence = spy_ret - qqq_ret  # positive = SPY outperforming QQQ (rotation into value)
+    spy_qqq_both_down = 1 if spy_ret < -0.3 and qqq_ret < -0.3 else 0  # broad selloff
+    spy_qqq_both_up = 1 if spy_ret > 0.3 and qqq_ret > 0.3 else 0  # broad rally
+
+    # Previous day cross-asset patterns
+    prev_spy_ret = ((prev1.get('spy_close') or 0) - (prev1.get('spy_open') or 0)) / (prev1.get('spy_open') or 1) * 100 if prev1.get('spy_open') else 0
+    prev_qqq_ret = ((prev1.get('qqq_close') or 0) - (prev1.get('qqq_open') or 0)) / (prev1.get('qqq_open') or 1) * 100 if prev1.get('qqq_open') else 0
+    prev_spy_qqq_div = prev_spy_ret - prev_qqq_ret
+
+    # 5-day correlation: are SPY and QQQ moving together recently?
+    spy_rets_5d = []
+    qqq_rets_5d = []
+    for j in range(1, 6):
+        p = raw[dates[i-j]]
+        if p.get('spy_close') and p.get('spy_open') and p.get('qqq_close') and p.get('qqq_open'):
+            spy_rets_5d.append((p['spy_close'] - p['spy_open']) / p['spy_open'] * 100)
+            qqq_rets_5d.append((p['qqq_close'] - p['qqq_open']) / p['qqq_open'] * 100)
+    if len(spy_rets_5d) >= 3:
+        spy_qqq_corr = float(np.corrcoef(spy_rets_5d, qqq_rets_5d)[0, 1])
+        if np.isnan(spy_qqq_corr): spy_qqq_corr = 0
+    else:
+        spy_qqq_corr = 0
+
+    # QQQ relative strength (is tech leading or lagging?)
+    qqq_rel_strength_1d = prev_qqq_ret - prev_spy_ret
+    qqq_rel_strength_5d = sum(qqq_rets_5d) - sum(spy_rets_5d) if spy_rets_5d else 0
+
+    # Volume divergence (is volume confirming the move?)
+    qqq_vol = today.get('qqq_volume') or 0
+    qqq_vols_20d = [raw[dates[i-j]].get('qqq_volume', 0) or 0 for j in range(1, 21)]
+    avg_qqq_vol = np.mean(qqq_vols_20d) if qqq_vols_20d else 1
+    qqq_vol_ratio = qqq_vol / avg_qqq_vol if avg_qqq_vol > 0 else 1
+    vol_divergence = vol_ratio - qqq_vol_ratio  # SPY vol expanding faster than QQQ = broad move
 
     # Consecutive direction days
     consec_down = 0
@@ -171,6 +207,16 @@ for i in range(20, len(dates)):  # need 20 days lookback
         'pct_from_20d_low': pct_from_20d_low,
         'prev_day_range': ranges_5d[0] if ranges_5d else 0,
         'prev_day_move': raw[dates[i-1]]['spx_close'] - raw[dates[i-1]]['spx_open'] if raw[dates[i-1]].get('spx_close') else 0,
+        # Cross-asset relationships
+        'spy_qqq_divergence': spy_qqq_divergence,
+        'spy_qqq_both_down': spy_qqq_both_down,
+        'spy_qqq_both_up': spy_qqq_both_up,
+        'prev_spy_qqq_div': prev_spy_qqq_div,
+        'spy_qqq_corr_5d': spy_qqq_corr,
+        'qqq_rel_strength_1d': qqq_rel_strength_1d,
+        'qqq_rel_strength_5d': qqq_rel_strength_5d,
+        'qqq_vol_ratio': qqq_vol_ratio,
+        'vol_divergence': vol_divergence,
         # Labels
         'spx_move': spx_move,
         'abs_move': abs_move,
@@ -197,6 +243,11 @@ feature_cols = [
     'consec_down', 'consec_up', 'dow', 'rsi_14',
     'pct_from_20d_high', 'pct_from_20d_low',
     'prev_day_range', 'prev_day_move',
+    # Cross-asset
+    'spy_qqq_divergence', 'spy_qqq_both_down', 'spy_qqq_both_up',
+    'prev_spy_qqq_div', 'spy_qqq_corr_5d',
+    'qqq_rel_strength_1d', 'qqq_rel_strength_5d',
+    'qqq_vol_ratio', 'vol_divergence',
 ]
 
 for target in ['big_move_day', 'trend_day']:
