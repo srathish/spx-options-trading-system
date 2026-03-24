@@ -53,50 +53,75 @@ export async function fetchGexData(symbol = 'SPXW') {
     const decoder = new TextDecoder();
     let collected = '';
     const start = Date.now();
+    let snapshotData = null;
+    let velocityData = null;
 
-    // Read until we get a gex_update or snapshot event, or timeout after 8s
-    while (Date.now() - start < 8000) {
+    // Read until we get both snapshot + velocity, or timeout after 10s
+    while (Date.now() - start < 10000) {
       const { value, done } = await reader.read();
       if (done) break;
       collected += decoder.decode(value, { stream: true });
 
-      // Look for a complete SSE event with GEX data
-      // Events are separated by double newlines: "event: X\ndata: {...}\n\n"
+      // Parse complete SSE events (separated by double newlines)
       const events = collected.split('\n\n');
+      // Keep the last potentially incomplete event in the buffer
+      collected = events.pop() || '';
+
       for (const event of events) {
         const lines = event.trim().split('\n');
         const eventType = lines.find(l => l.startsWith('event:'))?.replace('event:', '').trim();
         const dataLine = lines.find(l => l.startsWith('data:'))?.replace('data:', '').trim();
-
         if (!dataLine) continue;
+
         try {
           const parsed = JSON.parse(dataLine);
 
-          // snapshot_update contains classic format inside .data
+          // snapshot_update: classic GEX format inside .data
           if (eventType === 'snapshot_update' && parsed.data?.CurrentSpot) {
-            reader.cancel();
-            const d = parsed.data;
-            log.debug(`Got data (SSE snapshot): Spot=$${d.CurrentSpot} | ${d.GammaValues?.length || 0} strikes | ${d.Expirations?.length || 0} exp`);
-            return d;
+            snapshotData = parsed.data;
           }
 
-          // Fallback: direct classic format
-          if (parsed.CurrentSpot && parsed.GammaValues) {
-            reader.cancel();
-            log.debug(`Got data (SSE ${eventType}): Spot=$${parsed.CurrentSpot} | ${parsed.GammaValues?.length || 0} strikes`);
-            return parsed;
+          // velocity_update: rate-of-change data for each strike
+          if (eventType === 'velocity_update' && parsed.data?.topRisers) {
+            velocityData = parsed.data;
           }
         } catch (e) {
-          // Not valid JSON yet, keep reading
+          // Incomplete JSON, skip
         }
       }
+
+      // Got snapshot — that's the minimum we need. Velocity is bonus.
+      if (snapshotData) break;
     }
     reader.cancel();
 
-    // If we got here, dump what we collected for debugging
-    log.warn(`SSE stream for ${symbol}: got ${collected.length} bytes but no GEX data found`);
-    log.debug(`SSE events received: ${collected.substring(0, 500)}`);
-    throw new Error(`No GEX data in SSE stream for ${symbol}`);
+    if (!snapshotData) {
+      log.warn(`SSE stream for ${symbol}: no snapshot_update received in 10s`);
+      throw new Error(`No GEX data in SSE stream for ${symbol}`);
+    }
+
+    // Attach velocity data to the snapshot for downstream use
+    if (velocityData) {
+      snapshotData._velocity = {
+        topRisers: (velocityData.topRisers || []).slice(0, 10).map(r => ({
+          strike: r.strike, value: r.currentValue,
+          delta1m: r.delta1Min, delta5m: r.delta5Min, delta15m: r.delta15Min, delta1h: r.delta1Hour,
+          pct1m: r.percent1Min, pct5m: r.percent5Min, pct15m: r.percent15Min, pct1h: r.percent1Hour,
+          velocity: r.velocity, trend: r.trend,
+        })),
+        topFallers: (velocityData.topFallers || []).slice(0, 10).map(r => ({
+          strike: r.strike, value: r.currentValue,
+          delta1m: r.delta1Min, delta5m: r.delta5Min, delta15m: r.delta15Min, delta1h: r.delta1Hour,
+          pct1m: r.percent1Min, pct5m: r.percent5Min, pct15m: r.percent15Min, pct1h: r.percent1Hour,
+          velocity: r.velocity, trend: r.trend,
+        })),
+        timestamp: velocityData.timestamp,
+      };
+      log.debug(`Got velocity: ${velocityData.topRisers?.length || 0} risers, ${velocityData.topFallers?.length || 0} fallers`);
+    }
+
+    log.debug(`Got data (SSE snapshot): Spot=$${snapshotData.CurrentSpot} | ${snapshotData.GammaValues?.length || 0} strikes | ${snapshotData.Expirations?.length || 0} exp`);
+    return snapshotData;
   }
 
   // Handle regular JSON response (legacy)

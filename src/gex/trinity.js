@@ -39,6 +39,8 @@ export async function fetchTrinityData() {
     try {
       const raw = await fetchGexData(ticker);
       const parsed = parseGexResponse(raw);
+      // Attach velocity data from SSE stream (rate-of-change for each strike)
+      if (raw._velocity) parsed._velocity = raw._velocity;
       const walls = identifyWalls(parsed);
       parsed.walls = walls;
 

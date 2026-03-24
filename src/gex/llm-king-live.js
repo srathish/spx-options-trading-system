@@ -389,7 +389,7 @@ function findKingNode(parsed) {
 }
 
 // ---- Build snapshot for LLM ----
-function buildLiveSnapshot(king, spot, spyKing, qqqKing, position) {
+function buildLiveSnapshot(king, spot, spyKing, qqqKing, position, velocity) {
   const et = nowET();
   const { kingHistory, hod, lod, openPrice } = dailyState;
 
@@ -428,6 +428,15 @@ function buildLiveSnapshot(king, spot, spyKing, qqqKing, position) {
     opening_gamma: dailyState.openingGamma ? `${(dailyState.openingGamma / 1e6).toFixed(0)}M at open — ${dailyState.openingGamma >= 80_000_000 ? 'HIGH gamma = dealers positioned, watch for squeezes' : 'LOW gamma = less dealer positioning, directional moves expected'}` : 'not yet captured',
     vix: dailyState.vix ? `${dailyState.vix.level} (${dailyState.vix.regime})${dailyState.vix.prevClose ? ` — prev close ${dailyState.vix.prevClose}, change ${dailyState.vix.level > dailyState.vix.prevClose ? '+' : ''}${((dailyState.vix.level - dailyState.vix.prevClose) / dailyState.vix.prevClose * 100).toFixed(1)}%` : ''}. ${dailyState.vix.regime === 'HIGH' || dailyState.vix.regime === 'EXTREME' ? 'HIGH VIX = macro-driven, bigger moves, be skeptical of squeezes and trust TREND/DEFY over pins' : 'Normal VIX = gamma-driven, trust GEX signals'}` : 'not available',
     morning_trend_score: dailyState.trendScore ? `${dailyState.trendScore.score} (${dailyState.trendScore.regime}) — ${dailyState.trendScore.regime === 'TREND_LIKELY' ? 'ML predicts big move today, trade aggressively with TREND/DEFY' : dailyState.trendScore.regime === 'CHOP_LIKELY' ? 'ML predicts chop, reduce entries or sit out' : 'normal day, use standard rules'}` : 'not yet scored',
+    gamma_velocity: velocity ? (() => {
+      const risers = (velocity.topRisers || []).slice(0, 3).map(r =>
+        `${r.strike} ${r.trend} +${(r.pct15m || 0).toFixed(0)}%/15m vel=${(r.velocity/1e6).toFixed(1)}M`
+      ).join(' | ');
+      const fallers = (velocity.topFallers || []).slice(0, 3).map(r =>
+        `${r.strike} ${r.trend} ${(r.pct15m || 0).toFixed(0)}%/15m vel=${(r.velocity/1e6).toFixed(1)}M`
+      ).join(' | ');
+      return `GROWING: ${risers || 'none'}. SHRINKING: ${fallers || 'none'}. Fast-growing nodes = strong conviction, shrinking nodes = thesis dying.`;
+    })() : 'not available',
     day_move: Math.round(dayMove),
     hod: Math.round(hod), lod: Math.round(lod),
     spy_magnet: spyKing ? `${spyKing.strike} (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -573,7 +582,7 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
   // Build snapshot and call LLM
   const spyKing = multiAnalysis?.king_nodes?.SPY || null;
   const qqqKing = multiAnalysis?.king_nodes?.QQQ || null;
-  const snapshot = buildLiveSnapshot(king, spot, spyKing, qqqKing, currentPosition);
+  const snapshot = buildLiveSnapshot(king, spot, spyKing, qqqKing, currentPosition, parsed._velocity);
 
   log.info(`LLM call: spot=$${Math.round(spot)} | king=${king.strike} ${(king.value/1e6).toFixed(1)}M | ${king.regime} regime`);
 
