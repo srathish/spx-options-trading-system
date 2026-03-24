@@ -37,7 +37,7 @@ export const dashboardEmitter = new EventEmitter();
 
 // ---- Server state ----
 
-let httpServer = null;y6
+let httpServer = null;
 let wss = null;
 
 // In-memory chat history (resets on restart)

@@ -1,7 +1,9 @@
 // Heatseeker API
 export const HEATSEEKER_BASE = 'https://app.skylit.ai';
-export const DATA_API = (symbol) =>
-  `${HEATSEEKER_BASE}/api/data?symbol=${encodeURIComponent(symbol)}&nocache=${Math.random()}`;
+// Old endpoint (deprecated): /api/data?symbol=X
+// New endpoint: /api/stream?symbol=X&token=JWT&max_strikes=200&max_expirations=1
+export const DATA_API = (symbol, token) =>
+  `${HEATSEEKER_BASE}/api/stream?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(token)}&max_strikes=200&max_expirations=1`;
 
 // GEX scoring thresholds (per-expiration values, NOT aggregated)
 export const WALL_MIN_INDIVIDUAL = 500_000;   // $500K for individual stocks
