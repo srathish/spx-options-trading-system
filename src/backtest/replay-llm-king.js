@@ -15,8 +15,17 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { DateTime } from 'luxon';
 import { parseGexResponse } from '../gex/gex-parser.js';
+import { loadModel, predict, buildFeatureVector } from '../ml/xgb-scorer.js';
 import OpenAI from 'openai';
 import 'dotenv/config';
+
+// ---- ML Model ----
+let mlModel = null;
+try {
+  mlModel = loadModel('data/ml-model-trees.json');
+} catch (e) {
+  // ML model optional — system works without it
+}
 
 // ---- Config ----
 
@@ -505,10 +514,15 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
   const eodMin = timeToMinutes(CONFIG.eod_exit_time);
 
   // Simulated position — may inherit a 1DTE carry from previous day
+  // Lane A: rule-based entries (existing logic)
   let position = carryPosition ? { ...carryPosition, _carriedOver: true } : null;
   if (position && verbose) {
     console.log(`  CARRY-IN | ${position.direction} ${position.mode} from ${position.openedAt} | entry=$${Math.round(position.entrySpx)} | MFE=${position.mfe} | 1DTE overnight`);
   }
+  // Lane B: ML-driven entries (independent position slot)
+  let mlPosition = null;
+  let mlEntriesPerDir = { BULLISH: 0, BEARISH: 0 };
+  let mlDirLosses = { BULLISH: 0, BEARISH: 0 };
   const trades = [];
 
   for (let i = 0; i < frames.length; i++) {
@@ -692,6 +706,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
           : Math.round(progress * 100) / 100;
         trades.push({
           mode: position.mode || 'TREND',
+          lane: 'A',
           direction: position.direction,
           entrySpx: position.entrySpx,
           exitSpx: spot,
@@ -730,6 +745,56 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
           console.log(`  EXIT  ${etStr} | ${position.direction} ${exitReason} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(2)} pts | dayPnl=${localState._dayPnl.toFixed(1)} | ${tag}`);
         }
         position = null;
+      }
+    }
+
+    // ---- Lane B (ML) position management ----
+    if (mlPosition) {
+      const isBull = mlPosition.direction === 'BULLISH';
+      const progress = isBull ? spot - mlPosition.entrySpx : mlPosition.entrySpx - spot;
+      if (progress > mlPosition.mfe) mlPosition.mfe = progress;
+      if (progress < mlPosition.mae) mlPosition.mae = progress;
+
+      let mlExit = null;
+      const mlIs1DTE = mlPosition.expiry === '1DTE';
+      const mlMaxLoss = mlIs1DTE ? CONFIG.dte1_max_loss_pts : CONFIG.max_loss_pts;
+
+      // Target hit (magnet reached)
+      if (mlPosition.targetStrike) {
+        const hit = isBull ? spot >= mlPosition.targetStrike - CONFIG.target_proximity_pts
+          : spot <= mlPosition.targetStrike + CONFIG.target_proximity_pts;
+        if (hit) mlExit = 'TARGET_HIT';
+      }
+      // Trailing lock: only after significant MFE, and give room to breathe
+      if (!mlExit && mlPosition.mfe >= 20 && progress <= Math.max(5, mlPosition.mfe * 0.15)) {
+        mlExit = 'ML_LOCK';
+      }
+      // Max loss
+      if (!mlExit && progress <= -mlMaxLoss) mlExit = 'MAX_LOSS';
+      // EOD close (0DTE only)
+      if (!mlIs1DTE && !mlExit && minuteOfDay >= eodMin) mlExit = 'EOD_CLOSE';
+
+      if (mlExit) {
+        const mlPnl = mlExit === 'MAX_LOSS' ? -mlMaxLoss : Math.round(progress * 100) / 100;
+        trades.push({
+          mode: 'ML_' + (mlPosition._mlMode || 'TREND'),
+          lane: 'B',
+          direction: mlPosition.direction,
+          entrySpx: mlPosition.entrySpx, exitSpx: spot,
+          targetStrike: mlPosition.targetStrike, pnl: mlPnl,
+          exitReason: mlExit, openedAt: mlPosition.openedAt,
+          closedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+          mfe: Math.round(mlPosition.mfe * 100) / 100,
+          mae: Math.round(mlPosition.mae * 100) / 100,
+          expiry: mlPosition.expiry || '0DTE',
+          _mlScore: mlPosition._mlScore,
+        });
+        if (mlPnl <= 0) mlDirLosses[mlPosition.direction]++;
+        if (verbose) {
+          const tag = mlPnl > 0 ? 'WIN' : 'LOSS';
+          console.log(`  ML-EXIT ${etStr} | ${mlPosition.direction} ${mlExit} | ${mlPnl > 0 ? '+' : ''}${mlPnl.toFixed(2)} pts | ${tag} [Lane B]`);
+        }
+        mlPosition = null;
       }
     }
 
@@ -813,6 +878,45 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
 
       // Track entries per direction today (max 1 re-entry after stop)
       if (!localState._entriesPerDir) localState._entriesPerDir = { BULLISH: 0, BEARISH: 0 };
+
+      // ==== LANE B: ML-DRIVEN ENTRY ====
+      // The ML model scores every LLM call for profitable setup probability.
+      // When ML >= 0.5 and no position, enter in the direction of the best magnet.
+      if (mlModel && !mlPosition && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin) {
+        const mlFV = buildFeatureVector(king, spot, localState, llmResult, minuteOfDay, { priceTrend10: 0, priceTrend30: priceTrend30 });
+        const mlScore = predict(mlModel, mlFV);
+
+        if (mlScore >= 0.5) {
+          // Find best magnet for direction
+          const bestMag = king.bearMagnet && king.bullMagnet
+            ? (king.bearMagnet.absValue > king.bullMagnet.absValue ? king.bearMagnet : king.bullMagnet)
+            : king.bearMagnet || king.bullMagnet;
+          if (bestMag) {
+            const mlDir = bestMag.dist < 0 ? 'BEARISH' : 'BULLISH';
+            const mlDirEntries = mlEntriesPerDir[mlDir] || 0;
+            const mlDirLoss = mlDirLosses[mlDir] || 0;
+
+            // Max 2 entries per direction, stop after 1 loss in direction
+            if (mlDirEntries < 2 && mlDirLoss < 1) {
+              const mlMagnetDist = Math.abs(bestMag.dist);
+              const dayMove = spot - localState.openPrice;
+              const use1DTE = shouldUse1DTE('TREND', dayMove, mlMagnetDist, king.regime, minuteOfDay);
+              mlPosition = {
+                direction: mlDir,
+                entrySpx: spot,
+                targetStrike: bestMag.strike,
+                openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+                mfe: 0, mae: 0,
+                _mlScore: mlScore,
+                _mlMode: mlMagnetDist >= 40 ? 'TREND' : 'BREAKOUT',
+                expiry: use1DTE ? '1DTE' : '0DTE',
+              };
+              mlEntriesPerDir[mlDir]++;
+              if (verbose) console.log(`  ML-ENTER ${etStr} | ${mlDir} ML=${mlScore.toFixed(2)} @ $${Math.round(spot)} → ${bestMag.strike} (${mlMagnetDist.toFixed(0)}pts) [Lane B]`);
+            }
+          }
+        }
+      }
 
       // Daily P&L circuit breaker
       const dailyLossLimit = -25;
@@ -974,7 +1078,16 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
 
             // Hard squeeze gate: NEVER enter TREND against an active squeeze
             const squeezeBlocsTrend = (dir === 'BEARISH' && king.squeezeUp) || (dir === 'BULLISH' && king.squeezeDown);
-            if ((llmConfirms || qualityOverride || superQuality) && !squeezeBlocsTrend) {
+            // ML gate: check if model thinks this is a profitable setup
+            let mlScore = null;
+            let mlBlocks = false;
+            if (mlModel) {
+              const llmEnc = { direction: dir, confidence: llmConf === 'HIGH' ? 'HIGH' : 'MEDIUM', regime: llmRegime, action: 'ENTER' };
+              const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay);
+              mlScore = predict(mlModel, fv);
+              mlBlocks = mlScore < 0.30; // block clearly bad setups (saves ~24 pts)
+            }
+            if ((llmConfirms || qualityOverride || superQuality) && !squeezeBlocsTrend && !mlBlocks) {
               const use1DTE = shouldUse1DTE('TREND', dayMove, dist, king.regime, minuteOfDay);
               position = {
                 mode: 'TREND',
@@ -985,12 +1098,14 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
                 entryMinute: minuteOfDay,
                 mfe: 0, mae: 0, llmSaysExit: false,
                 _quality: quality,
+                _mlScore: mlScore,
                 expiry: use1DTE ? '1DTE' : '0DTE',
               };
               localState._entriesPerDir[dir]++;
-              if (verbose) console.log(`  ENTER ${etStr} | ${dir} Q=${quality} @ $${Math.round(spot)} → ${bestMagnet.strike} (${dist.toFixed(0)}pts, ${fmtVal(bestMagnet.value)}) LLM=${llmRegime}`);
+              if (verbose) console.log(`  ENTER ${etStr} | ${dir} Q=${quality} ML=${mlScore?.toFixed(2) || '?'} @ $${Math.round(spot)} → ${bestMagnet.strike} (${dist.toFixed(0)}pts, ${fmtVal(bestMagnet.value)}) LLM=${llmRegime}`);
             } else if (verbose) {
-              console.log(`  BLOCKED by LLM: ${llmRegime} ${llmConf} (need HIGH + not CHOP)`);
+              const reason = mlBlocks ? `ML score ${mlScore?.toFixed(2)} < 0.25` : `${llmRegime} ${llmConf} (need HIGH + not CHOP)`;
+              console.log(`  BLOCKED: ${reason}`);
             }
           }
         }
@@ -1029,6 +1144,13 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
             const defyDist = Math.abs(targetStrike - spot);
 
             if (defyDist >= 20 && defyDist <= 60) {
+              // ML gate for DEFY
+              let defyMlScore = null;
+              if (mlModel) {
+                const llmEnc = { direction: priceDir, confidence: 'HIGH', regime: 'TREND', action: 'ENTER' };
+                const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay);
+                defyMlScore = predict(mlModel, fv);
+              }
               const use1DTE = shouldUse1DTE('DEFY', dayMove, defyDist, king.regime, minuteOfDay);
               position = {
                 mode: 'DEFY',
@@ -1037,6 +1159,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
                 targetStrike,
                 openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
                 mfe: 0, mae: 0, llmSaysExit: false,
+                _mlScore: defyMlScore,
                 _defyStop: use1DTE ? 20 : 15,
                 expiry: use1DTE ? '1DTE' : '0DTE',
               };
@@ -1193,6 +1316,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
       // 0DTE or 1DTE already carried (day 2) — force close
       trades.push({
         mode: position.mode || 'TREND',
+        lane: 'A',
         direction: position.direction, entrySpx: position.entrySpx, exitSpx: lastSpot,
         targetStrike: position.targetStrike, pnl, exitReason: position._carriedOver ? 'DTE1_EOD' : 'EOD_FORCE',
         openedAt: position.openedAt, closedAt: 'EOD', mfe: Math.round(position.mfe * 100) / 100,
@@ -1201,6 +1325,26 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
       });
     }
     position = null;
+  }
+
+  // Force close Lane B position at EOD
+  if (mlPosition) {
+    const lastSpxw = isTrinity ? frames[frames.length - 1]?.tickers?.SPXW : frames[frames.length - 1];
+    const lastSpot = lastSpxw?.spotPrice || mlPosition.entrySpx;
+    const isBull = mlPosition.direction === 'BULLISH';
+    const pnl = Math.round((isBull ? lastSpot - mlPosition.entrySpx : mlPosition.entrySpx - lastSpot) * 100) / 100;
+    trades.push({
+      mode: 'ML_' + (mlPosition._mlMode || 'TREND'),
+      lane: 'B',
+      direction: mlPosition.direction, entrySpx: mlPosition.entrySpx, exitSpx: lastSpot,
+      targetStrike: mlPosition.targetStrike, pnl, exitReason: 'EOD_CLOSE',
+      openedAt: mlPosition.openedAt, closedAt: 'EOD',
+      mfe: Math.round(mlPosition.mfe * 100) / 100,
+      mae: Math.round(mlPosition.mae * 100) / 100,
+      expiry: mlPosition.expiry || '0DTE',
+      _mlScore: mlPosition._mlScore,
+    });
+    mlPosition = null;
   }
 
   // ---- Scoring ----
@@ -1342,6 +1486,26 @@ async function main() {
       console.log(`  1DTE  ${dte1Trades.length} trades (${d1w}W/${d1l}L) | NET: ${d1p > 0 ? '+' : ''}${d1p.toFixed(2)} pts`);
       for (const t of dte1Trades) {
         console.log(`    ${t.openedAt} → ${t.closedAt} | ${t.direction} ${t.mode} | ${t.pnl > 0 ? '+' : ''}${t.pnl.toFixed(2)} pts | ${t.exitReason}`);
+      }
+    }
+
+    // Lane breakdown
+    const laneA = allTrades.filter(t => t.lane === 'A' || !t.lane);
+    const laneB = allTrades.filter(t => t.lane === 'B');
+    if (laneB.length > 0) {
+      const aw = laneA.filter(t => t.pnl > 0).length, al = laneA.filter(t => t.pnl <= 0).length;
+      const ap = laneA.reduce((s, t) => s + t.pnl, 0);
+      const bw = laneB.filter(t => t.pnl > 0).length, bl = laneB.filter(t => t.pnl <= 0).length;
+      const bp = laneB.reduce((s, t) => s + t.pnl, 0);
+      console.log('\nLane breakdown:');
+      console.log(`  Lane A (Rules) ${laneA.length} trades (${aw}W/${al}L) | NET: ${ap > 0 ? '+' : ''}${ap.toFixed(2)} pts | WR: ${laneA.length > 0 ? (aw/laneA.length*100).toFixed(0) : 0}%`);
+      console.log(`  Lane B (ML)    ${laneB.length} trades (${bw}W/${bl}L) | NET: ${bp > 0 ? '+' : ''}${bp.toFixed(2)} pts | WR: ${laneB.length > 0 ? (bw/laneB.length*100).toFixed(0) : 0}%`);
+      console.log(`  COMBINED       ${allTrades.length} trades | NET: ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(2)} pts`);
+      if (laneB.length <= 30) {
+        console.log('\n  Lane B trades:');
+        for (const t of laneB) {
+          console.log(`    ${t.openedAt} → ${t.closedAt} | ${t.direction} ${t.mode} | ML=${t._mlScore?.toFixed(2) || '?'} | ${t.pnl > 0 ? '+' : ''}${t.pnl.toFixed(2)} pts | ${t.exitReason}`);
+        }
       }
     }
   }
