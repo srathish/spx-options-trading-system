@@ -29,6 +29,7 @@ import { checkGexOnlyEntry, checkLaneBEntry, checkTrendPullbackEntry } from '../
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
+import { runLlmKingCycle, resetLlmKingDaily } from '../gex/llm-king-live.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
 import { getSignalSnapshot } from '../tv/tv-signal-store.js';
 import { getSchedulePhase, isOpeningSummaryTime, isEodRecapTime, nowET, formatET } from '../utils/market-hours.js';
@@ -444,6 +445,18 @@ async function runCycle(phase) {
       const nodeSignChanges = getNodeSignChanges('SPXW');
       const kingNodeFlip = getKingNodeFlip('SPXW');
       detectedPatterns = detectAllPatterns(scored, parsed, multiAnalysis, getNodeTouches(), trinityState?.spxw?.nodeTrends, getCurrentPosition()?.direction || null, nodeSignChanges, kingNodeFlip);
+
+      // LLM King Node analysis — runs every 10 cycles, adds patterns to the list
+      try {
+        const llmPatterns = await runLlmKingCycle(parsed, scored, multiAnalysis, getCurrentPosition());
+        if (llmPatterns && llmPatterns.length > 0) {
+          detectedPatterns = [...detectedPatterns, ...llmPatterns];
+          log.info(`LLM King Node: ${llmPatterns.map(p => `${p.pattern}(${p.direction} ${p.confidence})`).join(', ')}`);
+        }
+      } catch (llmErr) {
+        log.error(`LLM King error: ${llmErr.message}`);
+      }
+
       if (detectedPatterns.length > 0) {
         log.info(`Patterns: ${detectedPatterns.map(p => `${p.pattern}(${p.direction})`).join(', ')}`);
         try { dashboardEmitter.emit('patterns_detected', detectedPatterns); } catch (_) {}
@@ -1023,6 +1036,7 @@ function scheduleDailyReset() {
     resetNodeTouches();
     resetDailyState();
     resetDailyGates();
+    resetLlmKingDaily();
     resetTrendDetector();
     dailyCycleIndex = 0;
     lastSpot = null; // Clear stale spot from previous session
