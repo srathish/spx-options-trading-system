@@ -59,7 +59,8 @@ async function fetchVixOpen() {
 // Price-based ML model (500 days training, AUC 0.803 OOS).
 // Predicts "is today a 40+ pt trend day?" from prior price action.
 // Fetched once at morning alongside VIX.
-import { loadModel as loadXgbModel, predict as xgbPredict } from '../ml/xgb-scorer.js';
+import { loadModel as loadXgbModel, predict as xgbPredict, buildFeatureVector } from '../ml/xgb-scorer.js';
+import Database from 'better-sqlite3';
 
 let trendModel = null;
 try {
@@ -67,6 +68,46 @@ try {
   log.info(`Trend model loaded: ${trendModel.trees.length} trees`);
 } catch (e) {
   log.warn('Trend model not found — morning score unavailable');
+}
+
+// ---- ML Lane B (GEX entry model) ----
+let gexModel = null;
+try {
+  gexModel = loadXgbModel('data/ml-model-trees.json');
+  log.info(`GEX ML model loaded: ${gexModel.trees.length} trees`);
+} catch (e) {
+  log.warn('GEX ML model not found — Lane B phantom unavailable');
+}
+
+// Lane B phantom state
+let mlPhantom = null;  // { direction, entrySpx, targetStrike, openedAt, mfe, mae, mlScore }
+let mlPhantomTrades = [];
+
+// Ensure phantom_ml table exists
+try {
+  const db = new Database('./data/spx-bot.db');
+  db.exec(`CREATE TABLE IF NOT EXISTS phantom_ml (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction TEXT, entry_spx REAL, exit_spx REAL, target_strike REAL,
+    pnl REAL, exit_reason TEXT, ml_score REAL,
+    opened_at TEXT, closed_at TEXT, mfe REAL, mae REAL
+  )`);
+  db.close();
+} catch (e) { /* table may already exist */ }
+
+function logMlPhantomTrade(trade) {
+  try {
+    const db = new Database('./data/spx-bot.db');
+    db.prepare(`INSERT INTO phantom_ml (direction, entry_spx, exit_spx, target_strike, pnl, exit_reason, ml_score, opened_at, closed_at, mfe, mae)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      trade.direction, trade.entrySpx, trade.exitSpx, trade.targetStrike,
+      trade.pnl, trade.exitReason, trade.mlScore,
+      trade.openedAt, trade.closedAt, trade.mfe, trade.mae
+    );
+    db.close();
+  } catch (e) {
+    log.warn(`Failed to log ML phantom: ${e.message}`);
+  }
 }
 
 let cachedTrendScore = null;
@@ -468,6 +509,44 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
   dailyState.prevPosWalls = posWallsNow.sort((a, b) => b.value - a.value).slice(0, 3);
   dailyState.prevSpot = spot;
 
+  // ---- Lane B phantom: manage open position every cycle ----
+  if (mlPhantom) {
+    const isBull = mlPhantom.direction === 'BULLISH';
+    const progress = isBull ? spot - mlPhantom.entrySpx : mlPhantom.entrySpx - spot;
+    if (progress > mlPhantom.mfe) mlPhantom.mfe = progress;
+    if (progress < mlPhantom.mae) mlPhantom.mae = progress;
+
+    let exitReason = null;
+    // Target hit
+    if (mlPhantom.targetStrike) {
+      const hit = isBull ? spot >= mlPhantom.targetStrike - 8 : spot <= mlPhantom.targetStrike + 8;
+      if (hit) exitReason = 'TARGET_HIT';
+    }
+    // Trailing lock
+    if (!exitReason && mlPhantom.mfe >= 20 && progress <= Math.max(5, mlPhantom.mfe * 0.15)) {
+      exitReason = 'ML_LOCK';
+    }
+    // Max loss
+    if (!exitReason && progress <= -12) exitReason = 'MAX_LOSS';
+    // EOD
+    const minuteNow = et.hour * 60 + et.minute;
+    if (!exitReason && minuteNow >= 945) exitReason = 'EOD_CLOSE';
+
+    if (exitReason) {
+      const pnl = exitReason === 'MAX_LOSS' ? -12 : Math.round(progress * 100) / 100;
+      const trade = {
+        direction: mlPhantom.direction, entrySpx: mlPhantom.entrySpx, exitSpx: spot,
+        targetStrike: mlPhantom.targetStrike, pnl, exitReason, mlScore: mlPhantom.mlScore,
+        openedAt: mlPhantom.openedAt, closedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+        mfe: Math.round(mlPhantom.mfe * 100) / 100, mae: Math.round(mlPhantom.mae * 100) / 100,
+      };
+      logMlPhantomTrade(trade);
+      const tag = pnl > 0 ? 'WIN' : 'LOSS';
+      log.info(`[PHANTOM-B] EXIT ${mlPhantom.direction} ${exitReason} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(2)} pts | ML=${mlPhantom.mlScore.toFixed(2)} | ${tag}`);
+      mlPhantom = null;
+    }
+  }
+
   // Only call LLM every N cycles
   cycleCount++;
   if (cycleCount % LLM_CALL_INTERVAL !== 0) {
@@ -534,6 +613,54 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
     }
   }
 
+  // ---- Lane B phantom: ML entry check ----
+  if (gexModel && !mlPhantom && minuteOfDay >= 590 && minuteOfDay <= 900) {
+    const overrides = {
+      priceTrend10: 0, priceTrend30: 0,
+      spyKingAgrees: 0, spyKingIsNegative: spyKing ? (spyKing.value < 0 ? 1 : 0) : -1,
+      spyMagnetDist: spyKing ? Math.abs(spyKing.dist) : 50,
+      qqqKingAgrees: 0, qqqKingIsNegative: qqqKing ? (qqqKing.value < 0 ? 1 : 0) : -1,
+      qqqMagnetDist: qqqKing ? Math.abs(qqqKing.dist) : 50,
+      trinityAlignment: 0, trinityAllAgree: 0,
+    };
+
+    // Compute cross-asset agreement
+    const bestMag = king.bearMagnet && king.bullMagnet
+      ? (king.bearMagnet.absValue > king.bullMagnet.absValue ? king.bearMagnet : king.bullMagnet)
+      : king.bearMagnet || king.bullMagnet;
+    if (bestMag) {
+      const tradeDir = bestMag.dist < 0 ? -1 : 1;
+      const spyDir = spyKing ? (spyKing.value < 0 ? (spyKing.dist < 0 ? -1 : 1) : 0) : 0;
+      const qqqDir = qqqKing ? (qqqKing.value < 0 ? (qqqKing.dist < 0 ? -1 : 1) : 0) : 0;
+      overrides.spyKingAgrees = spyDir !== 0 && spyDir === tradeDir ? 1 : 0;
+      overrides.qqqKingAgrees = qqqDir !== 0 && qqqDir === tradeDir ? 1 : 0;
+      const alignment = 1 + overrides.spyKingAgrees + overrides.qqqKingAgrees;
+      overrides.trinityAlignment = alignment;
+      overrides.trinityAllAgree = alignment === 3 ? 1 : 0;
+
+      const mlFV = buildFeatureVector(king, spot, dailyState, llmResult, minuteOfDay, overrides);
+      const mlScore = xgbPredict(gexModel, mlFV);
+
+      // Hard gate: don't enter against day direction
+      const mlDir = bestMag.dist < 0 ? 'BEARISH' : 'BULLISH';
+      const fightingDay = (mlDir === 'BULLISH' && dayMove < -35) || (mlDir === 'BEARISH' && dayMove > 35);
+
+      if (mlScore >= 0.5 && !fightingDay) {
+        mlPhantom = {
+          direction: mlDir,
+          entrySpx: spot,
+          targetStrike: bestMag.strike,
+          openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
+          mfe: 0, mae: 0,
+          mlScore,
+        };
+        log.info(`[PHANTOM-B] ENTER ${mlDir} ML=${mlScore.toFixed(2)} @ $${Math.round(spot)} → ${bestMag.strike} (${Math.abs(bestMag.dist).toFixed(0)}pts)`);
+      } else if (mlScore >= 0.5 && fightingDay) {
+        log.debug(`[PHANTOM-B] BLOCKED ${mlDir} ML=${mlScore.toFixed(2)} | FIGHTING_DAY (dayMove=${dayMove.toFixed(0)})`);
+      }
+    }
+  }
+
   lastLlmResult = patterns;
   return patterns;
 }
@@ -557,5 +684,6 @@ export function resetLlmKingDaily() {
   };
   vixFetchDate = null;  // force re-fetch on next day
   trendScoreDate = null;
+  mlPhantom = null;  // close any open phantom
   log.info('Daily state reset');
 }
