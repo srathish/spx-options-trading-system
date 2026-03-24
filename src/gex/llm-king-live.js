@@ -55,6 +55,164 @@ async function fetchVixOpen() {
   return cachedVix;
 }
 
+// ---- Morning Trend Score ----
+// Price-based ML model (500 days training, AUC 0.803 OOS).
+// Predicts "is today a 40+ pt trend day?" from prior price action.
+// Fetched once at morning alongside VIX.
+import { loadModel as loadXgbModel, predict as xgbPredict } from '../ml/xgb-scorer.js';
+
+let trendModel = null;
+try {
+  trendModel = loadXgbModel('data/ml-price-model-trees.json');
+  log.info(`Trend model loaded: ${trendModel.trees.length} trees`);
+} catch (e) {
+  log.warn('Trend model not found — morning score unavailable');
+}
+
+let cachedTrendScore = null;
+let trendScoreDate = null;
+
+async function fetchMorningTrendScore() {
+  const today = nowET().toFormat('yyyy-MM-dd');
+  if (trendScoreDate === today && cachedTrendScore !== null) return cachedTrendScore;
+  if (!trendModel) return null;
+
+  try {
+    // Fetch 30 days of daily data for SPX, SPY, VIX, VIX9D, 10Y, Dollar, ES
+    const tickers = [
+      ['^GSPC', 'spx'], ['SPY', 'spy'], ['^VIX', 'vix'],
+      ['^VIX9D', 'vix9d'], ['^TNX', 'tnx'], ['DX-Y.NYB', 'dxy'], ['ES=F', 'es'],
+    ];
+    const data = {};
+    for (const [ticker, key] of tickers) {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1mo`;
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(5000) });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const r = json?.chart?.result?.[0];
+      const ts = r?.timestamp || [];
+      const q = r?.indicators?.quote?.[0] || {};
+      for (let i = 0; i < ts.length; i++) {
+        const d = new Date(ts[i] * 1000).toISOString().split('T')[0];
+        if (!data[d]) data[d] = {};
+        data[d][key] = { open: q.open?.[i], high: q.high?.[i], low: q.low?.[i], close: q.close?.[i], volume: q.volume?.[i] };
+      }
+    }
+
+    const dates = Object.keys(data).sort();
+    if (dates.length < 21) { log.warn('Not enough daily data for trend score'); return null; }
+
+    // Use the most recent day as "today" (or yesterday if before market open)
+    const latest = dates[dates.length - 1];
+    const prev1 = data[dates[dates.length - 2]];
+    const prev2 = data[dates[dates.length - 3]];
+    const prev3 = data[dates[dates.length - 4]];
+    const prev5 = data[dates[dates.length - 6]];
+    const todayD = data[latest];
+
+    // Compute features (same as train-price-ml.py)
+    const spxPrevClose = prev1?.spx?.close || 0;
+    const overnightGap = (todayD?.spx?.open || 0) - spxPrevClose;
+    const esGap = (todayD?.es?.open || 0) - (prev1?.es?.close || 0);
+    const ret1d = prev2?.spx?.close ? ((prev1?.spx?.close || 0) - prev2.spx.close) / prev2.spx.close * 100 : 0;
+    const ret3d = prev3?.spx?.close ? ((prev1?.spx?.close || 0) - (data[dates[dates.length - 5]]?.spx?.close || prev3.spx.close)) / prev3.spx.close * 100 : 0;
+    const ret5d = prev5?.spx?.close ? ((prev1?.spx?.close || 0) - prev5.spx.close) / prev5.spx.close * 100 : 0;
+
+    // 5-day and 20-day avg range
+    const ranges = [];
+    for (let j = 2; j <= Math.min(21, dates.length); j++) {
+      const p = data[dates[dates.length - j]];
+      if (p?.spx?.high && p?.spx?.low) ranges.push(p.spx.high - p.spx.low);
+    }
+    const avgRange5d = ranges.slice(0, 5).reduce((s, v) => s + v, 0) / Math.max(ranges.slice(0, 5).length, 1);
+    const avgRange20d = ranges.slice(0, 20).reduce((s, v) => s + v, 0) / Math.max(ranges.slice(0, 20).length, 1);
+
+    const vix = todayD?.vix?.close || prev1?.vix?.close || 0;
+    const vixOpen = todayD?.vix?.open || vix;
+    const vixPrev = prev1?.vix?.close || 0;
+    const vix9d = todayD?.vix9d?.close || 0;
+    const vixChange = vixOpen - vixPrev;
+    const vixTerm = vix9d && vix ? vix9d - vix : 0;
+
+    const tnxChange = (todayD?.tnx?.close || 0) - (prev1?.tnx?.close || 0);
+    const dxyChange = (todayD?.dxy?.close || 0) - (prev1?.dxy?.close || 0);
+
+    // SPY volume ratio
+    const spyVol = todayD?.spy?.volume || prev1?.spy?.volume || 0;
+    const spyVols = [];
+    for (let j = 2; j <= Math.min(21, dates.length); j++) {
+      const v = data[dates[dates.length - j]]?.spy?.volume;
+      if (v) spyVols.push(v);
+    }
+    const avgSpyVol = spyVols.length > 0 ? spyVols.reduce((s, v) => s + v, 0) / spyVols.length : 1;
+    const volRatio = spyVol / avgSpyVol;
+
+    // Consecutive days
+    let consecDown = 0, consecUp = 0;
+    for (let j = 2; j <= Math.min(7, dates.length); j++) {
+      const p = data[dates[dates.length - j]];
+      if (p?.spx?.close && p?.spx?.open && p.spx.close < p.spx.open) { consecDown++; } else break;
+    }
+    for (let j = 2; j <= Math.min(7, dates.length); j++) {
+      const p = data[dates[dates.length - j]];
+      if (p?.spx?.close && p?.spx?.open && p.spx.close > p.spx.open) { consecUp++; } else break;
+    }
+
+    const dow = new Date(latest).getDay() - 1; // Mon=0
+
+    // RSI(14)
+    const closes14 = [];
+    for (let j = 1; j <= Math.min(16, dates.length); j++) {
+      const c = data[dates[dates.length - j]]?.spx?.close;
+      if (c) closes14.unshift(c);
+    }
+    let rsi = 50;
+    if (closes14.length >= 15) {
+      let gains = 0, losses = 0;
+      for (let k = 1; k < closes14.length; k++) {
+        const ch = closes14[k] - closes14[k - 1];
+        if (ch > 0) gains += ch; else losses -= ch;
+      }
+      rsi = 100 - (100 / (1 + (gains / 14) / (losses / 14 + 1e-9)));
+    }
+
+    // 20d high/low
+    let high20 = 0, low20 = 99999;
+    for (let j = 1; j <= Math.min(21, dates.length); j++) {
+      const p = data[dates[dates.length - j]];
+      if (p?.spx?.high && p.spx.high > high20) high20 = p.spx.high;
+      if (p?.spx?.low && p.spx.low < low20) low20 = p.spx.low;
+    }
+    const spxOpen = todayD?.spx?.open || spxPrevClose;
+    const pctFrom20dHigh = high20 ? (spxOpen - high20) / high20 * 100 : 0;
+    const pctFrom20dLow = low20 < 99999 ? (spxOpen - low20) / low20 * 100 : 0;
+
+    const prevDayRange = prev1?.spx?.high && prev1?.spx?.low ? prev1.spx.high - prev1.spx.low : 0;
+    const prevDayMove = prev1?.spx?.close && prev1?.spx?.open ? prev1.spx.close - prev1.spx.open : 0;
+
+    // Feature vector (must match training order exactly)
+    const features = [
+      overnightGap, esGap, ret1d, ret3d, ret5d,
+      avgRange5d, avgRange20d, avgRange5d / (avgRange20d + 1e-9),
+      vix, vixChange, vixTerm, vix9d > vix ? 1 : 0,
+      tnxChange, dxyChange, volRatio,
+      consecDown, consecUp, dow, rsi,
+      pctFrom20dHigh, pctFrom20dLow,
+      prevDayRange, prevDayMove,
+    ];
+
+    const score = xgbPredict(trendModel, features);
+    const regime = score >= 0.6 ? 'TREND_LIKELY' : score >= 0.4 ? 'NORMAL' : 'CHOP_LIKELY';
+
+    cachedTrendScore = { score: Math.round(score * 100) / 100, regime, date: latest };
+    trendScoreDate = today;
+    log.info(`Morning trend score: ${cachedTrendScore.score} (${regime}) | VIX=${vix.toFixed(1)} VIX9D=${vix9d.toFixed(1)} range5d=${avgRange5d.toFixed(0)}`);
+  } catch (err) {
+    log.warn(`Morning trend score failed: ${err.message}`);
+  }
+  return cachedTrendScore;
+}
+
 // ---- State (persists across cycles, reset daily) ----
 let cycleCount = 0;
 const LLM_CALL_INTERVAL = 10; // every 10 cycles
@@ -62,6 +220,7 @@ let lastLlmResult = null;
 let dailyState = {
   hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
   vix: null,  // { level, prevClose, regime } — fetched once at morning
+  trendScore: null,  // { score, regime } — morning ML prediction
   kingHistory: [],
   entriesPerDir: { BULLISH: 0, BEARISH: 0 },
   dirLosses: { BULLISH: 0, BEARISH: 0 },
@@ -227,6 +386,7 @@ function buildLiveSnapshot(king, spot, spyKing, qqqKing, position) {
     narrative: kingStory,
     opening_gamma: dailyState.openingGamma ? `${(dailyState.openingGamma / 1e6).toFixed(0)}M at open — ${dailyState.openingGamma >= 80_000_000 ? 'HIGH gamma = dealers positioned, watch for squeezes' : 'LOW gamma = less dealer positioning, directional moves expected'}` : 'not yet captured',
     vix: dailyState.vix ? `${dailyState.vix.level} (${dailyState.vix.regime})${dailyState.vix.prevClose ? ` — prev close ${dailyState.vix.prevClose}, change ${dailyState.vix.level > dailyState.vix.prevClose ? '+' : ''}${((dailyState.vix.level - dailyState.vix.prevClose) / dailyState.vix.prevClose * 100).toFixed(1)}%` : ''}. ${dailyState.vix.regime === 'HIGH' || dailyState.vix.regime === 'EXTREME' ? 'HIGH VIX = macro-driven, bigger moves, be skeptical of squeezes and trust TREND/DEFY over pins' : 'Normal VIX = gamma-driven, trust GEX signals'}` : 'not available',
+    morning_trend_score: dailyState.trendScore ? `${dailyState.trendScore.score} (${dailyState.trendScore.regime}) — ${dailyState.trendScore.regime === 'TREND_LIKELY' ? 'ML predicts big move today, trade aggressively with TREND/DEFY' : dailyState.trendScore.regime === 'CHOP_LIKELY' ? 'ML predicts chop, reduce entries or sit out' : 'normal day, use standard rules'}` : 'not yet scored',
     day_move: Math.round(dayMove),
     hod: Math.round(hod), lod: Math.round(lod),
     spy_magnet: spyKing ? `${spyKing.strike} (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -278,8 +438,9 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
 
   if (dailyState.openPrice === 0) {
     dailyState.openPrice = spot;
-    // Fetch VIX on first cycle of the day (non-blocking)
+    // Fetch VIX + morning trend score on first cycle (non-blocking)
     fetchVixOpen().then(vix => { if (vix) dailyState.vix = vix; }).catch(() => {});
+    fetchMorningTrendScore().then(ts => { if (ts) dailyState.trendScore = ts; }).catch(() => {});
     dailyState.openingGamma = king.totalAbsGamma;
   }
 
@@ -384,6 +545,7 @@ export function resetLlmKingDaily() {
   dailyState = {
     hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
     vix: null,
+    trendScore: null,
     kingHistory: [],
     entriesPerDir: { BULLISH: 0, BEARISH: 0 },
     dirLosses: { BULLISH: 0, BEARISH: 0 },
@@ -394,5 +556,6 @@ export function resetLlmKingDaily() {
     priceTrend: [],
   };
   vixFetchDate = null;  // force re-fetch on next day
+  trendScoreDate = null;
   log.info('Daily state reset');
 }
