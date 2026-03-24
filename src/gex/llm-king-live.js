@@ -20,12 +20,48 @@ import { getNodeTrends, getGexConviction } from '../store/state.js';
 
 const log = createLogger('LLM-King');
 
+// ---- VIX Fetch ----
+// Pull VIX once at morning to give LLM macro regime context.
+// Uses Yahoo Finance (free, no API key). Cached daily.
+let cachedVix = null;
+let vixFetchDate = null;
+
+async function fetchVixOpen() {
+  const today = nowET().toFormat('yyyy-MM-dd');
+  if (vixFetchDate === today && cachedVix !== null) return cachedVix;
+
+  try {
+    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=2d';
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const quote = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+    const prevClose = data?.chart?.result?.[0]?.meta?.chartPreviousClose;
+    if (quote && quote > 0) {
+      cachedVix = {
+        level: Math.round(quote * 100) / 100,
+        prevClose: prevClose ? Math.round(prevClose * 100) / 100 : null,
+        regime: quote >= 30 ? 'EXTREME' : quote >= 22 ? 'HIGH' : quote >= 16 ? 'MODERATE' : 'LOW',
+      };
+      vixFetchDate = today;
+      log.info(`VIX fetched: ${cachedVix.level} (${cachedVix.regime})${prevClose ? ` prev=${cachedVix.prevClose}` : ''}`);
+    }
+  } catch (err) {
+    log.warn(`VIX fetch failed: ${err.message} — LLM will proceed without VIX context`);
+  }
+  return cachedVix;
+}
+
 // ---- State (persists across cycles, reset daily) ----
 let cycleCount = 0;
 const LLM_CALL_INTERVAL = 10; // every 10 cycles
 let lastLlmResult = null;
 let dailyState = {
   hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
+  vix: null,  // { level, prevClose, regime } — fetched once at morning
   kingHistory: [],
   entriesPerDir: { BULLISH: 0, BEARISH: 0 },
   dirLosses: { BULLISH: 0, BEARISH: 0 },
@@ -190,6 +226,7 @@ function buildLiveSnapshot(king, spot, spyKing, qqqKing, position) {
     gamma_flip_level: king.flipLevel ? `${king.flipLevel}` : 'not found',
     narrative: kingStory,
     opening_gamma: dailyState.openingGamma ? `${(dailyState.openingGamma / 1e6).toFixed(0)}M at open — ${dailyState.openingGamma >= 80_000_000 ? 'HIGH gamma = dealers positioned, watch for squeezes' : 'LOW gamma = less dealer positioning, directional moves expected'}` : 'not yet captured',
+    vix: dailyState.vix ? `${dailyState.vix.level} (${dailyState.vix.regime})${dailyState.vix.prevClose ? ` — prev close ${dailyState.vix.prevClose}, change ${dailyState.vix.level > dailyState.vix.prevClose ? '+' : ''}${((dailyState.vix.level - dailyState.vix.prevClose) / dailyState.vix.prevClose * 100).toFixed(1)}%` : ''}. ${dailyState.vix.regime === 'HIGH' || dailyState.vix.regime === 'EXTREME' ? 'HIGH VIX = macro-driven, bigger moves, be skeptical of squeezes and trust TREND/DEFY over pins' : 'Normal VIX = gamma-driven, trust GEX signals'}` : 'not available',
     day_move: Math.round(dayMove),
     hod: Math.round(hod), lod: Math.round(lod),
     spy_magnet: spyKing ? `${spyKing.strike} (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -241,6 +278,8 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
 
   if (dailyState.openPrice === 0) {
     dailyState.openPrice = spot;
+    // Fetch VIX on first cycle of the day (non-blocking)
+    fetchVixOpen().then(vix => { if (vix) dailyState.vix = vix; }).catch(() => {});
     dailyState.openingGamma = king.totalAbsGamma;
   }
 
@@ -344,6 +383,7 @@ export function resetLlmKingDaily() {
   lastLlmResult = null;
   dailyState = {
     hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
+    vix: null,
     kingHistory: [],
     entriesPerDir: { BULLISH: 0, BEARISH: 0 },
     dirLosses: { BULLISH: 0, BEARISH: 0 },
@@ -353,5 +393,6 @@ export function resetLlmKingDaily() {
     breachUp: false, breachDown: false,
     priceTrend: [],
   };
+  vixFetchDate = null;  // force re-fetch on next day
   log.info('Daily state reset');
 }

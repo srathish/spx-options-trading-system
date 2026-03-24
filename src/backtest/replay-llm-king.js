@@ -36,7 +36,32 @@ const CONFIG = {
   entry_start_time: '09:50',
   entry_end_time: '15:00',
   eod_exit_time: '15:45',
+
+  // 1DTE hybrid
+  dte1_max_loss_pts: 20,           // wider stop for 1DTE
+  dte1_min_day_move: 40,           // minimum abs(dayMove) to qualify
+  dte1_min_magnet_dist: 40,        // magnet must be far enough to justify holding
 };
+
+// ---- 1DTE Decision ----
+// Determines if a TREND or DEFY trade should use 1DTE instead of 0DTE.
+// 1DTE = wider stop, no time-based exits, carry overnight to next session.
+// Criteria: large directional move + negative regime + far magnet = multi-session trend.
+function shouldUse1DTE(mode, dayMove, magnetDist, regime, minuteOfDay) {
+  // Only TREND and DEFY qualify — SQUEEZE/BREAKOUT are intraday-specific
+  if (mode !== 'TREND' && mode !== 'DEFY') return false;
+  // Need significant move already established (confirms real selling/buying)
+  if (Math.abs(dayMove) < CONFIG.dte1_min_day_move) return false;
+  // Negative regime = dealers amplifying. Positive = pinning (stay 0DTE)
+  if (regime !== 'NEGATIVE') return false;
+  // TREND: magnet must be far enough that same-day target hit is unlikely
+  // DEFY: day move itself is the signal (DEFY targets are intentionally close)
+  if (mode === 'TREND' && magnetDist < CONFIG.dte1_min_magnet_dist) return false;
+  if (mode === 'DEFY' && Math.abs(dayMove) < 45) return false; // DEFY needs 45+ pt move for 1DTE
+  // Not too late — entering at 2:30PM for 1DTE is risky (gap exposure with little time to confirm)
+  if (minuteOfDay > timeToMinutes('14:00')) return false;
+  return true;
+}
 
 // ---- System prompt ----
 
@@ -449,7 +474,7 @@ function saveCache(cache) {
 
 // ---- Core Replay ----
 
-async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
+async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, carryPosition = null) {
   const rawJson = readFileSync(jsonPath, 'utf-8');
   const data = JSON.parse(rawJson);
   const { metadata, frames } = data;
@@ -479,8 +504,11 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
   const entryEndMin = timeToMinutes(CONFIG.entry_end_time);
   const eodMin = timeToMinutes(CONFIG.eod_exit_time);
 
-  // Simulated position
-  let position = null;
+  // Simulated position — may inherit a 1DTE carry from previous day
+  let position = carryPosition ? { ...carryPosition, _carriedOver: true } : null;
+  if (position && verbose) {
+    console.log(`  CARRY-IN | ${position.direction} ${position.mode} from ${position.openedAt} | entry=$${Math.round(position.entrySpx)} | MFE=${position.mfe} | 1DTE overnight`);
+  }
   const trades = [];
 
   for (let i = 0; i < frames.length; i++) {
@@ -583,9 +611,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         else if (position.llmSaysExit) exitReason = 'LLM_EXIT';
       } else if (mode === 'SQUEEZE') {
-        // Squeeze trades: target 25 pts, stop 12, lock at 40% of MFE
+        // Squeeze trades: target 25 pts, stop 12, lock at 20% of MFE (was 40% — too tight)
         if (progress >= 25) exitReason = 'SQUEEZE_TARGET';
-        else if (position.mfe >= 15 && progress <= position.mfe * 0.4) exitReason = 'SQUEEZE_LOCK';
+        else if (position.mfe >= 20 && progress <= Math.max(5, position.mfe * 0.2)) exitReason = 'SQUEEZE_LOCK';
         else if (progress <= -12) exitReason = 'SQUEEZE_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         // Exit if squeeze condition disappears
@@ -596,58 +624,66 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
         const t = 20;
         const s = position._breakStop || 12;
         if (progress >= t) exitReason = 'BREAK_TARGET';
-        // Lock at 30% of MFE once we hit +12 (was +15/+5 which was too tight)
-        else if (position.mfe >= 12 && progress <= Math.max(3, position.mfe * 0.3)) exitReason = 'BREAK_LOCK';
+        // Lock at 20% of MFE once we hit +15 (was 30%/+12 — too tight, cutting trend continuations)
+        else if (position.mfe >= 15 && progress <= Math.max(4, position.mfe * 0.2)) exitReason = 'BREAK_LOCK';
         else if (progress <= -s) exitReason = 'BREAK_STOP';
         else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else if (mode === 'DEFY') {
-        const t = 30;
-        const s = position._defyStop || 15;
+        const is1DTE = position.expiry === '1DTE';
+        const t = is1DTE ? 50 : 30;  // 1DTE can target bigger moves
+        const s = position._defyStop || (is1DTE ? 20 : 15);
         if (progress >= t) exitReason = 'DEFY_TARGET';
-        // Profit lock for DEFY: tighter on pinning days, wider on trending days
-        // In NEGATIVE GEX (trending), let it breathe — lock at 25% of MFE
-        // In POSITIVE GEX (pinning), tighter — lock at 40% of MFE
-        else if (position.mfe >= 15) {
+        // Profit lock: 1DTE uses wider lock (15% of MFE) to let multi-day moves breathe
+        else if (!is1DTE && position.mfe >= 15) {
           const defyLockPct = king.regime === 'NEGATIVE' ? 0.25 : 0.4;
           if (progress <= position.mfe * defyLockPct) exitReason = 'DEFY_LOCK';
         }
+        else if (is1DTE && position.mfe >= 30 && progress <= position.mfe * 0.15) {
+          exitReason = 'DEFY_LOCK';  // 1DTE: only lock after +30 MFE, at 15% pullback
+        }
         else if (progress <= -s) exitReason = 'DEFY_STOP';
-        else if (minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
+        // 1DTE: no EOD close — carry overnight. 0DTE: close at EOD.
+        else if (!is1DTE && minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
       } else {
         // TREND MODE
+        const is1DTE = position.expiry === '1DTE';
         if (position.targetStrike) {
           const hit = isBull ? spot >= position.targetStrike - CONFIG.target_proximity_pts
             : spot <= position.targetStrike + CONFIG.target_proximity_pts;
           if (hit) exitReason = 'TARGET_HIT';
         }
         // Trend-aware dynamic lock: only lock when you've captured 60%+ of the magnet distance
+        // 1DTE: disable lock entirely — let it ride to target or stop
         const magnetDist = Math.abs(position.targetStrike - position.entrySpx);
         const capturedPct = magnetDist > 0 ? progress / magnetDist : 1;
-        if (!exitReason && position.mfe >= 25 && progress <= 10 && capturedPct >= 0.6) {
+        if (!is1DTE && !exitReason && position.mfe >= 25 && progress <= 10 && capturedPct >= 0.6) {
           exitReason = 'TREND_LOCK';
         }
-        // Early cut disabled — thesis hold + max loss handle this better
-        // MAX LOSS — but check if our magnet is still alive first
-        if (!exitReason && progress <= -CONFIG.max_loss_pts) {
+        // MAX LOSS — 1DTE uses wider stop (-20), 0DTE uses -12
+        const maxLoss = is1DTE ? CONFIG.dte1_max_loss_pts : CONFIG.max_loss_pts;
+        if (!exitReason && progress <= -maxLoss) {
           const ourMagnet = position.direction === 'BEARISH' ? king.bearMagnet : king.bullMagnet;
           const magnetAlive = ourMagnet && ourMagnet.absValue >= 10_000_000;
-          const hardLimit = progress <= -25; // absolute max, never hold beyond -25
+          const hardLimit = progress <= -(maxLoss + 10); // absolute max beyond stop
           if (magnetAlive && !hardLimit) {
             // Magnet still pulling — hold through the bounce
           } else {
             exitReason = 'MAX_LOSS';
           }
         }
-        // After 2:30 PM, tighten profit lock — lock in any gains before close
-        if (!exitReason && minuteOfDay >= timeToMinutes('14:30') && position.mfe >= 10 && progress > 0 && progress <= Math.max(3, position.mfe * 0.3)) {
+        // After 2:30 PM, tighten profit lock — 0DTE only (1DTE doesn't need this)
+        if (!is1DTE && !exitReason && minuteOfDay >= timeToMinutes('14:30') && position.mfe >= 10 && progress > 0 && progress <= Math.max(3, position.mfe * 0.3)) {
           exitReason = 'LATE_LOCK';
         }
-        if (!exitReason && minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
+        // 1DTE: no EOD close — carry overnight
+        if (!is1DTE && !exitReason && minuteOfDay >= eodMin) exitReason = 'EOD_CLOSE';
         if (!exitReason && position.llmSaysExit) exitReason = 'LLM_EXIT';
       }
 
       if (exitReason) {
-        const pnl = exitReason === 'MAX_LOSS' ? -CONFIG.max_loss_pts
+        const is1DTE = position.expiry === '1DTE';
+        const maxLossPnl = is1DTE ? CONFIG.dte1_max_loss_pts : CONFIG.max_loss_pts;
+        const pnl = exitReason === 'MAX_LOSS' ? -maxLossPnl
           : exitReason === 'PIN_STOP' ? -(position._pinnedStop || 8)
           : exitReason === 'RANGE_STOP' ? -(position._rangeStop || 8)
           : exitReason === 'SQUEEZE_STOP' ? -12
@@ -666,6 +702,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           closedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
           mfe: Math.round(position.mfe * 100) / 100,
           mae: Math.round(position.mae * 100) / 100,
+          expiry: position.expiry || '0DTE',
         });
         if (!localState._dirLosses) localState._dirLosses = { BULLISH: 0, BEARISH: 0 };
         if (!localState._dirWins) localState._dirWins = { BULLISH: 0, BEARISH: 0 };
@@ -938,6 +975,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
             // Hard squeeze gate: NEVER enter TREND against an active squeeze
             const squeezeBlocsTrend = (dir === 'BEARISH' && king.squeezeUp) || (dir === 'BULLISH' && king.squeezeDown);
             if ((llmConfirms || qualityOverride || superQuality) && !squeezeBlocsTrend) {
+              const use1DTE = shouldUse1DTE('TREND', dayMove, dist, king.regime, minuteOfDay);
               position = {
                 mode: 'TREND',
                 direction: dir,
@@ -947,6 +985,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
                 entryMinute: minuteOfDay,
                 mfe: 0, mae: 0, llmSaysExit: false,
                 _quality: quality,
+                expiry: use1DTE ? '1DTE' : '0DTE',
               };
               localState._entriesPerDir[dir]++;
               if (verbose) console.log(`  ENTER ${etStr} | ${dir} Q=${quality} @ $${Math.round(spot)} → ${bestMagnet.strike} (${dist.toFixed(0)}pts, ${fmtVal(bestMagnet.value)}) LLM=${llmRegime}`);
@@ -990,6 +1029,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
             const defyDist = Math.abs(targetStrike - spot);
 
             if (defyDist >= 20 && defyDist <= 60) {
+              const use1DTE = shouldUse1DTE('DEFY', dayMove, defyDist, king.regime, minuteOfDay);
               position = {
                 mode: 'DEFY',
                 direction: priceDir,
@@ -997,7 +1037,8 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
                 targetStrike,
                 openedAt: et.toFormat('yyyy-MM-dd HH:mm:ss'),
                 mfe: 0, mae: 0, llmSaysExit: false,
-                _defyStop: 15, // wider stop for momentum trades
+                _defyStop: use1DTE ? 20 : 15,
+                expiry: use1DTE ? '1DTE' : '0DTE',
               };
               localState._entriesPerDir[priceDir]++;
               localState._defyCount++;
@@ -1133,18 +1174,32 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
     }
   }
 
-  // Force close any open position at EOD
+  // Force close any open position at EOD — EXCEPT 1DTE which carries overnight
+  let carryOut = null;
   if (position) {
     const lastSpxw = isTrinity ? frames[frames.length - 1]?.tickers?.SPXW : frames[frames.length - 1];
     const lastSpot = lastSpxw?.spotPrice || position.entrySpx;
     const isBull = position.direction === 'BULLISH';
     const pnl = Math.round((isBull ? lastSpot - position.entrySpx : position.entrySpx - lastSpot) * 100) / 100;
-    trades.push({
-      direction: position.direction, entrySpx: position.entrySpx, exitSpx: lastSpot,
-      targetStrike: position.targetStrike, pnl, exitReason: 'EOD_FORCE',
-      openedAt: position.openedAt, closedAt: 'EOD', mfe: Math.round(position.mfe * 100) / 100,
-      mae: Math.round(position.mae * 100) / 100,
-    });
+
+    if (position.expiry === '1DTE' && !position._carriedOver) {
+      // 1DTE position opened today: carry to next day (don't close)
+      // Update MFE/MAE with final spot
+      position.mfe = Math.max(position.mfe, pnl);
+      position.mae = Math.min(position.mae, pnl);
+      carryOut = position;
+      if (verbose) console.log(`  CARRY-OUT | ${position.direction} ${position.mode} @ $${Math.round(position.entrySpx)} | P&L=${pnl > 0 ? '+' : ''}${pnl.toFixed(1)} | carrying overnight`);
+    } else {
+      // 0DTE or 1DTE already carried (day 2) — force close
+      trades.push({
+        mode: position.mode || 'TREND',
+        direction: position.direction, entrySpx: position.entrySpx, exitSpx: lastSpot,
+        targetStrike: position.targetStrike, pnl, exitReason: position._carriedOver ? 'DTE1_EOD' : 'EOD_FORCE',
+        openedAt: position.openedAt, closedAt: 'EOD', mfe: Math.round(position.mfe * 100) / 100,
+        mae: Math.round(position.mae * 100) / 100,
+        expiry: position.expiry || '0DTE',
+      });
+    }
     position = null;
   }
 
@@ -1166,13 +1221,17 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
   if (trades.length > 0) {
     console.log(`  Trades: ${trades.length} (${wins}W/${losses}L) | NET: ${netPnl > 0 ? '+' : ''}${netPnl.toFixed(2)} pts`);
     for (const t of trades) {
-      console.log(`    ${t.openedAt} -> ${t.closedAt} | ${t.direction} | target=${t.targetStrike} | ${t.pnl > 0 ? '+' : ''}${t.pnl.toFixed(2)} pts | ${t.exitReason} | MFE=${t.mfe} MAE=${t.mae}`);
+      const dteTag = t.expiry === '1DTE' ? ' [1DTE]' : '';
+      console.log(`    ${t.openedAt} -> ${t.closedAt} | ${t.direction} | target=${t.targetStrike} | ${t.pnl > 0 ? '+' : ''}${t.pnl.toFixed(2)} pts | ${t.exitReason}${dteTag} | MFE=${t.mfe} MAE=${t.mae}`);
     }
   } else {
     console.log(`  No trades (sat flat)`);
   }
+  if (carryOut) {
+    console.log(`  >>> 1DTE CARRY: ${carryOut.direction} ${carryOut.mode} @ $${Math.round(carryOut.entrySpx)} → next day`);
+  }
 
-  return { date: dateStr, calls, trades, netPnl, wins, losses };
+  return { date: dateStr, calls, trades, netPnl, wins, losses, carryPosition: carryOut };
 }
 
 // ---- CLI ----
@@ -1191,15 +1250,21 @@ async function main() {
 
   const cache = loadCache();
   const allResults = [];
+  let pendingCarry = null; // 1DTE position carrying overnight between days
 
   for (const file of files) {
     try {
-      const result = await replayLLMKing(file, cache, verbose, dryRun);
+      const result = await replayLLMKing(file, cache, verbose, dryRun, pendingCarry);
       allResults.push(result);
+      pendingCarry = result.carryPosition || null;
+      if (pendingCarry && verbose) {
+        console.log(`  >>> 1DTE carry: ${pendingCarry.direction} ${pendingCarry.mode} → next day`);
+      }
       // Save cache after each day so progress isn't lost
       if (!dryRun) saveCache(cache);
     } catch (err) {
       console.error(`ERROR on ${file}: ${err.message}`);
+      pendingCarry = null; // drop carry on error
       if (!dryRun) saveCache(cache);
     }
   }
@@ -1260,6 +1325,24 @@ async function main() {
     console.log('\nExit reasons:');
     for (const [reason, data] of Object.entries(exitCounts).sort((a, b) => b[1].pnl - a[1].pnl)) {
       console.log(`  ${reason.padEnd(15)} ${data.count.toString().padStart(4)} trades | ${data.pnl > 0 ? '+' : ''}${data.pnl.toFixed(2)} pts`);
+    }
+
+    // 1DTE breakdown
+    const dte1Trades = allTrades.filter(t => t.expiry === '1DTE');
+    const dte0Trades = allTrades.filter(t => t.expiry !== '1DTE');
+    if (dte1Trades.length > 0) {
+      const d1w = dte1Trades.filter(t => t.pnl > 0).length;
+      const d1l = dte1Trades.filter(t => t.pnl <= 0).length;
+      const d1p = dte1Trades.reduce((s, t) => s + t.pnl, 0);
+      const d0w = dte0Trades.filter(t => t.pnl > 0).length;
+      const d0l = dte0Trades.filter(t => t.pnl <= 0).length;
+      const d0p = dte0Trades.reduce((s, t) => s + t.pnl, 0);
+      console.log('\nExpiry breakdown:');
+      console.log(`  0DTE  ${dte0Trades.length} trades (${d0w}W/${d0l}L) | NET: ${d0p > 0 ? '+' : ''}${d0p.toFixed(2)} pts`);
+      console.log(`  1DTE  ${dte1Trades.length} trades (${d1w}W/${d1l}L) | NET: ${d1p > 0 ? '+' : ''}${d1p.toFixed(2)} pts`);
+      for (const t of dte1Trades) {
+        console.log(`    ${t.openedAt} → ${t.closedAt} | ${t.direction} ${t.mode} | ${t.pnl > 0 ? '+' : ''}${t.pnl.toFixed(2)} pts | ${t.exitReason}`);
+      }
     }
   }
 }
