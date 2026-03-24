@@ -146,6 +146,10 @@ const cache = JSON.parse(readFileSync('data/llm-king-cache-v2.json'));
 let esData = {};
 try { esData = JSON.parse(readFileSync('data/es-overnight.json')); } catch (e) { /* no ES data */ }
 
+// Load market daily data (VIX term structure, SPY volume)
+let marketDaily = {};
+try { marketDaily = JSON.parse(readFileSync('data/market-daily.json')); } catch (e) { /* no market data */ }
+
 // CSV header
 const header = [
   'date', 'time', 'minute_of_day', 'spot',
@@ -183,6 +187,8 @@ const header = [
   'opening_range_broken', 'broke_which_side',
   // ES futures overnight
   'es_overnight_change',
+  // VIX term structure + SPY volume
+  'vix_term_structure', 'vix_inverted', 'spy_volume_M',
   // Labels
   'move_10min', 'move_30min', 'abs_move_30min',
   'dir_correct_10', 'dir_correct_30',
@@ -425,6 +431,10 @@ for (const file of files) {
       })(),
       // ES overnight
       esData[dateStr] ? esData[dateStr].overnight.toFixed(1) : 0,
+      // VIX term structure + SPY volume
+      marketDaily[dateStr]?.vix_term_structure ?? 0,
+      marketDaily[dateStr]?.vix_inverted ?? 0,
+      marketDaily[dateStr]?.spy_volume ? (marketDaily[dateStr].spy_volume / 1e6).toFixed(0) : 0,
       move10 !== null ? move10.toFixed(2) : '',
       move30 !== null ? move30.toFixed(2) : '',
       move30 !== null ? Math.abs(move30).toFixed(2) : '',

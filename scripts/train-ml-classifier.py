@@ -71,6 +71,10 @@ feature_cols = [
     'broke_which_side',          # 1=bullish break, -1=bearish break, 0=neither
     # NEW: ES futures overnight
     'es_overnight_change',       # ES futures overnight change (gap direction)
+    # NEW: VIX term structure + SPY volume
+    'vix_term_structure',        # VIX9D - VIX (positive = inverted = near-term fear)
+    'vix_inverted',              # 1 if VIX9D > VIX (panic signal)
+    'spy_volume_M',              # SPY daily volume in millions (high = institutional day)
 ]
 
 # ---- Targets ----
