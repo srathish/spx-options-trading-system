@@ -25,7 +25,7 @@ let cycleCount = 0;
 const LLM_CALL_INTERVAL = 10; // every 10 cycles
 let lastLlmResult = null;
 let dailyState = {
-  hod: -Infinity, lod: Infinity, openPrice: 0,
+  hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
   kingHistory: [],
   entriesPerDir: { BULLISH: 0, BEARISH: 0 },
   dirLosses: { BULLISH: 0, BEARISH: 0 },
@@ -189,6 +189,7 @@ function buildLiveSnapshot(king, spot, spyKing, qqqKing, position) {
     net_gex_regime: `${king.regime} gamma (${(king.netGex/1e6).toFixed(0)}M)`,
     gamma_flip_level: king.flipLevel ? `${king.flipLevel}` : 'not found',
     narrative: kingStory,
+    opening_gamma: dailyState.openingGamma ? `${(dailyState.openingGamma / 1e6).toFixed(0)}M at open — ${dailyState.openingGamma >= 80_000_000 ? 'HIGH gamma = dealers positioned, watch for squeezes' : 'LOW gamma = less dealer positioning, directional moves expected'}` : 'not yet captured',
     day_move: Math.round(dayMove),
     hod: Math.round(hod), lod: Math.round(lod),
     spy_magnet: spyKing ? `${spyKing.strike} (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -232,12 +233,16 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
   if (!spot || spot <= 0) return [];
 
   // Update daily state
-  if (dailyState.openPrice === 0) dailyState.openPrice = spot;
   if (spot > dailyState.hod) dailyState.hod = spot;
   if (spot < dailyState.lod) dailyState.lod = spot;
 
   const king = findKingNode(parsed);
   if (!king) return [];
+
+  if (dailyState.openPrice === 0) {
+    dailyState.openPrice = spot;
+    dailyState.openingGamma = king.totalAbsGamma;
+  }
 
   // Update king history
   const et = nowET();
@@ -338,7 +343,7 @@ export function resetLlmKingDaily() {
   cycleCount = 0;
   lastLlmResult = null;
   dailyState = {
-    hod: -Infinity, lod: Infinity, openPrice: 0,
+    hod: -Infinity, lod: Infinity, openPrice: 0, openingGamma: null,
     kingHistory: [],
     entriesPerDir: { BULLISH: 0, BEARISH: 0 },
     dirLosses: { BULLISH: 0, BEARISH: 0 },

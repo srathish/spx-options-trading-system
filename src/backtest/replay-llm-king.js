@@ -364,6 +364,7 @@ function buildSnapshot(localState, parsed, king, spot, et, spyKing, qqqKing, pos
     gamma_flip_level: king.flipLevel ? `${king.flipLevel} (${king.flipLevel > spot ? (king.flipLevel - spot).toFixed(0) + 'pts ABOVE' : (spot - king.flipLevel).toFixed(0) + 'pts BELOW'} spot) — above this level market stabilizes, below it moves accelerate` : 'not found',
     vacuum_zones: `${king.vacuumBelow && king.vacuumBelow.pts >= 10 ? 'BELOW: ' + king.vacuumBelow.pts + 'pt corridor from ' + king.vacuumBelow.from + ' to ' + king.vacuumBelow.to + ' (low resistance, fast move zone)' : 'no significant vacuum below'}${king.vacuumAbove && king.vacuumAbove.pts >= 10 ? ' | ABOVE: ' + king.vacuumAbove.pts + 'pt corridor from ' + king.vacuumAbove.from + ' to ' + king.vacuumAbove.to + ' (low resistance, fast move zone)' : ' | no significant vacuum above'}`,
     concentration: `Top 3 strikes hold ${(king.concentration * 100).toFixed(0)}% of total GEX — ${king.concentration > 0.5 ? 'CONCENTRATED (tight gravity field, strong pin)' : 'SPREAD (loose structure, easier to trend)'}`,
+    opening_gamma: localState.openingGamma ? `${(localState.openingGamma / 1e6).toFixed(0)}M at open — ${localState.openingGamma >= 80_000_000 ? 'HIGH gamma = low vol/pinning day, breakouts likely to fail' : 'LOW gamma = high vol/trending day, directional moves expected'}` : 'not yet captured',
     narrative: [kingStory, competingStory, priceStory, crossStory].filter(Boolean).join(' '),
     spy_magnet: spyKing ? `SPY king at ${spyKing.strike}, ${Math.abs(spyKing.dist).toFixed(0)}pts ${spyKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(spyKing.value/1e6).toFixed(1)}M)` : 'no data',
     qqq_magnet: qqqKing ? `QQQ king at ${qqqKing.strike}, ${Math.abs(qqqKing.dist).toFixed(0)}pts ${qqqKing.dist < 0 ? 'BELOW' : 'ABOVE'} spot (${(qqqKing.value/1e6).toFixed(1)}M)` : 'no data',
@@ -464,6 +465,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
     hod: -Infinity,
     lod: Infinity,
     openPrice: 0,
+    openingGamma: null,  // total gamma at open — VIX proxy
     _entriesPerDir: { BULLISH: 0, BEARISH: 0 },
     _dirLosses: { BULLISH: 0, BEARISH: 0 },
     _dirWins: { BULLISH: 0, BEARISH: 0 },
@@ -494,11 +496,18 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
     const spot = parsed.spotPrice;
     const walls = [...(parsed.walls || [])];
 
-    if (localState.openPrice === 0) localState.openPrice = spot;
     if (spot > localState.hod) localState.hod = spot;
     if (spot < localState.lod) localState.lod = spot;
 
     const king = findKingNode(parsed);
+
+    if (localState.openPrice === 0) {
+      localState.openPrice = spot;
+      // Capture opening gamma — our VIX proxy
+      // Low gamma (<80M) = high vol = big moves expected = trade aggressively
+      // High gamma (>=80M) = low vol = pinning = be cautious
+      if (king) localState.openingGamma = king.totalAbsGamma;
+    }
     if (!king) continue;
 
     // === BREACH DETECTION — runs EVERY frame, not just LLM frames ===
@@ -896,6 +905,9 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
           // Late to the party penalty
           if ((dir === 'BEARISH' && dayMove < -80) || (dir === 'BULLISH' && dayMove > 80)) quality -= 30;
 
+          // Opening gamma captured for LLM context — no mechanical penalty
+          // Data shows high gamma days perform better per trade day (+7.68 vs +5.37)
+
           // GAMMA SQUEEZE penalty: if positive gamma on opposite side overwhelms our magnet,
           // dealers are hedging AGAINST our direction. Don't fight the squeeze.
           if (dir === 'BEARISH' && king.squeezeUp) quality -= 25;
@@ -1149,7 +1161,8 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false) {
   const netPnl = trades.reduce((s, t) => s + t.pnl, 0);
 
   // Summary
-  console.log(`\n${dateStr} | ${calls.length} LLM calls | Dir accuracy: ${correct30}/${dirCalls.length} (${dirCalls.length > 0 ? (correct30 / dirCalls.length * 100).toFixed(0) : 0}%) | HIGH: ${highCorrect30}/${highConfCalls.length} | ENTER signals: ${enterCalls.length}`);
+  const ogStr = localState.openingGamma ? `${(localState.openingGamma / 1e6).toFixed(0)}M` : '?';
+  console.log(`\n${dateStr} | openGamma=${ogStr} | ${calls.length} LLM calls | Dir accuracy: ${correct30}/${dirCalls.length} (${dirCalls.length > 0 ? (correct30 / dirCalls.length * 100).toFixed(0) : 0}%) | HIGH: ${highCorrect30}/${highConfCalls.length} | ENTER signals: ${enterCalls.length}`);
   if (trades.length > 0) {
     console.log(`  Trades: ${trades.length} (${wins}W/${losses}L) | NET: ${netPnl > 0 ? '+' : ''}${netPnl.toFixed(2)} pts`);
     for (const t of trades) {
