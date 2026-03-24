@@ -62,6 +62,15 @@ feature_cols = [
     'qqq_magnet_dist',           # QQQ king distance from QQQ spot
     'trinity_alignment',         # 0-3 count of aligned tickers
     'trinity_all_agree',         # 1 if all 3 tickers agree on direction
+    # NEW: Technical indicators
+    'rsi_14',                    # RSI(14) — overbought/oversold
+    'price_vs_vwap',             # price - VWAP (above/below institutional avg)
+    'ema9_above_ema21',          # 1 if EMA9 > EMA21 (bullish trend)
+    'atr_14',                    # ATR(14) — current volatility
+    'opening_range_broken',      # 1 if price broke first 20min high/low
+    'broke_which_side',          # 1=bullish break, -1=bearish break, 0=neither
+    # NEW: ES futures overnight
+    'es_overnight_change',       # ES futures overnight change (gap direction)
 ]
 
 # ---- Targets ----
@@ -87,25 +96,43 @@ for target_name in ['dir_correct_30', 'profitable_entry']:
 
     # Filter rows with valid labels
     valid = ~pd.isna(y) & (y >= 0)
+    df_valid = df[valid].copy()
     X_valid = X[valid].values
     y_valid = y[valid].astype(int)
     groups_valid = groups[valid]
 
     print(f"Valid samples: {len(y_valid)} ({y_valid.mean():.1%} positive)")
 
-    # ---- Cross-validation by day (no data leakage) ----
-    # GroupKFold ensures all calls from a day stay together
-    gkf = GroupKFold(n_splits=5)
+    # ---- Walk-forward cross-validation (chronological, no future leakage) ----
+    # Sort dates chronologically, train on first N days, test on next M
+    unique_dates = sorted(df_valid['date'].unique())
+    n_dates = len(unique_dates)
 
     all_preds = np.zeros(len(y_valid))
     all_true = np.zeros(len(y_valid))
     fold_aucs = []
 
-    for fold, (train_idx, test_idx) in enumerate(gkf.split(X_valid, y_valid, groups_valid)):
-        X_train, X_test = X_valid[train_idx], X_valid[test_idx]
-        y_train, y_test = y_valid[train_idx], y_valid[test_idx]
+    # 5 walk-forward folds: train on expanding window, test on next ~11 days
+    fold_size = n_dates // 5
+    for fold in range(5):
+        # Train on first (fold+1)*fold_size days, test on next fold_size
+        train_end = (fold + 1) * fold_size
+        test_end = min(train_end + fold_size, n_dates)
+        if train_end >= n_dates or test_end <= train_end:
+            continue
 
-        # Conservative hyperparameters to prevent overfitting
+        train_dates = set(unique_dates[:train_end])
+        test_dates = set(unique_dates[train_end:test_end])
+
+        train_mask = df_valid['date'].isin(train_dates).values
+        test_mask = df_valid['date'].isin(test_dates).values
+
+        X_train, X_test = X_valid[train_mask], X_valid[test_mask]
+        y_train, y_test = y_valid[train_mask], y_valid[test_mask]
+
+        if len(y_test) == 0 or len(np.unique(y_test)) < 2:
+            continue
+
         model = xgb.XGBClassifier(
             max_depth=3,
             n_estimators=100,
@@ -122,15 +149,13 @@ for target_name in ['dir_correct_30', 'profitable_entry']:
         model.fit(X_train, y_train)
 
         preds = model.predict_proba(X_test)[:, 1]
-        all_preds[test_idx] = preds
-        all_true[test_idx] = y_test
+        all_preds[test_mask] = preds
+        all_true[test_mask] = y_test
 
-        auc = roc_auc_score(y_test, preds) if len(np.unique(y_test)) > 1 else 0.5
+        auc = roc_auc_score(y_test, preds)
         fold_aucs.append(auc)
 
-        n_train_days = len(np.unique(groups_valid[train_idx]))
-        n_test_days = len(np.unique(groups_valid[test_idx]))
-        print(f"  Fold {fold+1}: AUC={auc:.3f} | train={n_train_days}d/{len(y_train)} samples | test={n_test_days}d/{len(y_test)} samples")
+        print(f"  Fold {fold+1}: AUC={auc:.3f} | train={len(train_dates)}d/{len(y_train)} | test={len(test_dates)}d/{len(y_test)} | {sorted(test_dates)[0]}→{sorted(test_dates)[-1]}")
 
     mean_auc = np.mean(fold_aucs)
     print(f"\nMean AUC: {mean_auc:.3f} (±{np.std(fold_aucs):.3f})")
