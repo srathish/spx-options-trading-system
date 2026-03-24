@@ -119,6 +119,12 @@ const header = [
   'entries_so_far', 'losses_so_far',
   // LLM output
   'llm_direction', 'llm_confidence', 'llm_regime', 'llm_action',
+  // Day move context (trade vs day direction)
+  'day_move_agrees', 'day_move_magnitude', 'trade_fighting_day',
+  // SPY/QQQ cross-asset features
+  'spy_king_agrees', 'spy_king_is_negative', 'spy_magnet_dist',
+  'qqq_king_agrees', 'qqq_king_is_negative', 'qqq_magnet_dist',
+  'trinity_alignment', 'trinity_all_agree',
   // Labels
   'move_10min', 'move_30min', 'abs_move_30min',
   'dir_correct_10', 'dir_correct_30',
@@ -165,6 +171,21 @@ for (const file of files) {
 
     const king = findKingNode(parsed);
     if (!king) continue;
+
+    // SPY/QQQ king nodes (trinity data)
+    let spyKing = null, qqqKing = null;
+    if (isTrinity) {
+      for (const [ticker, setter] of [['SPY', 'spy'], ['QQQ', 'qqq']]) {
+        const td = frame.tickers?.[ticker];
+        if (td?.spotPrice && td?.gammaValues && td?.strikes?.length > 0) {
+          const tRaw = { CurrentSpot: td.spotPrice, Strikes: td.strikes, GammaValues: td.gammaValues };
+          const tParsed = parseGexResponse(tRaw);
+          const tk = findKingNode(tParsed);
+          if (setter === 'spy') spyKing = tk;
+          else qqqKing = tk;
+        }
+      }
+    }
 
     if (openPrice === 0) {
       openPrice = spot;
@@ -281,6 +302,34 @@ for (const file of files) {
       llmResult.confidence === 'HIGH' ? 2 : llmResult.confidence === 'MEDIUM' ? 1 : 0,
       llmResult.regime === 'TREND' ? 2 : llmResult.regime === 'CHOP' ? 0 : 1,
       llmResult.action === 'ENTER' ? 1 : 0,
+      // Day move context features
+      (() => {
+        const dir = llmResult.direction === 'BULLISH' ? 1 : llmResult.direction === 'BEARISH' ? -1 : 0;
+        const agrees = (dir > 0 && dayMove > 10) || (dir < 0 && dayMove < -10);
+        const fighting = (dir > 0 && dayMove < -30) || (dir < 0 && dayMove > 30);
+        return [agrees ? 1 : 0, Math.abs(dayMove).toFixed(1), fighting ? 1 : 0];
+      })(),
+      // SPY/QQQ cross-asset features
+      (() => {
+        const tradeDir = bestMagnet ? (bestMagnet.dist < 0 ? -1 : 1) : 0;
+        // SPY king direction: negative gamma below spot = bearish magnet
+        const spyDir = spyKing ? (spyKing.value < 0 ? (spyKing.dist < 0 ? -1 : 1) : 0) : 0;
+        const qqqDir = qqqKing ? (qqqKing.value < 0 ? (qqqKing.dist < 0 ? -1 : 1) : 0) : 0;
+        const spxwAgrees = tradeDir !== 0 ? 1 : 0; // SPXW always agrees with itself
+        const spyAgrees = spyDir !== 0 && spyDir === tradeDir ? 1 : 0;
+        const qqqAgrees = qqqDir !== 0 && qqqDir === tradeDir ? 1 : 0;
+        const alignment = spxwAgrees + spyAgrees + qqqAgrees;
+        return [
+          spyAgrees,
+          spyKing ? (spyKing.value < 0 ? 1 : 0) : -1,
+          spyKing ? Math.abs(spyKing.dist).toFixed(1) : 50,
+          qqqAgrees,
+          qqqKing ? (qqqKing.value < 0 ? 1 : 0) : -1,
+          qqqKing ? Math.abs(qqqKing.dist).toFixed(1) : 50,
+          alignment,
+          alignment === 3 ? 1 : 0,
+        ];
+      })(),
       move10 !== null ? move10.toFixed(2) : '',
       move30 !== null ? move30.toFixed(2) : '',
       move30 !== null ? Math.abs(move30).toFixed(2) : '',

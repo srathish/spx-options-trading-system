@@ -82,6 +82,11 @@ export const FEATURE_NAMES = [
   'concentration', 'opening_gamma_M', 'price_trend_10', 'price_trend_30',
   'move_from_hod', 'move_from_lod', 'unique_kings_count', 'net_gex_M',
   'llm_direction', 'llm_confidence', 'llm_regime', 'llm_action',
+  // v2: day move context + cross-asset
+  'day_move_agrees', 'day_move_magnitude', 'trade_fighting_day',
+  'spy_king_agrees', 'spy_king_is_negative', 'spy_magnet_dist',
+  'qqq_king_agrees', 'qqq_king_is_negative', 'qqq_magnet_dist',
+  'trinity_alignment', 'trinity_all_agree',
 ];
 
 /**
@@ -140,5 +145,18 @@ export function buildFeatureVector(king, spot, localState, llmResult, minuteOfDa
     llmConf,                                       // llm_confidence
     llmRegime,                                     // llm_regime
     llmAction,                                     // llm_action
+    // v2: Day move context
+    (llmDir > 0 && dayMove > 10) || (llmDir < 0 && dayMove < -10) ? 1 : 0,  // day_move_agrees
+    Math.abs(dayMove),                             // day_move_magnitude
+    (llmDir > 0 && dayMove < -30) || (llmDir < 0 && dayMove > 30) ? 1 : 0,  // trade_fighting_day
+    // v2: SPY/QQQ cross-asset (from overrides — caller must compute)
+    overrides.spyKingAgrees ?? 0,                  // spy_king_agrees
+    overrides.spyKingIsNegative ?? -1,             // spy_king_is_negative
+    overrides.spyMagnetDist ?? 50,                 // spy_magnet_dist
+    overrides.qqqKingAgrees ?? 0,                  // qqq_king_agrees
+    overrides.qqqKingIsNegative ?? -1,             // qqq_king_is_negative
+    overrides.qqqMagnetDist ?? 50,                 // qqq_magnet_dist
+    overrides.trinityAlignment ?? 0,               // trinity_alignment
+    overrides.trinityAllAgree ?? 0,                // trinity_all_agree
   ];
 }

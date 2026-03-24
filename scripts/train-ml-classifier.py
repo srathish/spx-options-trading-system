@@ -49,6 +49,19 @@ feature_cols = [
     'llm_confidence',            # LLM confidence (0, 1, 2)
     'llm_regime',                # LLM regime call (0=CHOP, 1=PINNED, 2=TREND)
     'llm_action',                # LLM action (0=WAIT/HOLD, 1=ENTER)
+    # NEW: Day move context (trade vs day direction)
+    'day_move_agrees',           # 1 if day move agrees with trade direction (>10 pts)
+    'day_move_magnitude',        # absolute day move size
+    'trade_fighting_day',        # 1 if trade opposes day move by >30 pts
+    # NEW: SPY/QQQ cross-asset features
+    'spy_king_agrees',           # 1 if SPY king direction matches SPXW trade
+    'spy_king_is_negative',      # 1 if SPY king is negative gamma (magnet not pin)
+    'spy_magnet_dist',           # SPY king distance from SPY spot
+    'qqq_king_agrees',           # 1 if QQQ king direction matches SPXW trade
+    'qqq_king_is_negative',      # 1 if QQQ king is negative gamma
+    'qqq_magnet_dist',           # QQQ king distance from QQQ spot
+    'trinity_alignment',         # 0-3 count of aligned tickers
+    'trinity_all_agree',         # 1 if all 3 tickers agree on direction
 ]
 
 # ---- Targets ----

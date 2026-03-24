@@ -56,6 +56,30 @@ const CONFIG = {
 // Determines if a TREND or DEFY trade should use 1DTE instead of 0DTE.
 // 1DTE = wider stop, no time-based exits, carry overnight to next session.
 // Criteria: large directional move + negative regime + far magnet = multi-session trend.
+// Build ML cross-asset overrides from SPY/QQQ king nodes
+function buildCrossAssetOverrides(king, spyKing, qqqKing, priceTrend30) {
+  const tradeDir = king.bearMagnet && king.bullMagnet
+    ? (king.bearMagnet.absValue > king.bullMagnet.absValue ? -1 : 1)
+    : king.bearMagnet ? -1 : king.bullMagnet ? 1 : 0;
+  const spyDir = spyKing ? (spyKing.value < 0 ? (spyKing.dist < 0 ? -1 : 1) : 0) : 0;
+  const qqqDir = qqqKing ? (qqqKing.value < 0 ? (qqqKing.dist < 0 ? -1 : 1) : 0) : 0;
+  const spxwAgrees = tradeDir !== 0 ? 1 : 0;
+  const spyAgrees = spyDir !== 0 && spyDir === tradeDir ? 1 : 0;
+  const qqqAgrees = qqqDir !== 0 && qqqDir === tradeDir ? 1 : 0;
+  const alignment = spxwAgrees + spyAgrees + qqqAgrees;
+  return {
+    priceTrend10: 0, priceTrend30: priceTrend30 || 0,
+    spyKingAgrees: spyAgrees,
+    spyKingIsNegative: spyKing ? (spyKing.value < 0 ? 1 : 0) : -1,
+    spyMagnetDist: spyKing ? Math.abs(spyKing.dist) : 50,
+    qqqKingAgrees: qqqAgrees,
+    qqqKingIsNegative: qqqKing ? (qqqKing.value < 0 ? 1 : 0) : -1,
+    qqqMagnetDist: qqqKing ? Math.abs(qqqKing.dist) : 50,
+    trinityAlignment: alignment,
+    trinityAllAgree: alignment === 3 ? 1 : 0,
+  };
+}
+
 function shouldUse1DTE(mode, dayMove, magnetDist, regime, minuteOfDay) {
   // Only TREND and DEFY qualify — SQUEEZE/BREAKOUT are intraday-specific
   if (mode !== 'TREND' && mode !== 'DEFY') return false;
@@ -883,7 +907,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
       // The ML model scores every LLM call for profitable setup probability.
       // When ML >= 0.5 and no position, enter in the direction of the best magnet.
       if (mlModel && !mlPosition && minuteOfDay >= entryStartMin && minuteOfDay <= entryEndMin) {
-        const mlFV = buildFeatureVector(king, spot, localState, llmResult, minuteOfDay, { priceTrend10: 0, priceTrend30: priceTrend30 });
+        const mlFV = buildFeatureVector(king, spot, localState, llmResult, minuteOfDay, buildCrossAssetOverrides(king, spyKing, qqqKing, priceTrend30));
         const mlScore = predict(mlModel, mlFV);
 
         if (mlScore >= 0.5) {
@@ -1083,7 +1107,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
             let mlBlocks = false;
             if (mlModel) {
               const llmEnc = { direction: dir, confidence: llmConf === 'HIGH' ? 'HIGH' : 'MEDIUM', regime: llmRegime, action: 'ENTER' };
-              const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay);
+              const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay, buildCrossAssetOverrides(king, spyKing, qqqKing, priceTrend30));
               mlScore = predict(mlModel, fv);
               mlBlocks = mlScore < 0.30; // block clearly bad setups (saves ~24 pts)
             }
@@ -1148,7 +1172,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
               let defyMlScore = null;
               if (mlModel) {
                 const llmEnc = { direction: priceDir, confidence: 'HIGH', regime: 'TREND', action: 'ENTER' };
-                const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay);
+                const fv = buildFeatureVector(king, spot, localState, llmEnc, minuteOfDay, buildCrossAssetOverrides(king, spyKing, qqqKing, priceTrend30));
                 defyMlScore = predict(mlModel, fv);
               }
               const use1DTE = shouldUse1DTE('DEFY', dayMove, defyDist, king.regime, minuteOfDay);
