@@ -917,13 +917,22 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
             : king.bearMagnet || king.bullMagnet;
           if (bestMag) {
             const mlDir = bestMag.dist < 0 ? 'BEARISH' : 'BULLISH';
+
+            // HARD GATE: don't enter against a day already moving 35+ pts the other way
+            // The ML can't reliably learn this from 55 days — safety rail until more data
+            const dayMove = spot - localState.openPrice;
+            const fightingDayHard = (mlDir === 'BULLISH' && dayMove < -35) ||
+                                     (mlDir === 'BEARISH' && dayMove > 35);
+            if (fightingDayHard) {
+              if (verbose) console.log(`  ML-BLOCKED ${etStr} | ${mlDir} ML=${mlScore.toFixed(2)} | FIGHTING_DAY (dayMove=${dayMove.toFixed(0)}) [Lane B]`);
+            } else {
+
             const mlDirEntries = mlEntriesPerDir[mlDir] || 0;
             const mlDirLoss = mlDirLosses[mlDir] || 0;
 
             // Max 2 entries per direction, stop after 1 loss in direction
             if (mlDirEntries < 2 && mlDirLoss < 1) {
               const mlMagnetDist = Math.abs(bestMag.dist);
-              const dayMove = spot - localState.openPrice;
               const use1DTE = shouldUse1DTE('TREND', dayMove, mlMagnetDist, king.regime, minuteOfDay);
               mlPosition = {
                 direction: mlDir,
@@ -938,6 +947,7 @@ async function replayLLMKing(jsonPath, cache, verbose = false, dryRun = false, c
               mlEntriesPerDir[mlDir]++;
               if (verbose) console.log(`  ML-ENTER ${etStr} | ${mlDir} ML=${mlScore.toFixed(2)} @ $${Math.round(spot)} → ${bestMag.strike} (${mlMagnetDist.toFixed(0)}pts) [Lane B]`);
             }
+          } // end else (not fighting day)
           }
         }
       }
