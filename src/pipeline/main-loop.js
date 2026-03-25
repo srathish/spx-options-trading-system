@@ -30,6 +30,7 @@ import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGat
 import { buildEntryContext } from '../trades/entry-context.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
 import { runLlmKingCycle, resetLlmKingDaily, getDailyTrendScore } from '../gex/llm-king-live.js';
+import { runLaneECycle, resetLaneE, getState as getLaneEState, getLaneEStats } from '../gex/lane-e.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
 import { getSignalSnapshot } from '../tv/tv-signal-store.js';
 import { getSchedulePhase, isOpeningSummaryTime, isEodRecapTime, nowET, formatET } from '../utils/market-hours.js';
@@ -455,6 +456,16 @@ async function runCycle(phase) {
         }
       } catch (llmErr) {
         log.error(`LLM King error: ${llmErr.message}`);
+      }
+
+      // Lane E — Adaptive-Stop Simple System (phantom)
+      try {
+        const laneEState = runLaneECycle(parsed);
+        if (laneEState.qualified !== null) {
+          try { dashboardEmitter.emit('lane_e_update', laneEState); } catch (_) {}
+        }
+      } catch (laneEErr) {
+        log.debug(`Lane E: ${laneEErr.message}`);
       }
 
       if (detectedPatterns.length > 0) {
@@ -1043,6 +1054,7 @@ function scheduleDailyReset() {
     resetDailyState();
     resetDailyGates();
     resetLlmKingDaily();
+    resetLaneE();
     resetTrendDetector();
     dailyCycleIndex = 0;
     lastSpot = null; // Clear stale spot from previous session
