@@ -29,7 +29,7 @@ import { checkGexOnlyEntry, checkLaneBEntry, checkTrendPullbackEntry } from '../
 import { checkEntryGates, recordEntryForGates, recordExitForGates, resetDailyGates } from '../trades/entry-gates.js';
 import { buildEntryContext } from '../trades/entry-context.js';
 import { detectAllPatterns } from '../gex/gex-patterns.js';
-import { runLlmKingCycle, resetLlmKingDaily } from '../gex/llm-king-live.js';
+import { runLlmKingCycle, resetLlmKingDaily, getDailyTrendScore } from '../gex/llm-king-live.js';
 import { getNodeTouches } from '../gex/node-tracker.js';
 import { getSignalSnapshot } from '../tv/tv-signal-store.js';
 import { getSchedulePhase, isOpeningSummaryTime, isEodRecapTime, nowET, formatET } from '../utils/market-hours.js';
@@ -571,7 +571,13 @@ async function runCycle(phase) {
       }
 
       // B. If FLAT → algorithmic Lane A entry (GEX-only, no agent call needed)
-      if (getPositionState() === 'FLAT' && detectedPatterns.length > 0) {
+      // Morning ML gate: if trend model says CHOP_LIKELY (< 0.30), suppress entries
+      const trendScore = getDailyTrendScore();
+      const chopGate = trendScore && trendScore.score < 0.30;
+      if (chopGate && getPositionState() === 'FLAT' && detectedPatterns.length > 0) {
+        log.info(`Morning ML gate: score=${trendScore.score.toFixed(2)} (${trendScore.regime}) — suppressing ${detectedPatterns.length} pattern(s)`);
+      }
+      if (getPositionState() === 'FLAT' && detectedPatterns.length > 0 && !chopGate) {
         const nodeTouches = getNodeTouches();
         const currentTrendState = getTrendState();
         const entryState = { patterns: detectedPatterns, scored, multiAnalysis, nodeTouches, trendState: currentTrendState };

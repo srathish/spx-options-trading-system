@@ -674,6 +674,11 @@ export async function runLlmKingCycle(parsed, scored, multiAnalysis, currentPosi
   return patterns;
 }
 
+// ---- Accessor for morning trend score ----
+export function getDailyTrendScore() {
+  return dailyState.trendScore;
+}
+
 // ---- Reset daily state ----
 export function resetLlmKingDaily() {
   cycleCount = 0;
