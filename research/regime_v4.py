@@ -149,20 +149,27 @@ def compute_v3_features(df):
             if king_dir != 'AT_SPOT':
                 if king_dir == thesis_dir:
                     thesis_king_strikes.add(king_strike)
-                elif (persistence_bars >= 20 and
-                      king_abs >= 10_000_000 and
-                      same_dir_targets == 0 and
-                      opp_dir_threat == 0 and
-                      abs(king_dist) >= 15):
-                    # Thesis flip — strict conditions:
-                    # 1. Opposite king persisted 20+ bars (not just a wobble)
-                    # 2. King is significant (10M+)
-                    # 3. No same-direction targets fighting back
-                    # 4. No opposite threats either (clean takeover)
-                    # 5. King is genuinely away from spot (15+ pts)
-                    thesis_dir = king_dir
-                    thesis_start_frame = frame
-                    thesis_king_strikes = {king_strike}
+                else:
+                    # Potential thesis flip — requires STRUCTURAL handoff, not wobble
+                    # Distance from old thesis king strikes (must be displaced, not contact wobble)
+                    min_dist_from_old_kings = min(
+                        (abs(king_strike - old_k) for old_k in thesis_king_strikes),
+                        default=0
+                    ) if thesis_king_strikes else 999
+
+                    real_takeover = (
+                        persistence_bars >= 20 and      # sustained opposite control
+                        king_abs >= 10_000_000 and      # significant node
+                        abs(king_dist) >= 15 and        # not AT_SPOT wobble
+                        min_dist_from_old_kings >= 20 and  # displaced from old king zone
+                        same_dir_targets == 0 and       # old thesis targets stopped building
+                        not king_migrated_same_dir       # not a same-dir migration
+                    )
+
+                    if real_takeover:
+                        thesis_dir = king_dir
+                        thesis_start_frame = frame
+                        thesis_king_strikes = {king_strike}
             # AT_SPOT does NOT flip thesis — price reached the king,
             # thesis continues if same-direction targets are building
 
