@@ -465,7 +465,7 @@ async function runCycle(phase) {
           try { dashboardEmitter.emit('lane_e_update', laneEState); } catch (_) {}
         }
       } catch (laneEErr) {
-        log.debug(`Lane E: ${laneEErr.message}`);
+        log.error(`Lane E error: ${laneEErr.message}`);
       }
 
       if (detectedPatterns.length > 0) {
